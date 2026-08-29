@@ -63,7 +63,9 @@ class IngressGuard:
         if route.kind is RouteKind.MAINTAINER:
             return {"action": "allow"}
         principal = route.principal
-        assert principal is not None
+        if principal is None:
+            # Unreachable for a client route; fail closed rather than assume.
+            return {"action": "skip", "reason": "unauthorized"}
         if stripped.startswith("/"):
             return {"action": "skip", "reason": "commands-disabled"}
         if any(pattern.search(stripped) for pattern in _CODING_PATTERNS):
