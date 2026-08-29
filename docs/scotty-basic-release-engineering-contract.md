@@ -21,6 +21,16 @@ Exact cap response:
 
 ## Users and Discord isolation
 
+> **Amendment (native profile routing).** This section is superseded in part by
+> the native multiplexed profile routing adopted after review. The maintainer no
+> longer holds a bounded channel in the client guild. Private runtime
+> configuration now defines two client principal tuples plus one private route,
+> the gateway serves exactly three profile routes, and the fixed setup-wizard
+> command is retired. The rules below on exact-tuple authorization, rejection of
+> every mixed tuple, per-channel session isolation, and nothing being sent
+> automatically after installation are unchanged. See
+> `docs/claude-app-handoff.md` for the corrected design and its rationale.
+
 Private runtime configuration defines three immutable principal tuples:
 
 - maintainer: `(guild_id, channel_id, user_id, maintainer)`
@@ -38,6 +48,13 @@ Nothing is sent automatically after installation. After maintainer testing, the 
 `Scotty, send Trent the setup wizard.`
 
 A deterministic pre-model path sends a fixed non-secret onboarding wizard only to the configured main-operator channel. Do not let the model choose the destination or infer identity. The employee receives a separate fixed summary only when requested by an authorized principal.
+
+> **Amendment.** The setup-wizard command and its onboarding text are removed.
+> The maintainer now works from a separately served full profile that
+> deliberately does not load the bounded plugin, so no deterministic pre-model
+> path can run there. The trigger was retired rather than handed to the model.
+> The fixed employee summary is unchanged and still reaches only the employee
+> channel, chosen by code.
 
 ## Role policy
 
