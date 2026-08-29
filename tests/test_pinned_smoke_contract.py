@@ -123,17 +123,21 @@ class LifecycleDispatchContractTests(unittest.TestCase):
         self.assertIn("discover_plugins(force=True)", SMOKE.PROBE)
         self.assertIn("get_plugin_manager()", SMOKE.PROBE)
 
-    def test_the_probe_never_constructs_the_hook_object_directly(self) -> None:
-        """A direct construction proves the class, not the registration."""
+    def test_the_probe_never_constructs_or_reimports_the_hook_directly(self) -> None:
+        """Use the exact manager-loaded module, never a second bare import."""
 
         for forbidden in (
             "IngressGuard(",
             "from scotty_business.ingress import",
             "MaintainerGuard(",
             "_load_private_config",
+            'import_module("scotty_guard.guard")',
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, SMOKE.PROBE)
+        self.assertIn("def loaded_plugin_submodule(", SMOKE.PROBE)
+        self.assertIn("the manager-loaded plugin module", SMOKE.PROBE)
+        self.assertIn("sys.modules.items()", SMOKE.PROBE)
 
     def test_the_probe_has_no_manager_hooks_attribute_assumption(self) -> None:
         self.assertNotIn("manager.hooks", SMOKE.PROBE)

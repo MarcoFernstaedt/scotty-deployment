@@ -68,6 +68,7 @@ import json
 import os
 import pathlib
 import re
+import sys
 import types
 
 import yaml
@@ -318,6 +319,38 @@ loaded = [item.get("name") for item in manager.list_plugins()]
 notes["loaded_plugins"] = loaded
 notes["manager_type"] = type(manager).__name__
 
+
+def loaded_plugin_submodule(plugin_dirname, filename):
+    """Return the manager-loaded plugin module at the exact staged path.
+
+    Hermes gives directory plugins a scope-specific package name. Looking the
+    module up by its resolved source path observes that exact loaded instance;
+    importing a bare package name would create or request a different module.
+    """
+
+    expected = (
+        pathlib.Path(os.environ["HERMES_HOME"]) / "plugins" / plugin_dirname / filename
+    ).resolve()
+    matches = []
+    for name, module in tuple(sys.modules.items()):
+        origin = getattr(module, "__file__", None)
+        if not origin:
+            continue
+        try:
+            candidate = pathlib.Path(origin).resolve()
+        except OSError:
+            continue
+        if candidate == expected:
+            matches.append((name, module))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "the manager-loaded plugin module at %s was not unique; matches=%s"
+            % (expected, [name for name, _ in matches])
+        )
+    name, module = matches[0]
+    notes["loaded_plugin_module"] = name
+    return module
+
 _DISPATCH_NAMES = (
     "dispatch_hook",
     "run_hook",
@@ -543,7 +576,7 @@ elif ROLE == "maintainer":
     check("the maintainer guard is loaded in its own profile home", "scotty-guard" in loaded)
     check("the bounded plugin is absent from the full profile", "scotty-business" not in loaded)
 
-    guard_module = importlib.import_module("scotty_guard.guard")
+    guard_module = loaded_plugin_submodule("scotty_guard", "guard.py")
     delivered = []
     guard_module.send_fixed_message = lambda channel, text: delivered.append((channel, text))
 
