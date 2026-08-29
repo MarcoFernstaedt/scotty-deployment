@@ -1,0 +1,13 @@
+[Unit]
+Description=Scotty container egress firewall guard
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/scotty-egress-guard apply
+ExecStop=/usr/local/libexec/scotty-egress-guard remove
+
+[Install]
+WantedBy=multi-user.target

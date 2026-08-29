@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly IPTABLES=/usr/sbin/iptables
+readonly CHAIN=SCOTTY-EGRESS
+readonly SUBNET=172.30.50.0/24
+readonly JUMP_RULE="-A DOCKER-USER -s ${SUBNET} -j ${CHAIN}"
+readonly -a RULES=(
+  "-A ${CHAIN} -m addrtype --dst-type LOCAL -j REJECT"
+  "-A ${CHAIN} -d 0.0.0.0/8 -j REJECT"
+  "-A ${CHAIN} -d 10.0.0.0/8 -j REJECT"
+  "-A ${CHAIN} -d 100.64.0.0/10 -j REJECT"
+  "-A ${CHAIN} -d 127.0.0.0/8 -j REJECT"
+  "-A ${CHAIN} -d 169.254.0.0/16 -j REJECT"
+  "-A ${CHAIN} -d 172.16.0.0/12 -j REJECT"
+  "-A ${CHAIN} -d 192.0.0.0/24 -j REJECT"
+  "-A ${CHAIN} -d 192.0.2.0/24 -j REJECT"
+  "-A ${CHAIN} -d 192.88.99.0/24 -j REJECT"
+  "-A ${CHAIN} -d 192.168.0.0/16 -j REJECT"
+  "-A ${CHAIN} -d 198.18.0.0/15 -j REJECT"
+  "-A ${CHAIN} -d 198.51.100.0/24 -j REJECT"
+  "-A ${CHAIN} -d 203.0.113.0/24 -j REJECT"
+  "-A ${CHAIN} -d 224.0.0.0/4 -j REJECT"
+  "-A ${CHAIN} -d 240.0.0.0/4 -j REJECT"
+  "-A ${CHAIN} -j ACCEPT"
+)
+
+APPLY_TRANSACTION=0
+APPLY_COMMITTED=0
+CREATED_CHAIN=0
+ATTACHED_JUMP=0
+
+die() {
+  printf 'scotty-egress-guard: %s\n' "$*" >&2
+  exit 1
+}
+
+explicit_status_begin() {
+  trap - ERR
+  set +e
+}
+
+explicit_status_end() {
+  set -e
+  trap 'exit $?' ERR
+}
+
+cleanup_apply() {
+  local rc=$? inventory probe_rc remove_rc cleanup_rc=0
+  if (( APPLY_TRANSACTION == 1 && APPLY_COMMITTED == 0 )); then
+    trap - ERR
+    set +e
+    if (( ATTACHED_JUMP )); then
+      inventory="$($IPTABLES -w 5 -S DOCKER-USER 2>&1)"
+      probe_rc=$?
+      if (( probe_rc != 0 )); then
+        printf 'scotty-egress-guard: cleanup DOCKER-USER inventory failed (status %s): %s\n' "$probe_rc" "$inventory" >&2
+        cleanup_rc=1
+      elif grep -Fqx -- "$JUMP_RULE" <<<"$inventory"; then
+        $IPTABLES -w 5 -D DOCKER-USER -s "$SUBNET" -j "$CHAIN" >/dev/null 2>&1
+        remove_rc=$?
+        (( remove_rc == 0 )) || cleanup_rc=1
+      fi
+    fi
+    if (( CREATED_CHAIN )); then
+      inventory="$($IPTABLES -w 5 -S "$CHAIN" 2>&1)"
+      probe_rc=$?
+      if (( probe_rc != 0 )); then
+        printf 'scotty-egress-guard: cleanup chain inventory failed (status %s): %s\n' "$probe_rc" "$inventory" >&2
+        cleanup_rc=1
+      else
+        $IPTABLES -w 5 -F "$CHAIN" >/dev/null 2>&1
+        remove_rc=$?
+        (( remove_rc == 0 )) || cleanup_rc=1
+        $IPTABLES -w 5 -X "$CHAIN" >/dev/null 2>&1
+        remove_rc=$?
+        (( remove_rc == 0 )) || cleanup_rc=1
+      fi
+    fi
+    (( cleanup_rc == 0 )) || printf 'scotty-egress-guard: transactional cleanup incomplete\n' >&2
+  fi
+  exit "$rc"
+}
+
+trap 'exit $?' ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup_apply EXIT
+
+inventory() {
+  local chain=$1 output rc
+  explicit_status_begin
+  output="$($IPTABLES -w 5 -S "$chain" 2>&1)"
+  rc=$?
+  explicit_status_end
+  (( rc == 0 )) || die "iptables inventory failed for ${chain} (status ${rc}): ${output}"
+  printf '%s\n' "$output"
+}
+
+rules_from_inventory() {
+  local chain=$1 line
+  while IFS= read -r line; do
+    [[ $line == "-A ${chain} "* ]] && printf '%s\n' "$line"
+  done
+}
+
+exact_line_count() {
+  local haystack=$1 needle=$2 line count=0
+  while IFS= read -r line; do
+    if [[ $line == "$needle" ]]; then
+      (( count += 1 ))
+    fi
+  done <<<"$haystack"
+  printf '%s\n' "$count"
+}
+
+verify() {
+  local docker_user chain_rules
+  local -a actual_jump_rules actual_chain_rules
+
+  docker_user="$(inventory DOCKER-USER)"
+  mapfile -t actual_jump_rules < <(rules_from_inventory DOCKER-USER <<<"$docker_user")
+  (( ${#actual_jump_rules[@]} > 0 )) || die 'DOCKER-USER has no rules'
+  [[ ${actual_jump_rules[0]} == "$JUMP_RULE" ]] || die 'Scotty jump is not the first DOCKER-USER rule'
+  (( $(printf '%s\n' "${actual_jump_rules[@]}" | grep -Fxc -- "$JUMP_RULE") == 1 )) || die 'Scotty jump rule cardinality is not one'
+
+  chain_rules="$(inventory "$CHAIN")"
+  mapfile -t actual_chain_rules < <(rules_from_inventory "$CHAIN" <<<"$chain_rules")
+  (( ${#actual_chain_rules[@]} == ${#RULES[@]} )) || die 'guard rule count mismatch'
+  local index
+  for index in "${!RULES[@]}"; do
+    [[ ${actual_chain_rules[$index]} == "${RULES[$index]}" ]] || die "guard rule mismatch at index ${index}"
+  done
+}
+
+apply() {
+  local all_tables rc
+  explicit_status_begin
+  all_tables="$($IPTABLES -w 5 -S 2>&1)"
+  rc=$?
+  explicit_status_end
+  (( rc == 0 )) || die "iptables probe failed (status ${rc}): ${all_tables}"
+
+  if grep -Fqx -- "-N ${CHAIN}" <<<"$all_tables"; then
+    verify
+    return
+  fi
+
+  APPLY_TRANSACTION=1
+  local create_output create_rc tables_after probe_rc jump_output jump_rc docker_user_after
+  explicit_status_begin
+  create_output="$($IPTABLES -w 5 -N "$CHAIN" 2>&1)"
+  create_rc=$?
+  tables_after="$($IPTABLES -w 5 -S 2>&1)"
+  probe_rc=$?
+  explicit_status_end
+  if (( probe_rc == 0 )) && grep -Fqx -- "-N ${CHAIN}" <<<"$tables_after"; then
+    CREATED_CHAIN=1
+  elif (( probe_rc != 0 && create_rc == 0 )); then
+    CREATED_CHAIN=1
+    die "chain create succeeded but post-create inventory failed (status ${probe_rc}): ${tables_after}"
+  elif (( probe_rc != 0 )); then
+    die "chain create and post-create inventory both failed (create ${create_rc}, probe ${probe_rc}): ${create_output}; ${tables_after}"
+  fi
+  (( create_rc == 0 )) || die "chain create failed (status ${create_rc}): ${create_output}"
+  (( CREATED_CHAIN == 1 )) || die 'chain create reported success but exact-name inventory is absent'
+
+  local rule
+  for rule in "${RULES[@]}"; do
+    # RULES are fixed literals owned by this package; split into iptables arguments.
+    read -r -a fields <<<"${rule#-A "${CHAIN}" }"
+    $IPTABLES -w 5 -A "$CHAIN" "${fields[@]}"
+  done
+
+  explicit_status_begin
+  jump_output="$($IPTABLES -w 5 -I DOCKER-USER 1 -s "$SUBNET" -j "$CHAIN" 2>&1)"
+  jump_rc=$?
+  docker_user_after="$($IPTABLES -w 5 -S DOCKER-USER 2>&1)"
+  probe_rc=$?
+  explicit_status_end
+  if (( probe_rc == 0 )) && grep -Fqx -- "$JUMP_RULE" <<<"$docker_user_after"; then
+    ATTACHED_JUMP=1
+  elif (( probe_rc != 0 && jump_rc == 0 )); then
+    ATTACHED_JUMP=1
+    die "jump insertion succeeded but post-insert inventory failed (status ${probe_rc}): ${docker_user_after}"
+  elif (( probe_rc != 0 )); then
+    die "jump insertion and post-insert inventory both failed (insert ${jump_rc}, probe ${probe_rc}): ${jump_output}; ${docker_user_after}"
+  fi
+  (( jump_rc == 0 )) || die "jump insertion failed (status ${jump_rc}): ${jump_output}"
+  (( ATTACHED_JUMP == 1 )) || die 'jump insertion reported success but exact rule inventory is absent'
+  verify
+  APPLY_COMMITTED=1
+}
+
+remove() {
+  local all_tables docker_user chain_inventory output
+  local probe_rc action_rc jump_count chain_count
+  local -a remaining_chain_rules
+
+  explicit_status_begin
+  all_tables="$($IPTABLES -w 5 -S 2>&1)"
+  probe_rc=$?
+  explicit_status_end
+  (( probe_rc == 0 )) || die "iptables inventory failed during removal (status ${probe_rc}): ${all_tables}"
+
+  explicit_status_begin
+  docker_user="$($IPTABLES -w 5 -S DOCKER-USER 2>&1)"
+  probe_rc=$?
+  explicit_status_end
+  (( probe_rc == 0 )) || die "DOCKER-USER inventory failed during removal (status ${probe_rc}): ${docker_user}"
+
+  jump_count="$(exact_line_count "$docker_user" "$JUMP_RULE")"
+  chain_count="$(exact_line_count "$all_tables" "-N ${CHAIN}")"
+  (( jump_count <= 1 )) || die 'refusing removal: owned jump cardinality exceeds one'
+  (( chain_count <= 1 )) || die 'refusing removal: owned chain cardinality exceeds one'
+
+  if (( jump_count == 1 )); then
+    explicit_status_begin
+    output="$($IPTABLES -w 5 -D DOCKER-USER -s "$SUBNET" -j "$CHAIN" 2>&1)"
+    action_rc=$?
+    docker_user="$($IPTABLES -w 5 -S DOCKER-USER 2>&1)"
+    probe_rc=$?
+    explicit_status_end
+    (( probe_rc == 0 )) || die "DOCKER-USER post-delete inventory failed (status ${probe_rc}): ${docker_user}"
+    jump_count="$(exact_line_count "$docker_user" "$JUMP_RULE")"
+    (( jump_count == 0 )) || die "jump deletion did not reach absence (status ${action_rc}): ${output}"
+  fi
+
+  if (( chain_count == 1 )); then
+    explicit_status_begin
+    output="$($IPTABLES -w 5 -F "$CHAIN" 2>&1)"
+    action_rc=$?
+    chain_inventory="$($IPTABLES -w 5 -S "$CHAIN" 2>&1)"
+    probe_rc=$?
+    explicit_status_end
+    (( probe_rc == 0 )) || die "chain post-flush inventory failed (status ${probe_rc}): ${chain_inventory}"
+    mapfile -t remaining_chain_rules < <(rules_from_inventory "$CHAIN" <<<"$chain_inventory")
+    (( ${#remaining_chain_rules[@]} == 0 )) || die "chain flush did not reach empty state (status ${action_rc}): ${output}"
+
+    explicit_status_begin
+    output="$($IPTABLES -w 5 -X "$CHAIN" 2>&1)"
+    action_rc=$?
+    all_tables="$($IPTABLES -w 5 -S 2>&1)"
+    probe_rc=$?
+    explicit_status_end
+    (( probe_rc == 0 )) || die "iptables post-delete inventory failed (status ${probe_rc}): ${all_tables}"
+    chain_count="$(exact_line_count "$all_tables" "-N ${CHAIN}")"
+    (( chain_count == 0 )) || die "chain deletion did not reach absence (status ${action_rc}): ${output}"
+  fi
+
+  explicit_status_begin
+  all_tables="$($IPTABLES -w 5 -S 2>&1)"
+  probe_rc=$?
+  explicit_status_end
+  (( probe_rc == 0 )) || die "final iptables absence inventory failed (status ${probe_rc}): ${all_tables}"
+  chain_count="$(exact_line_count "$all_tables" "-N ${CHAIN}")"
+  (( chain_count == 0 )) || die 'final absence check found the owned chain'
+
+  explicit_status_begin
+  docker_user="$($IPTABLES -w 5 -S DOCKER-USER 2>&1)"
+  probe_rc=$?
+  explicit_status_end
+  (( probe_rc == 0 )) || die "final DOCKER-USER absence inventory failed (status ${probe_rc}): ${docker_user}"
+  jump_count="$(exact_line_count "$docker_user" "$JUMP_RULE")"
+  (( jump_count == 0 )) || die 'final absence check found the owned jump'
+}
+
+case ${1:-} in
+  apply) apply ;;
+  verify) verify ;;
+  remove) remove ;;
+  *) die 'usage: scotty-egress-guard {apply|verify|remove}' ;;
+esac

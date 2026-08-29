@@ -1,0 +1,37 @@
+name: scotty
+
+services:
+  scotty:
+    image: nousresearch/hermes-agent@sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517
+    pull_policy: never
+    container_name: scotty
+    command: ["gateway", "run"]
+    restart: "no"
+    privileged: false
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2.0
+    mem_limit: 4g
+    pids_limit: 512
+    cgroup: private
+    stdin_open: false
+    tty: false
+    environment:
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+    volumes:
+      - type: bind
+        source: /srv/Scotty/data
+        target: /opt/data
+        bind:
+          create_host_path: false
+    networks:
+      - scotty-egress
+    labels:
+      com.scotty.deployment: managed
+      com.scotty.image.digest: sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517
+
+networks:
+  scotty-egress:
+    external: true
+    name: scotty-egress

@@ -1,0 +1,28 @@
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime and generated state
+*.db
+*.sqlite*
+*.log
+*.pid
+*.cache
+.cache/
+__pycache__/
+.pytest_cache/
+coverage/
+dist/
+build/
+
+# Backups and editor/OS state
+*.bak
+*.backup
+*~
+.DS_Store
+.vscode/
+.idea/
