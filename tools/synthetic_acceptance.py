@@ -1,0 +1,396 @@
+"""Credential-free synthetic acceptance run.
+
+This proves the release behaviours end to end without any credential, live
+provider, Discord call, container, or host mutation. Every identifier comes from
+the synthetic fixtures in `fixtures/`.
+
+Run it with:
+
+    make acceptance
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+from collections.abc import Mapping
+from pathlib import Path
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from assistant.scotty_business.approvals import ApprovalStore  # noqa: E402
+from assistant.scotty_business.config import RuntimeConfig  # noqa: E402
+from assistant.scotty_business.guidance import (  # noqa: E402
+    NOT_CONNECTED,
+    PROVIDERS,
+    provider_guidance,
+)
+from assistant.scotty_business.ingress import (  # noqa: E402
+    EMPLOYEE_SUMMARY_COMMAND,
+    IngressGuard,
+)
+from assistant.scotty_business.policy import (  # noqa: E402
+    CODING_REFUSAL,
+    EMPLOYEE_SUMMARY,
+    FIXED_WIZARD_COMMAND,
+    SETUP_WIZARD,
+    Principal,
+    Role,
+    can_approve,
+)
+from assistant.scotty_business.provisioning import (  # noqa: E402
+    ChannelPlan,
+    ProvisionStatus,
+    ensure_private_channels,
+    intended_overwrites,
+)
+from assistant.scotty_business.routing import (  # noqa: E402
+    ALL_TOOLSETS,
+    CLIENT_TOOLSETS,
+    RouteKind,
+    resolve_route,
+)
+
+FIXTURES = ROOT / "fixtures"
+CHECKS: list[str] = []
+
+
+class AcceptanceFailure(RuntimeError):
+    pass
+
+
+def check(label: str, condition: bool) -> None:
+    if not condition:
+        raise AcceptanceFailure(label)
+    CHECKS.append(label)
+
+
+def config() -> RuntimeConfig:
+    raw = json.loads((FIXTURES / "scotty.private.route.example.json").read_text("utf-8"))
+    return RuntimeConfig.from_mapping(raw)
+
+
+def source(guild: str, channel: str, user: str, *, parent: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        platform=SimpleNamespace(value="discord"),
+        guild_id=guild,
+        scope_id=guild,
+        chat_id=channel,
+        user_id=user,
+        parent_chat_id=parent,
+        is_bot=False,
+    )
+
+
+def principal_for(runtime_config: RuntimeConfig, role: Role) -> Principal:
+    return next(item for item in runtime_config.principals if item.role == role)
+
+
+def check_routing(runtime_config: RuntimeConfig) -> None:
+    route = runtime_config.maintainer_route
+    assert route is not None
+    for role in Role:
+        principal = principal_for(runtime_config, role)
+        resolved = resolve_route(
+            runtime_config, source(principal.guild_id, principal.channel_id, principal.user_id)
+        )
+        check(
+            f"client tuple for {role.value} routes to a bounded profile",
+            resolved is not None
+            and resolved.kind is RouteKind.CLIENT
+            and resolved.toolsets == CLIENT_TOOLSETS,
+        )
+    exact = resolve_route(runtime_config, source(route.guild_id, route.channel_id, route.user_id))
+    check(
+        "the exact private tuple reaches the full profile",
+        exact is not None and exact.kind is RouteKind.MAINTAINER and exact.toolsets == ALL_TOOLSETS,
+    )
+
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+    maintainer = principal_for(runtime_config, Role.MAINTAINER)
+    rejects = [
+        ("wrong guild", source("999000000000000001", operator.channel_id, operator.user_id)),
+        ("wrong channel", source(operator.guild_id, employee.channel_id, operator.user_id)),
+        ("wrong user", source(operator.guild_id, operator.channel_id, employee.user_id)),
+        (
+            "client user in the private channel",
+            source(route.guild_id, route.channel_id, maintainer.user_id),
+        ),
+        (
+            "private user in a client channel",
+            source(operator.guild_id, operator.channel_id, route.user_id),
+        ),
+        (
+            "private channel in the client guild",
+            source(operator.guild_id, route.channel_id, route.user_id),
+        ),
+        (
+            "client channel in the private guild",
+            source(route.guild_id, operator.channel_id, route.user_id),
+        ),
+        (
+            "thread under the wrong parent",
+            source(
+                operator.guild_id,
+                "900000000000000001",
+                operator.user_id,
+                parent=employee.channel_id,
+            ),
+        ),
+    ]
+    for label, candidate in rejects:
+        check(
+            f"rejected before dispatch: {label}", resolve_route(runtime_config, candidate) is None
+        )
+
+    bot = source(operator.guild_id, operator.channel_id, operator.user_id)
+    bot.is_bot = True
+    check("rejected before dispatch: bot author", resolve_route(runtime_config, bot) is None)
+
+
+def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
+    outbound: list[tuple[str, str]] = []
+    guard = IngressGuard(runtime_config, lambda channel, text: outbound.append((channel, text)))
+    maintainer = principal_for(runtime_config, Role.MAINTAINER)
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+
+    guard(
+        SimpleNamespace(
+            text=FIXED_WIZARD_COMMAND,
+            source=source(maintainer.guild_id, maintainer.channel_id, maintainer.user_id),
+        )
+    )
+    check(
+        "the exact command sends the fixed wizard only to the main operator",
+        outbound == [(operator.channel_id, SETUP_WIZARD)],
+    )
+
+    outbound.clear()
+    guard(
+        SimpleNamespace(
+            text=FIXED_WIZARD_COMMAND,
+            source=source(operator.guild_id, operator.channel_id, operator.user_id),
+        )
+    )
+    check("the operator cannot trigger the wizard", outbound == [])
+
+    guard(
+        SimpleNamespace(
+            text=EMPLOYEE_SUMMARY_COMMAND,
+            source=source(operator.guild_id, operator.channel_id, operator.user_id),
+        )
+    )
+    check(
+        "the fixed employee summary reaches only the employee channel",
+        outbound == [(employee.channel_id, EMPLOYEE_SUMMARY)],
+    )
+
+    outbound.clear()
+    guard(
+        SimpleNamespace(
+            text="Please build an integration for me",
+            source=source(employee.guild_id, employee.channel_id, employee.user_id),
+        )
+    )
+    check(
+        "coding requests get the fixed refusal in the requesting channel",
+        outbound == [(employee.channel_id, CODING_REFUSAL)],
+    )
+
+    route = runtime_config.maintainer_route
+    assert route is not None
+    destinations = {channel for channel, _ in outbound}
+    check(
+        "no fixed path ever targets the private route",
+        route.channel_id not in destinations
+        and route.channel_id not in runtime_config.client_discord_destinations(),
+    )
+
+
+def check_employee_denial(runtime_config: RuntimeConfig) -> None:
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    check("an employee cannot approve a Trello write", not can_approve(employee, "trello_write"))
+    check("an employee cannot approve an SMS send", not can_approve(employee, "ghl_sms"))
+    check("the main operator can approve a Trello write", can_approve(operator, "trello_write"))
+
+    with tempfile.TemporaryDirectory(prefix="scotty-acceptance-") as directory:
+        store = ApprovalStore(Path(directory) / "approvals.db")
+        store.initialize()
+        from datetime import UTC, datetime, timedelta
+
+        proposal = store.propose(
+            requester=employee,
+            approver=operator,
+            action_class="trello_write",
+            target_ids=(runtime_config.trello.board_id, runtime_config.trello.list_ids[0]),
+            payload={"operation": "create", "fields": {"name": "Synthetic acceptance card"}},
+            source_revision="configured-board-v1",
+            expires_at=datetime.now(UTC) + timedelta(minutes=10),
+        )
+        denied = False
+        try:
+            store.approve(proposal.proposal_id, employee, proposal.version)
+        except Exception:
+            denied = True
+        check("an employee self-approval is refused by the approval store", denied)
+        approved = store.approve(proposal.proposal_id, operator, proposal.version)
+        check("the bound approver can approve", approved.status.value == "approved")
+
+
+def check_provider_guidance() -> None:
+    for name in PROVIDERS:
+        text = provider_guidance(name).as_text()
+        check(f"{name} states not connected with fixed steps", NOT_CONNECTED in text)
+        check(f"{name} points at the local setup command", "local setup command" in text)
+    discord = provider_guidance("discord")
+    check(
+        "Discord guidance asks for Manage Channels, never Administrator",
+        any("Manage Channels" in item for item in discord.required_scopes)
+        and not any("Administrator" in item for item in discord.required_scopes),
+    )
+    google = provider_guidance("google_workspace")
+    check("Google Workspace stays guidance only", "not installed" in google.as_text().lower())
+
+
+class SyntheticDiscord:
+    """Synthetic Discord REST double. No socket is ever opened."""
+
+    def __init__(self, guild_id: str, bot_id: str) -> None:
+        self.guild_id = guild_id
+        self.bot_id = bot_id
+        self.channels: list[dict[str, object]] = []
+        self.creates = 0
+        self._next = 700000000000000001
+
+    def get(self, path: str) -> object:
+        if path == "/users/@me":
+            return {"id": self.bot_id}
+        if path == f"/guilds/{self.guild_id}":
+            return {"id": self.guild_id}
+        if path == f"/guilds/{self.guild_id}/members/@me":
+            return {"user": {"id": self.bot_id}, "roles": ["400000000000000001"]}
+        if path == f"/guilds/{self.guild_id}/roles":
+            return [
+                {"id": self.guild_id, "permissions": "0"},
+                {"id": "400000000000000001", "permissions": str(1 << 4)},
+            ]
+        if path == f"/guilds/{self.guild_id}/channels":
+            return [dict(item) for item in self.channels]
+        channel_id = path.rsplit("/", 1)[-1]
+        for channel in self.channels:
+            if channel["id"] == channel_id:
+                return dict(channel)
+        raise RuntimeError("channel readback unavailable")
+
+    def post(self, path: str, json_body: Mapping[str, object]) -> object:
+        self.creates += 1
+        channel = {
+            "id": str(self._next),
+            "guild_id": self.guild_id,
+            "type": 0,
+            "name": json_body["name"],
+            "permission_overwrites": json_body["permission_overwrites"],
+        }
+        self._next += 1
+        self.channels.append(channel)
+        return dict(channel)
+
+
+def check_provisioning(runtime_config: RuntimeConfig) -> None:
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+    bot_id = "600000000000000001"
+    plans = (
+        ChannelPlan(
+            key="main_operator",
+            name="scotty-operator",
+            guild_id=operator.guild_id,
+            user_id=operator.user_id,
+        ),
+        ChannelPlan(
+            key="employee",
+            name="scotty-employee",
+            guild_id=employee.guild_id,
+            user_id=employee.user_id,
+        ),
+    )
+    client = SyntheticDiscord(operator.guild_id, bot_id)
+
+    declined = ensure_private_channels(plans, client, confirm=lambda _: False)
+    check("nothing is created without a local confirmation", client.creates == 0)
+    check("a declined preview reports an error", declined.error is not None)
+
+    first = ensure_private_channels(plans, client, confirm=lambda _: True)
+    check("both private channels are created after confirmation", first.error is None)
+    check("exactly two channels were created", client.creates == 2)
+    for plan in plans:
+        created = first.channels[plan.key]
+        check(
+            f"{plan.key} channel was created and read back",
+            created.status is ProvisionStatus.CREATED and created.channel_id is not None,
+        )
+
+    second = ensure_private_channels(plans, client, confirm=lambda _: True)
+    check("a rerun reuses both channels", second.error is None and client.creates == 2)
+    check(
+        "a rerun returns the same channel IDs",
+        all(
+            second.channels[plan.key].channel_id == first.channels[plan.key].channel_id
+            for plan in plans
+        ),
+    )
+
+    overwrites = intended_overwrites(operator.guild_id, operator.user_id, bot_id)
+    everyone = next(item for item in overwrites if item["id"] == operator.guild_id)
+    check("@everyone is denied View Channel", int(str(everyone["deny"])) & (1 << 10) != 0)
+    check(
+        "no in-channel overwrite grants Administrator or Manage Channels",
+        all(int(str(item["allow"])) & ((1 << 3) | (1 << 4)) == 0 for item in overwrites),
+    )
+
+
+def check_secrecy(runtime_config: RuntimeConfig) -> None:
+    route = runtime_config.maintainer_route
+    assert route is not None
+    identifiers = (route.guild_id, route.channel_id, route.user_id, route.profile)
+    client_text = "\n".join(
+        [
+            SETUP_WIZARD,
+            EMPLOYEE_SUMMARY,
+            CODING_REFUSAL,
+            FIXED_WIZARD_COMMAND,
+            *(provider_guidance(name).as_text() for name in PROVIDERS),
+        ]
+    )
+    for identifier in identifiers:
+        check(
+            "no client-facing string carries a private route identifier",
+            identifier not in client_text,
+        )
+    lowered = client_text.lower()
+    for phrase in ("maintainer server", "maintainer channel", "hidden route", "admin route"):
+        check(f"no client-facing string mentions a {phrase}", phrase not in lowered)
+
+
+def main() -> int:
+    runtime_config = config()
+    check_routing(runtime_config)
+    check_fixed_paths(runtime_config)
+    check_employee_denial(runtime_config)
+    check_provider_guidance()
+    check_provisioning(runtime_config)
+    check_secrecy(runtime_config)
+    for label in CHECKS:
+        print(f"  ok  {label}")
+    print(f"synthetic acceptance: PASS ({len(CHECKS)} checks, no credentials, no live calls)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
