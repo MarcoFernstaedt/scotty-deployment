@@ -8,6 +8,23 @@ readonly TARGET_ROOT=/srv/Scotty
 readonly OPERATOR_DIR=${TARGET_ROOT}/operator
 readonly DATA_DIR=${TARGET_ROOT}/data
 readonly COMPOSE_FILE=${OPERATOR_DIR}/compose.yaml
+readonly SETUP_BIN=/srv/Scotty/operator/setup-scotty
+readonly PLUGINS_DIR=/srv/Scotty/data/plugins
+readonly PLUGIN_DIR=/srv/Scotty/data/plugins/scotty_business
+readonly PLUGIN_ADAPTERS_DIR=/srv/Scotty/data/plugins/scotty_business/adapters
+readonly PROFILES_DIR=/srv/Scotty/data/profiles
+# The full profile home never receives the bounded plugin. Only the two client
+# profile homes are staged with it.
+readonly -a SERVED_PROFILES=(scotty-maintainer scotty-main-operator scotty-employee)
+readonly -a CLIENT_PROFILES=(scotty-main-operator scotty-employee)
+readonly MAINTAINER_PROFILE=scotty-maintainer
+# The guard registers only a pre-dispatch authorization hook: no model tools,
+# no prompt section, no bounded client identity.
+readonly -a GUARD_FILES=(
+  "__init__.py"
+  "plugin.yaml"
+  "guard.py"
+)
 readonly GUARD_BIN=/usr/local/libexec/scotty-egress-guard
 readonly GUARD_UNIT=/etc/systemd/system/scotty-egress-guard.service
 readonly CONTAINER=scotty
@@ -22,13 +39,45 @@ CLEANING=0
 CREATED_ROOT=0
 CREATED_OPERATOR=0
 CREATED_DATA=0
+CREATED_PLUGINS=0
+CREATED_PLUGIN=0
+CREATED_PLUGIN_ADAPTERS=0
 INSTALLED_COMPOSE=0
+INSTALLED_SETUP=0
 INSTALLED_GUARD=0
 INSTALLED_UNIT=0
 RELOADED_SYSTEMD=0
 ENABLED_GUARD=0
 CREATED_NETWORK=0
 CREATED_CONTAINER=0
+INSTALLED_PLUGIN_FILES=()
+CREATED_PROFILE_DIRS=()
+
+readonly -a PLUGIN_FILES=(
+  "__init__.py"
+  "plugin.yaml"
+  "approvals.py"
+  "calculations.py"
+  "config.py"
+  "guidance.py"
+  "identity.py"
+  "ingress.py"
+  "policy.py"
+  "provisioning.py"
+  "reminders.py"
+  "routing.py"
+  "runtime.py"
+  "service.py"
+  "setup.py"
+  "wizard.py"
+  "adapters/__init__.py"
+  "adapters/discord.py"
+  "adapters/ghl.py"
+  "adapters/http.py"
+  "adapters/records.py"
+  "adapters/rentcast.py"
+  "adapters/trello.py"
+)
 
 die() {
   printf 'install: %s\n' "$*" >&2
@@ -101,8 +150,67 @@ install_owned() {
   [[ -e $target && ! -L $target ]] || die "install reported success but safe target is absent: ${target}"
 }
 
+install_profile_dir() {
+  local target=$1 install_rc
+  [[ $target == "${DATA_DIR}/"* ]] || die "profile directory is outside the data mount: ${target}"
+  require_safe_ancestors "$target"
+  require_absent_destination "$target"
+  explicit_status_begin
+  install -d -o 10000 -g 10000 -m 0700 "$target"
+  install_rc=$?
+  explicit_status_end
+  if [[ -d $target && ! -L $target ]]; then
+    CREATED_PROFILE_DIRS+=("$target")
+  elif [[ -L $target ]]; then
+    die "profile install produced or encountered an unowned symlink: ${target}"
+  fi
+  (( install_rc == 0 )) || die "profile directory install failed for ${target} (status ${install_rc})"
+  [[ -d $target && ! -L $target ]] || die "profile directory is absent after install: ${target}"
+}
+
+install_guard_file() {
+  local relative=$1 root=$2 source target install_rc
+  source=${SOURCE_DIR}/assistant/scotty_guard/${relative}
+  target=${root}/${relative}
+  [[ -f $source && ! -L $source ]] || die "guard source is absent or unsafe: ${relative}"
+  require_safe_ancestors "$target"
+  require_absent_destination "$target"
+  explicit_status_begin
+  install -o 10000 -g 10000 -m 0600 "$source" "$target"
+  install_rc=$?
+  explicit_status_end
+  if [[ -f $target && ! -L $target ]]; then
+    INSTALLED_PLUGIN_FILES+=("$target")
+  elif [[ -L $target ]]; then
+    die "guard install produced or encountered an unowned symlink: ${target}"
+  fi
+  (( install_rc == 0 )) || die "guard install failed for ${relative} (status ${install_rc})"
+  [[ -f $target && ! -L $target ]] || die "guard install reported success but target is absent: ${relative}"
+}
+
+install_plugin_file() {
+  local relative=$1 root=${2:-$PLUGIN_DIR} source target install_rc
+  source=${SOURCE_DIR}/assistant/scotty_business/${relative}
+  target=${root}/${relative}
+  [[ -f $source && ! -L $source ]] || die "plugin source is absent or unsafe: ${relative}"
+  require_safe_ancestors "$target"
+  require_absent_destination "$target"
+  explicit_status_begin
+  install -o 10000 -g 10000 -m 0600 "$source" "$target"
+  install_rc=$?
+  explicit_status_end
+  if [[ -f $target && ! -L $target ]]; then
+    INSTALLED_PLUGIN_FILES+=("$target")
+  elif [[ -L $target ]]; then
+    die "plugin install produced or encountered an unowned symlink: ${target}"
+  fi
+  (( install_rc == 0 )) || die "plugin install failed for ${relative} (status ${install_rc})"
+  [[ -f $target && ! -L $target ]] || die "plugin install reported success but safe target is absent: ${relative}"
+}
+
 cleanup() {
   local original_rc=$1 label inventory probe_rc remove_rc disable_rc guard_rc rc=0
+  local installed_file index
   local management_safe=1
   (( CLEANING == 0 )) || return
   CLEANING=1
@@ -211,6 +319,65 @@ cleanup() {
       (( remove_rc == 0 )) || rc=1
     fi
   fi
+  if (( INSTALLED_SETUP )); then
+    if [[ -L $SETUP_BIN ]]; then
+      printf 'install: refusing to remove replacement symlink: %s\n' "$SETUP_BIN" >&2
+      rc=1
+    else
+      rm -f -- "$SETUP_BIN"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
+  for (( index=${#INSTALLED_PLUGIN_FILES[@]}-1; index>=0; index-- )); do
+    installed_file=${INSTALLED_PLUGIN_FILES[index]}
+    if [[ $installed_file != "$DATA_DIR/"* || -L $installed_file ]]; then
+      printf 'install: refusing to remove unsafe plugin path: %s\n' "$installed_file" >&2
+      rc=1
+    else
+      rm -f -- "$installed_file"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  done
+  for (( index=${#CREATED_PROFILE_DIRS[@]}-1; index>=0; index-- )); do
+    installed_file=${CREATED_PROFILE_DIRS[index]}
+    if [[ $installed_file != "$DATA_DIR/"* || -L $installed_file ]]; then
+      printf 'install: refusing to remove unsafe profile path: %s\n' "$installed_file" >&2
+      rc=1
+    else
+      rmdir -- "$installed_file"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  done
+  if (( CREATED_PLUGIN_ADAPTERS )); then
+    if [[ -L $PLUGIN_ADAPTERS_DIR ]]; then
+      rc=1
+    else
+      rmdir -- "$PLUGIN_ADAPTERS_DIR"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
+  if (( CREATED_PLUGIN )); then
+    if [[ -L $PLUGIN_DIR ]]; then
+      rc=1
+    else
+      rmdir -- "$PLUGIN_DIR"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
+  if (( CREATED_PLUGINS )); then
+    if [[ -L $PLUGINS_DIR ]]; then
+      rc=1
+    else
+      rmdir -- "$PLUGINS_DIR"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
   if (( CREATED_OPERATOR )); then
     if [[ -L $OPERATOR_DIR ]]; then
       printf 'install: refusing to remove replacement symlink: %s\n' "$OPERATOR_DIR" >&2
@@ -307,6 +474,7 @@ preflight() {
     "$OPERATOR_DIR"
     "$DATA_DIR"
     "$COMPOSE_FILE"
+    "$SETUP_BIN"
     "$GUARD_BIN"
     "$GUARD_UNIT"
   )
@@ -369,6 +537,27 @@ verify_install() {
 
   command_output actual stat -c '%u:%g:%a' "$TARGET_ROOT" "$OPERATOR_DIR" "$DATA_DIR" "$COMPOSE_FILE" "$GUARD_BIN" "$GUARD_UNIT"
   [[ $actual == $'0:0:700\n0:0:700\n10000:10000:700\n0:0:600\n0:0:755\n0:0:644' ]] || die "ownership/mode mismatch: ${actual}"
+  command_output actual stat -c '%u:%g:%a' "$SETUP_BIN" "$PLUGIN_DIR/plugin.yaml" "$PLUGIN_DIR/runtime.py"
+  [[ $actual == $'0:0:700\n10000:10000:600\n10000:10000:600' ]] || die "assistant package ownership/mode mismatch: ${actual}"
+
+  for served_profile in "${SERVED_PROFILES[@]}"; do
+    command_output actual stat -c '%u:%g:%a' "${PROFILES_DIR}/${served_profile}"
+    [[ $actual == '10000:10000:700' ]] || die "profile home ownership/mode mismatch: ${served_profile}"
+  done
+  for client_profile in "${CLIENT_PROFILES[@]}"; do
+    command_output actual stat -c '%u:%g:%a' \
+      "${PROFILES_DIR}/${client_profile}/plugins/scotty_business/plugin.yaml"
+    [[ $actual == '10000:10000:600' ]] || die "client profile plugin staging mismatch: ${client_profile}"
+  done
+  [[ ! -e ${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_business ]] \
+    || die 'the full profile home must not carry the bounded plugin'
+  command_output actual stat -c '%u:%g:%a' \
+    "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard/plugin.yaml"
+  [[ $actual == '10000:10000:600' ]] || die 'maintainer guard staging mismatch'
+  for client_profile in "${CLIENT_PROFILES[@]}"; do
+    [[ ! -e ${PROFILES_DIR}/${client_profile}/plugins/scotty_guard ]] \
+      || die "client profile must not carry the maintainer guard: ${client_profile}"
+  done
 
   systemctl is-active --quiet scotty-egress-guard.service || die 'firewall service is not active'
   "$GUARD_BIN" verify
@@ -379,7 +568,31 @@ preflight
 install_owned CREATED_ROOT "$TARGET_ROOT" -d -o root -g root -m 0700 "$TARGET_ROOT"
 install_owned CREATED_OPERATOR "$OPERATOR_DIR" -d -o root -g root -m 0700 "$OPERATOR_DIR"
 install_owned CREATED_DATA "$DATA_DIR" -d -o 10000 -g 10000 -m 0700 "$DATA_DIR"
+install_owned CREATED_PLUGINS "$PLUGINS_DIR" -d -o 10000 -g 10000 -m 0700 "$PLUGINS_DIR"
+install_owned CREATED_PLUGIN "$PLUGIN_DIR" -d -o 10000 -g 10000 -m 0700 "$PLUGIN_DIR"
+install_owned CREATED_PLUGIN_ADAPTERS "$PLUGIN_ADAPTERS_DIR" -d -o 10000 -g 10000 -m 0700 "$PLUGIN_ADAPTERS_DIR"
 install_owned INSTALLED_COMPOSE "$COMPOSE_FILE" -o root -g root -m 0600 "$SOURCE_DIR/compose.yaml" "$COMPOSE_FILE"
+install_owned INSTALLED_SETUP "$SETUP_BIN" -o root -g root -m 0700 "$SOURCE_DIR/setup-scotty" "$SETUP_BIN"
+for plugin_file in "${PLUGIN_FILES[@]}"; do
+  install_plugin_file "$plugin_file"
+done
+install_profile_dir "$PROFILES_DIR"
+for served_profile in "${SERVED_PROFILES[@]}"; do
+  install_profile_dir "${PROFILES_DIR}/${served_profile}"
+done
+for client_profile in "${CLIENT_PROFILES[@]}"; do
+  install_profile_dir "${PROFILES_DIR}/${client_profile}/plugins"
+  install_profile_dir "${PROFILES_DIR}/${client_profile}/plugins/scotty_business"
+  install_profile_dir "${PROFILES_DIR}/${client_profile}/plugins/scotty_business/adapters"
+  for plugin_file in "${PLUGIN_FILES[@]}"; do
+    install_plugin_file "$plugin_file" "${PROFILES_DIR}/${client_profile}/plugins/scotty_business"
+  done
+done
+install_profile_dir "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins"
+install_profile_dir "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
+for guard_file in "${GUARD_FILES[@]}"; do
+  install_guard_file "$guard_file" "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
+done
 install_owned INSTALLED_GUARD "$GUARD_BIN" -o root -g root -m 0755 "$SOURCE_DIR/firewall/scotty-egress-guard" "$GUARD_BIN"
 install_owned INSTALLED_UNIT "$GUARD_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/firewall/scotty-egress-guard.service" "$GUARD_UNIT"
 RELOADED_SYSTEMD=1

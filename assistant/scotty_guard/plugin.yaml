@@ -1,0 +1,7 @@
+name: scotty-guard
+version: 1.0.0
+description: "Profile-local pre-dispatch authorization for the full maintainer profile. Registers no model tools and no prompt sections."
+author: The Closing Room
+provides_tools: []
+hooks:
+  - pre_gateway_dispatch

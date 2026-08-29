@@ -22,6 +22,10 @@ set -e
 
 bash -n install.sh firewall/scotty-egress-guard tests/test.sh tests/test_firewall_cleanup.sh tests/test_err_traps.sh tests/test_symlink_preflight.sh
 shellcheck -x install.sh firewall/scotty-egress-guard tests/test.sh tests/test_firewall_cleanup.sh tests/test_err_traps.sh tests/test_symlink_preflight.sh
+python3 -m compileall -q assistant tests tools
+python3 -m py_compile setup-scotty
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 tools/generate_checksums.py --check
 sha256sum -c SHA256SUMS
 
 docker compose -f compose.yaml config --quiet

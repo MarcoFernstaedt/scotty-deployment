@@ -1,0 +1,12 @@
+{
+  "contacts": [
+    {
+      "dateUpdated": "2026-08-28T12:00:00Z",
+      "email": "fixture@example.invalid",
+      "firstName": "Synthetic",
+      "id": "synthetic-contact-1",
+      "locationId": "synthetic-location-1",
+      "phone": "+15550000001"
+    }
+  ]
+}

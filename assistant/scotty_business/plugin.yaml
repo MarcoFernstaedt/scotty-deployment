@@ -1,0 +1,12 @@
+name: scotty-business
+version: 1.0.0
+description: "Bounded day-one business assistant for exact Discord principals and configured Trello, GoHighLevel, and RentCast resources."
+author: The Closing Room
+provides_tools:
+  - scotty_read
+  - scotty_propose
+  - scotty_approval
+  - scotty_reminder
+  - scotty_calculate
+hooks:
+  - pre_gateway_dispatch

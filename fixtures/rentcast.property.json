@@ -1,0 +1,10 @@
+{
+  "bathrooms": 2,
+  "bedrooms": 3,
+  "formattedAddress": "123 Synthetic Avenue, Example, AZ 85000",
+  "id": "synthetic-property-1",
+  "lastUpdatedDate": "2026-08-28T12:00:00Z",
+  "latitude": 33.0,
+  "longitude": -112.0,
+  "propertyType": "Single Family"
+}

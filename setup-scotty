@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Run the installed Scotty hidden-input setup command."""
+
+import sys
+
+sys.path.insert(0, "/srv/Scotty/data/plugins")
+
+from scotty_business.setup import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

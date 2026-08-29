@@ -1,0 +1,33 @@
+{
+  "_comment": "Synthetic Discord-only private runtime configuration. Trello, GoHighLevel and RentCast are absent, so Scotty starts with each reported as not connected.",
+  "addons": [
+    "discord",
+    "trello",
+    "ghl",
+    "rentcast"
+  ],
+  "discord": {
+    "announcement_channel_ids": [
+      "210000000000000001"
+    ]
+  },
+  "maintainer_route": {
+    "channel_id": "220000000000000001",
+    "guild_id": "110000000000000001",
+    "profile": "scotty-maintainer",
+    "user_id": "320000000000000001"
+  },
+  "principals": {
+    "employee": {
+      "channel_id": "202000000000000001",
+      "guild_id": "100000000000000001",
+      "user_id": "302000000000000001"
+    },
+    "main_operator": {
+      "channel_id": "201000000000000001",
+      "guild_id": "100000000000000001",
+      "user_id": "301000000000000001"
+    }
+  },
+  "version": 1
+}
