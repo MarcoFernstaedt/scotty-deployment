@@ -34,6 +34,8 @@ from .routing import (
 
 _DATA_DIR = Path("/srv/Scotty/data")
 _PROFILES_DIRNAME = "profiles"
+#: Registers only a pre-dispatch authorization hook. No tools, no prompt.
+GUARD_PLUGIN = "scotty-guard"
 _VIEW_CHANNEL = 1 << 10
 _SEND_MESSAGES = 1 << 11
 _READ_HISTORY = 1 << 16
@@ -48,6 +50,11 @@ _MODEL_SECRET_ENV = {
 }
 _MODEL_PROVIDERS = (CODEX_PROVIDER, *sorted(_MODEL_SECRET_ENV))
 
+#: The pinned gateway admits a Discord sender only when their ID appears here.
+#: It is generated deterministically from the three configured principals; it is
+#: never a wildcard, a role, an open policy, or a manual post-install pairing.
+DISCORD_ALLOWED_USERS_ENV = "DISCORD_ALLOWED_USERS"
+
 #: Only Discord is required on day one. Every other provider connects later.
 REQUIRED_SECRETS = ("DISCORD_BOT_TOKEN",)
 OPTIONAL_SECRETS = (
@@ -58,6 +65,7 @@ OPTIONAL_SECRETS = (
 )
 _SAFE_SECRET = re.compile(r"[A-Za-z0-9._:/+\-=]+")
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9._:/+\-]+")
+_SAFE_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/+,\-=]+")
 
 
 class SetupError(RuntimeError):
@@ -469,6 +477,29 @@ def _require_provisioned(inputs: SetupInputs) -> None:
         raise SetupError("the operator and employee private channels are not provisioned yet")
 
 
+def discord_allowed_users(inputs: SetupInputs) -> tuple[str, ...]:
+    """The exact senders the gateway may admit, in a deterministic order."""
+
+    users = (inputs.route_user_id, inputs.operator_user_id, inputs.employee_user_id)
+    if not all(users):
+        raise SetupError("every configured principal needs a Discord user ID")
+    if len(set(users)) != len(users):
+        raise SetupError("the configured principals must be distinct Discord users")
+    for user in users:
+        if not user.isdigit() or not 1 <= len(user) <= 20:
+            raise SetupError("a configured principal is not a Discord numeric ID")
+    return users
+
+
+def runtime_environment(inputs: SetupInputs) -> dict[str, str]:
+    """Every value written to the owner-only runtime environment file."""
+
+    environment = dict(inputs.secrets)
+    environment[DISCORD_ALLOWED_USERS_ENV] = ",".join(discord_allowed_users(inputs))
+    environment["SCOTTY_PRIVATE_CONFIG"] = "/opt/data/scotty/private.json"
+    return environment
+
+
 def profile_routes(inputs: SetupInputs) -> list[dict[str, str]]:
     """The three native `gateway.profile_routes` entries this deployment serves."""
 
@@ -544,28 +575,38 @@ def render_hermes_config(inputs: SetupInputs) -> str:
     return render_mapping(mapping)
 
 
-def profile_config_mapping(profile: str) -> dict[str, object]:
-    """Per-profile configuration for one served profile."""
+def profile_config_mapping(profile: str, inputs: SetupInputs) -> dict[str, object]:
+    """Per-profile configuration for one served profile.
+
+    The pinned runtime scopes configuration to each profile home, so the model
+    the operator selected during setup is restated here. Nothing is hard-coded
+    and no provider default is relied on.
+    """
 
     if profile not in SERVED_PROFILES:
         raise ProfileRouteError("profile is not served by this deployment")
+    model = {"provider": inputs.model_provider, "default": inputs.model_name}
     if profile == MAINTAINER_PROFILE:
-        # A normal full profile: no bounded plugin, no bounded toolset, and no
-        # bounded identity section, because the plugin is not installed here.
+        # A normal full profile: the bounded business plugin is never staged or
+        # enabled here, so it carries no bounded toolset and no client identity.
+        # Only the profile-local authorization guard runs, and it registers no
+        # model tools and no prompt section.
         return {
-            "plugins": {"enabled": []},
+            "model": model,
+            "plugins": {"enabled": [GUARD_PLUGIN]},
             "platform_toolsets": {"discord": ["*"]},
             "tools": {"tool_search": {"enabled": True}},
         }
     return {
+        "model": model,
         "plugins": {"enabled": ["scotty-business"]},
         "platform_toolsets": {"discord": ["scotty"]},
         "tools": {"tool_search": {"enabled": False}},
     }
 
 
-def render_profile_config(profile: str) -> str:
-    return render_mapping(profile_config_mapping(profile))
+def render_profile_config(profile: str, inputs: SetupInputs) -> str:
+    return render_mapping(profile_config_mapping(profile, inputs))
 
 
 def channel_plans(inputs: SetupInputs) -> tuple[ChannelPlan, ...]:
@@ -684,6 +725,7 @@ def profile_home(root: Path, profile: str) -> Path:
 
 def ensure_profile_homes(
     root: Path,
+    inputs: SetupInputs,
     profiles: Sequence[str] = SERVED_PROFILES,
     *,
     owner_uid: int = 10000,
@@ -703,18 +745,27 @@ def ensure_profile_homes(
         _ensure_directory(home, owner_uid, owner_gid)
         _atomic_private_write(
             home / "config.yaml",
-            render_profile_config(profile).encode("utf-8"),
+            render_profile_config(profile, inputs).encode("utf-8"),
             owner_uid,
             owner_gid,
         )
         staged = home / "plugins" / "scotty_business" / "plugin.yaml"
+        guard = home / "plugins" / "scotty_guard" / "plugin.yaml"
         if profile == MAINTAINER_PROFILE:
             if staged.exists():
                 raise SetupError("the full profile must not carry the bounded Scotty plugin")
-        elif not staged.is_file() or staged.is_symlink():
-            raise SetupError(
-                "a client profile is missing its staged Scotty plugin; reinstall before setup"
-            )
+            if not guard.is_file() or guard.is_symlink():
+                raise SetupError(
+                    "the full profile is missing its staged authorization guard; "
+                    "reinstall before setup"
+                )
+        else:
+            if not staged.is_file() or staged.is_symlink():
+                raise SetupError(
+                    "a client profile is missing its staged Scotty plugin; reinstall before setup"
+                )
+            if guard.exists():
+                raise SetupError("a client profile must not carry the maintainer guard")
         if not home.is_dir():
             raise SetupError("a served profile home is missing")
         homes[profile] = home
@@ -738,13 +789,14 @@ def write_private_state(
         )
         + b"\n"
     )
+    environment = runtime_environment(inputs)
     env_lines = []
-    for name in sorted(inputs.secrets):
-        value = inputs.secrets[name]
-        if not _SAFE_SECRET.fullmatch(value):
-            raise SetupError("credential contains unsupported characters")
+    for name in sorted(environment):
+        value = environment[name]
+        if not _SAFE_SECRET.fullmatch(value) and not _SAFE_ENV_VALUE.fullmatch(value):
+            raise SetupError("a runtime environment value contains unsupported characters")
         env_lines.append(f"{name}={value}")
-    ensure_profile_homes(root, owner_uid=owner_uid, owner_gid=owner_gid)
+    ensure_profile_homes(root, inputs, owner_uid=owner_uid, owner_gid=owner_gid)
     _atomic_private_write(scotty_dir / "private.json", private_json, owner_uid, owner_gid)
     _atomic_private_write(
         root / "config.yaml", render_hermes_config(inputs).encode("utf-8"), owner_uid, owner_gid
@@ -861,8 +913,11 @@ __all__ = [
     "MEMBER_ALLOW",
     "SetupError",
     "SetupInputs",
+    "DISCORD_ALLOWED_USERS_ENV",
+    "GUARD_PLUGIN",
     "channel_plans",
     "collect_inputs",
+    "discord_allowed_users",
     "ensure_profile_homes",
     "hermes_config_mapping",
     "main",
@@ -876,6 +931,7 @@ __all__ = [
     "render_mapping",
     "render_profile_config",
     "resolve_provisioned_channels",
+    "runtime_environment",
     "validate_discord_scope",
     "validate_maintainer_route",
     "write_private_state",

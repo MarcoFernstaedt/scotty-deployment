@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 from .config import RuntimeConfig
-from .policy import CODING_REFUSAL, EMPLOYEE_SUMMARY, Role
+from .policy import (
+    CODING_REFUSAL,
+    EMPLOYEE_SUMMARY,
+    FIXED_WIZARD_COMMAND,
+    SETUP_WIZARD,
+    Role,
+)
 from .routing import RouteKind, resolve_route
+from .wizard import deliver_once, message_key
 
 EMPLOYEE_SUMMARY_COMMAND = "Scotty, send the employee summary."
 CREDENTIAL_ROTATION_NOTICE = (
@@ -36,9 +44,11 @@ class IngressGuard:
         self,
         config: RuntimeConfig,
         enqueue: Callable[[str, str], object],
+        marker_root: Path | None = None,
     ) -> None:
         self.config = config
         self.enqueue = enqueue
+        self.marker_root = marker_root
 
     def __call__(self, event: object, **_: object) -> Mapping[str, str]:
         source = getattr(event, "source", None)
@@ -55,6 +65,9 @@ class IngressGuard:
                 self.enqueue(route.principal.channel_id, CREDENTIAL_ROTATION_NOTICE)
             return {"action": "skip", "reason": "credential-redacted"}
         if route.kind is RouteKind.MAINTAINER:
+            if stripped == FIXED_WIZARD_COMMAND:
+                self.send_wizard(event, stripped)
+                return {"action": "skip", "reason": "fixed-wizard"}
             return {"action": "allow"}
         principal = route.principal
         if principal is None:
@@ -65,6 +78,10 @@ class IngressGuard:
         if any(pattern.search(stripped) for pattern in _CODING_PATTERNS):
             self.enqueue(principal.channel_id, CODING_REFUSAL)
             return {"action": "skip", "reason": "coding-refusal"}
+        if stripped == FIXED_WIZARD_COMMAND:
+            # Only the exact maintainer tuple may trigger it. Every other
+            # principal gets no wizard, no reply, and no disclosure.
+            return {"action": "skip", "reason": "fixed-wizard"}
         if stripped == EMPLOYEE_SUMMARY_COMMAND:
             destination = next(
                 item.channel_id for item in self.config.principals if item.role == Role.EMPLOYEE
@@ -72,3 +89,23 @@ class IngressGuard:
             self.enqueue(destination, EMPLOYEE_SUMMARY)
             return {"action": "skip", "reason": "fixed-employee-summary"}
         return {"action": "allow"}
+
+    def send_wizard(self, event: object, stripped: str) -> bool:
+        """Deliver the fixed wizard to the configured main-operator channel only.
+
+        The destination comes from private configuration, never from the model
+        and never from the message. Delivery is claimed once per inbound
+        message, so the root hook and the profile-local guard cannot both send.
+        """
+
+        destination = self.config.principal_for(Role.MAIN_OPERATOR).channel_id
+        if self.marker_root is None:
+            self.enqueue(destination, SETUP_WIZARD)
+            return True
+        return deliver_once(
+            self.marker_root,
+            message_key(event, stripped),
+            destination,
+            SETUP_WIZARD,
+            self.enqueue,
+        )

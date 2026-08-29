@@ -261,6 +261,7 @@ class Runtime:
             else UnconnectedProvider("RentCast")
         )
         state_dir = home / "scotty"
+        self.state_dir = state_dir
         self.approvals = ApprovalStore(state_dir / "approvals.db")
         self.approvals.initialize()
         self.approvals.recover_interrupted()
@@ -452,7 +453,7 @@ class Controller:
             runtime = self.runtime()
         except Exception:
             return {"action": "skip", "reason": "unavailable"}
-        return IngressGuard(runtime.config, self.enqueue)(event)
+        return IngressGuard(runtime.config, self.enqueue, runtime.state_dir)(event)
 
     def tool(self, kind: str, args: object, **kwargs: object) -> str:
         try:

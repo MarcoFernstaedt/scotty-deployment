@@ -42,7 +42,9 @@ def client_facing_strings() -> dict[str, str]:
         "identity_prompt": plugin._IDENTITY_PROMPT,
     }
     for profile_name in CLIENT_PROFILES.values():
-        strings[f"profile_config:{profile_name}"] = render_profile_config(profile_name)
+        strings[f"profile_config:{profile_name}"] = render_profile_config(
+            profile_name, maintainer_sample()
+        )
     for name in guidance.PROVIDERS:
         strings[f"guidance:{name}"] = guidance.provider_guidance(name).as_text()
     strings["guidance:index"] = guidance.all_provider_guidance_text()
@@ -134,7 +136,7 @@ class OwnerOnlyRuntimeConfigTests(unittest.TestCase):
         self.assertIn('discord: ["scotty"]', rendered)
 
     def test_the_full_profile_config_carries_no_bounded_client_identity(self) -> None:
-        rendered = render_profile_config(MAINTAINER_PROFILE)
+        rendered = render_profile_config(MAINTAINER_PROFILE, maintainer_sample())
         self.assertNotIn("scotty-business", rendered)
         self.assertNotIn("Scotty by The Closing Room", rendered)
 

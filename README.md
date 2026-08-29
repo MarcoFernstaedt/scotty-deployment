@@ -15,7 +15,9 @@ The assistant adds these enforced boundaries:
 - Exact pre-model authorization matches `(guild_id, channel_id, user_id, role)` as one tuple. Mixed allowlist cross-products fail closed.
 - A thread is accepted only under the configured principal channel.
 - The gateway serves exactly three native profile routes: one full profile for the private route channel and one bounded profile per client channel. Each profile has its own home; the bounded plugin is staged only in the two client homes.
-- The plugin's own pre-dispatch gate additionally binds the acting user, which native routing does not match, and every unresolved source is rejected before any session or model activity.
+- The gateway admits only the three configured Discord senders, from a deterministic `DISCORD_ALLOWED_USERS` allowlist. That is admission only: a pre-dispatch gate in every profile additionally binds the acting user, which native routing does not match, and rejects every mixed tuple before any session or model activity.
+- The full profile carries `scotty-guard`, which registers one pre-dispatch hook and nothing else: no model tools, no prompt section, no bounded client identity. The two client profiles carry the bounded plugin instead.
+- Every served profile restates the provider and model chosen during setup, so a routed turn cannot silently fall back to a runtime default.
 - The base configuration is bounded, so a profile widens its own surface only by overriding it. A profile whose override fails to apply is bounded, never unbounded.
 - Client-visible Discord destinations are limited to the configured principal and announcement channels by construction.
 - Native Discord slash commands and automatic threads are disabled.
@@ -37,6 +39,8 @@ A prompt, folder name, model, or persona is not a security boundary. The code, e
 - `assistant/scotty_business/`: installable Hermes plugin and bounded business domain.
 - `assistant/scotty_business/ingress.py`: exact Discord tuple gate and fixed pre-model paths.
 - `assistant/scotty_business/routing.py`: the native profile-routing contract plus the plugin's own fail-closed pre-dispatch tuple gate.
+- `assistant/scotty_business/wizard.py`: single-delivery dispatch for the fixed onboarding wizard.
+- `assistant/scotty_guard/`: self-contained pre-dispatch authorization for the full profile. No tools, no prompt, no client identity.
 - `assistant/scotty_business/provisioning.py`: idempotent private-channel creation or reuse with preview, confirmation, and readback.
 - `assistant/scotty_business/guidance.py`: fixed, credential-free provider setup guidance.
 - `assistant/scotty_business/approvals.py`: SQLite proposal state machine with `BEGIN IMMEDIATE`, version compare-and-set, immutable fields, nonce claims, crash recovery, and reconciliation states.
@@ -81,7 +85,7 @@ fixtures. `make oauth-probe` reads the pinned image's own login subcommand from
 a disposable, network-disabled container; it is not part of `make verify`
 because it needs the pinned image present.
 
-`make smoke` uses a disposable, network-disabled container from the pinned image and proves Hermes 0.20.6 discovers exactly the five Scotty tools, and that the generated configuration parses into three native profile routes with the served allowlist and per-profile toolsets it expects. It does not use credentials or providers. `make package` writes ignored deterministic artifacts below `dist/`.
+`make smoke` uses a disposable, network-disabled container from the pinned image and proves Hermes 0.20.6 discovers exactly the five Scotty tools, and that the generated configuration parses into three native profile routes with the served allowlist and per-profile toolsets it expects. It also drives the runtime's own sender authorization, the full admit/deny tuple matrix through both pre-dispatch hooks, the fixed wizard dispatch, and profile-scoped model resolution. It does not use credentials or providers. `make package` writes ignored deterministic artifacts below `dist/`.
 
 ## Install without activation
 

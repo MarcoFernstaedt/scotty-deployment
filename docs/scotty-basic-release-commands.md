@@ -153,22 +153,29 @@ Expected: the proposal is not approved and nothing is executed. The employee may
 propose; approval belongs to the main operator or the maintainer, bound to the
 exact proposal and requester.
 
-### 5.4 Fixed employee summary
+### 5.4 Exact maintainer-triggered wizard command
+
+Send from the configured private route channel, as the configured route user,
+exactly:
+
+> Scotty, send Trent the setup wizard.
+
+Expected: the fixed onboarding wizard is delivered only to the main-operator
+channel, chosen by code rather than by the model, and exactly once per trigger.
+The same text from any other user, channel or guild sends nothing and reveals
+nothing. Nothing is ever sent automatically after installation, and repeating
+delivery requires the maintainer to repeat the exact trigger.
+
+### 5.5 Fixed employee summary
 
 Send from the main-operator or employee private channel, exactly:
 
 > Scotty, send the employee summary.
 
 Expected: the fixed summary is delivered only to the employee channel, chosen by
-code rather than by the model. Nothing is ever sent automatically after
-installation.
+code rather than by the model.
 
-The former `Scotty, send Trent the setup wizard.` command no longer exists. The
-maintainer now works from a separately served full profile that deliberately does
-not load the bounded Scotty plugin, so no deterministic pre-model path can run
-there. That trigger was retired rather than moved into the model's hands.
-
-### 5.5 `not connected` provider behaviour
+### 5.6 `not connected` provider behaviour
 
 Initial setup requires only the Discord bot token, the Discord identifiers, and
 the native Codex OAuth step. Trello, GoHighLevel, RentCast and Google Workspace

@@ -54,10 +54,32 @@ class InstallerPackageTests(unittest.TestCase):
             installer,
         )
         self.assertIn(
-            "[[ ! -e ${PROFILES_DIR}/scotty-maintainer/plugins ]]",
+            "[[ ! -e ${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_business ]]",
             installer,
         )
-        self.assertNotIn("${PROFILES_DIR}/scotty-maintainer/plugins/scotty_business", installer)
+
+    def test_installer_stages_the_guard_only_in_the_full_profile_home(self) -> None:
+        installer = Path("install.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'install_guard_file "$guard_file" '
+            '"${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"',
+            installer,
+        )
+        self.assertIn(
+            "[[ ! -e ${PROFILES_DIR}/${client_profile}/plugins/scotty_guard ]]", installer
+        )
+        guard_files = {
+            str(path.relative_to(Path("assistant/scotty_guard")))
+            for path in Path("assistant/scotty_guard").rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+        }
+        start = installer.index("readonly -a GUARD_FILES=(")
+        staged = {
+            line.strip().strip('"')
+            for line in installer[start : installer.index(")", start)].splitlines()[1:]
+            if line.strip()
+        }
+        self.assertEqual(staged, guard_files)
 
     def test_setup_wrapper_imports_only_the_installed_package(self) -> None:
         wrapper = Path("setup-scotty").read_text(encoding="utf-8")

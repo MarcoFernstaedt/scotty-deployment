@@ -17,6 +17,14 @@ readonly PROFILES_DIR=/srv/Scotty/data/profiles
 # profile homes are staged with it.
 readonly -a SERVED_PROFILES=(scotty-maintainer scotty-main-operator scotty-employee)
 readonly -a CLIENT_PROFILES=(scotty-main-operator scotty-employee)
+readonly MAINTAINER_PROFILE=scotty-maintainer
+# The guard registers only a pre-dispatch authorization hook: no model tools,
+# no prompt section, no bounded client identity.
+readonly -a GUARD_FILES=(
+  "__init__.py"
+  "plugin.yaml"
+  "guard.py"
+)
 readonly GUARD_BIN=/usr/local/libexec/scotty-egress-guard
 readonly GUARD_UNIT=/etc/systemd/system/scotty-egress-guard.service
 readonly CONTAINER=scotty
@@ -61,6 +69,7 @@ readonly -a PLUGIN_FILES=(
   "runtime.py"
   "service.py"
   "setup.py"
+  "wizard.py"
   "adapters/__init__.py"
   "adapters/discord.py"
   "adapters/ghl.py"
@@ -157,6 +166,26 @@ install_profile_dir() {
   fi
   (( install_rc == 0 )) || die "profile directory install failed for ${target} (status ${install_rc})"
   [[ -d $target && ! -L $target ]] || die "profile directory is absent after install: ${target}"
+}
+
+install_guard_file() {
+  local relative=$1 root=$2 source target install_rc
+  source=${SOURCE_DIR}/assistant/scotty_guard/${relative}
+  target=${root}/${relative}
+  [[ -f $source && ! -L $source ]] || die "guard source is absent or unsafe: ${relative}"
+  require_safe_ancestors "$target"
+  require_absent_destination "$target"
+  explicit_status_begin
+  install -o 10000 -g 10000 -m 0600 "$source" "$target"
+  install_rc=$?
+  explicit_status_end
+  if [[ -f $target && ! -L $target ]]; then
+    INSTALLED_PLUGIN_FILES+=("$target")
+  elif [[ -L $target ]]; then
+    die "guard install produced or encountered an unowned symlink: ${target}"
+  fi
+  (( install_rc == 0 )) || die "guard install failed for ${relative} (status ${install_rc})"
+  [[ -f $target && ! -L $target ]] || die "guard install reported success but target is absent: ${relative}"
 }
 
 install_plugin_file() {
@@ -520,8 +549,15 @@ verify_install() {
       "${PROFILES_DIR}/${client_profile}/plugins/scotty_business/plugin.yaml"
     [[ $actual == '10000:10000:600' ]] || die "client profile plugin staging mismatch: ${client_profile}"
   done
-  [[ ! -e ${PROFILES_DIR}/scotty-maintainer/plugins ]] \
+  [[ ! -e ${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_business ]] \
     || die 'the full profile home must not carry the bounded plugin'
+  command_output actual stat -c '%u:%g:%a' \
+    "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard/plugin.yaml"
+  [[ $actual == '10000:10000:600' ]] || die 'maintainer guard staging mismatch'
+  for client_profile in "${CLIENT_PROFILES[@]}"; do
+    [[ ! -e ${PROFILES_DIR}/${client_profile}/plugins/scotty_guard ]] \
+      || die "client profile must not carry the maintainer guard: ${client_profile}"
+  done
 
   systemctl is-active --quiet scotty-egress-guard.service || die 'firewall service is not active'
   "$GUARD_BIN" verify
@@ -551,6 +587,11 @@ for client_profile in "${CLIENT_PROFILES[@]}"; do
   for plugin_file in "${PLUGIN_FILES[@]}"; do
     install_plugin_file "$plugin_file" "${PROFILES_DIR}/${client_profile}/plugins/scotty_business"
   done
+done
+install_profile_dir "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins"
+install_profile_dir "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
+for guard_file in "${GUARD_FILES[@]}"; do
+  install_guard_file "$guard_file" "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
 done
 install_owned INSTALLED_GUARD "$GUARD_BIN" -o root -g root -m 0755 "$SOURCE_DIR/firewall/scotty-egress-guard" "$GUARD_BIN"
 install_owned INSTALLED_UNIT "$GUARD_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/firewall/scotty-egress-guard.service" "$GUARD_UNIT"

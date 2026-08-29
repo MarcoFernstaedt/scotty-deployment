@@ -8,7 +8,7 @@ lint:
 	shellcheck -x install.sh firewall/scotty-egress-guard tests/*.sh
 
 typecheck:
-	uvx mypy@1.17.1 assistant/scotty_business tools
+	uvx mypy@1.17.1 assistant/scotty_business assistant/scotty_guard tools
 
 test:
 	./tests/test.sh
@@ -19,6 +19,7 @@ acceptance:
 package:
 	python3 tools/build_package.py
 	cd dist && sha256sum -c scotty-business-1.0.0.tar.gz.sha256
+	cd dist && sha256sum -c scotty-guard-1.0.0.tar.gz.sha256
 
 smoke:
 	python3 tools/pinned_smoke.py

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import synthetic
 from synthetic import (
@@ -17,7 +19,12 @@ from synthetic import (
 
 from assistant.scotty_business.config import ConfigError, RuntimeConfig
 from assistant.scotty_business.ingress import EMPLOYEE_SUMMARY_COMMAND, IngressGuard
-from assistant.scotty_business.policy import Role
+from assistant.scotty_business.policy import (
+    EMPLOYEE_SUMMARY,
+    FIXED_WIZARD_COMMAND,
+    SETUP_WIZARD,
+    Role,
+)
 from assistant.scotty_business.routing import (
     ALL_TOOLSETS,
     CLIENT_PROFILES,
@@ -223,10 +230,122 @@ class IngressRouteTests(unittest.TestCase):
         self.assertEqual(result["action"], "skip")
         self.assertEqual(self.outbound, [])
 
-    def test_the_retired_wizard_command_is_an_ordinary_message(self) -> None:
-        result = self.guard(synthetic.event(text="Scotty, send Trent the setup wizard."))
-        self.assertEqual(result, {"action": "allow"})
-        self.assertEqual(self.outbound, [], "no fixed wizard path remains")
+    def test_only_the_exact_maintainer_tuple_triggers_the_fixed_wizard(self) -> None:
+        result = self.guard(
+            synthetic.event(
+                guild=ROUTE_GUILD,
+                channel=ROUTE_CHANNEL,
+                user=ROUTE_USER,
+                text=FIXED_WIZARD_COMMAND,
+            )
+        )
+        self.assertEqual(result, {"action": "skip", "reason": "fixed-wizard"})
+        self.assertEqual(self.outbound, [(OPERATOR_CHANNEL, SETUP_WIZARD)])
+
+    def test_the_wizard_destination_is_chosen_by_code_not_by_the_model(self) -> None:
+        self.guard(
+            synthetic.event(
+                guild=ROUTE_GUILD,
+                channel=ROUTE_CHANNEL,
+                user=ROUTE_USER,
+                text=FIXED_WIZARD_COMMAND,
+            )
+        )
+        destinations = {channel for channel, _ in self.outbound}
+        self.assertEqual(destinations, {OPERATOR_CHANNEL})
+        self.assertNotIn(ROUTE_CHANNEL, destinations)
+        self.assertNotIn(EMPLOYEE_CHANNEL, destinations)
+
+    def test_client_principals_get_no_wizard_and_no_disclosure(self) -> None:
+        for channel, user in (
+            (OPERATOR_CHANNEL, OPERATOR_USER),
+            (EMPLOYEE_CHANNEL, EMPLOYEE_USER),
+        ):
+            with self.subTest(channel=channel):
+                result = self.guard(
+                    synthetic.event(channel=channel, user=user, text=FIXED_WIZARD_COMMAND)
+                )
+                self.assertEqual(result, {"action": "skip", "reason": "fixed-wizard"})
+        self.assertEqual(self.outbound, [], "no wizard and no reply for a wrong principal")
+
+    def test_mixed_tuples_get_no_wizard(self) -> None:
+        for candidate in (
+            synthetic.event(
+                channel=OPERATOR_CHANNEL, user=EMPLOYEE_USER, text=FIXED_WIZARD_COMMAND
+            ),
+            synthetic.event(
+                guild=ROUTE_GUILD,
+                channel=ROUTE_CHANNEL,
+                user=OPERATOR_USER,
+                text=FIXED_WIZARD_COMMAND,
+            ),
+            synthetic.event(
+                guild=CLIENT_GUILD,
+                channel=ROUTE_CHANNEL,
+                user=ROUTE_USER,
+                text=FIXED_WIZARD_COMMAND,
+            ),
+        ):
+            with self.subTest(source=candidate.source):
+                self.assertEqual(self.guard(candidate)["action"], "skip")
+        self.assertEqual(self.outbound, [])
+
+    def test_the_wizard_is_never_sent_without_the_exact_trigger(self) -> None:
+        for text in (
+            "scotty, send trent the setup wizard.",
+            "Scotty, send Trent the setup wizard",
+            "send Trent the wizard please",
+        ):
+            with self.subTest(text=text):
+                self.guard(
+                    synthetic.event(
+                        guild=ROUTE_GUILD, channel=ROUTE_CHANNEL, user=ROUTE_USER, text=text
+                    )
+                )
+        self.assertEqual(self.outbound, [])
+
+    def test_the_employee_summary_still_works_alongside_the_wizard(self) -> None:
+        self.guard(synthetic.event(text=EMPLOYEE_SUMMARY_COMMAND))
+        self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, EMPLOYEE_SUMMARY)])
+
+
+class WizardSingleDeliveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory(prefix="scotty-wizard-test-")
+        self.outbound: list[tuple[str, str]] = []
+        self.guard = IngressGuard(
+            synthetic.config(),
+            lambda channel, text: self.outbound.append((channel, text)),
+            Path(self.tempdir.name),
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def trigger(self, message_id: str) -> object:
+        candidate = synthetic.event(
+            guild=ROUTE_GUILD,
+            channel=ROUTE_CHANNEL,
+            user=ROUTE_USER,
+            text=FIXED_WIZARD_COMMAND,
+        )
+        candidate.message_id = message_id
+        return candidate
+
+    def test_two_hooks_on_one_message_deliver_exactly_once(self) -> None:
+        candidate = self.trigger("800000000000000001")
+        self.guard(candidate)
+        self.guard(candidate)
+        self.assertEqual(self.outbound, [(OPERATOR_CHANNEL, SETUP_WIZARD)])
+
+    def test_an_explicit_repeat_delivers_again(self) -> None:
+        self.guard(self.trigger("800000000000000001"))
+        self.guard(self.trigger("800000000000000002"))
+        self.assertEqual(len(self.outbound), 2)
+
+    def test_nothing_is_delivered_without_a_trigger(self) -> None:
+        self.guard(synthetic.event(guild=ROUTE_GUILD, channel=ROUTE_CHANNEL, user=ROUTE_USER))
+        self.assertEqual(self.outbound, [])
 
 
 if __name__ == "__main__":

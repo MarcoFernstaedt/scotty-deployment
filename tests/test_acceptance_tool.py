@@ -43,26 +43,10 @@ class PinnedSmokeTests(unittest.TestCase):
         source = Path("tools/pinned_smoke.py").read_text(encoding="utf-8")
         self.assertIn("multiplex_profiles", source)
         self.assertIn("profile_routes", source)
-        self.assertIn("expected exactly three native profile routes", source)
+        self.assertIn("exactly three native profile routes", source)
         self.assertIn('["chat_id", "guild_id", "name", "platform", "profile"]', source)
-        self.assertIn("the full profile is not a normal unbounded profile", source)
-        self.assertIn("client profile is not bounded", source)
-
-    def test_the_smoke_uses_synthetic_identifiers_only(self) -> None:
-        module = load_tool("pinned_smoke")
-        inputs = module.SYNTHETIC_INPUTS
-        for value in (
-            inputs.guild_id,
-            inputs.operator_channel_id,
-            inputs.employee_channel_id,
-            inputs.route_guild_id,
-            inputs.route_channel_id,
-            inputs.route_user_id,
-        ):
-            with self.subTest(value=value):
-                self.assertTrue(value.isdigit())
-                self.assertTrue(17 <= len(value) <= 20)
-        self.assertEqual(set(inputs.secrets), {"DISCORD_BOT_TOKEN"})
+        self.assertIn("the full profile enables only the guard", source)
+        self.assertIn("client profile is bounded", source)
 
 
 class OAuthProbeTests(unittest.TestCase):

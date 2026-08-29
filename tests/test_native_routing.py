@@ -171,15 +171,17 @@ class NativeRouteMatcherTests(unittest.TestCase):
 
 class ProfileConfigTests(unittest.TestCase):
     def test_the_maintainer_profile_enables_no_plugin_and_keeps_the_full_inventory(self) -> None:
-        profile = profile_config_mapping(MAINTAINER_PROFILE)
-        self.assertEqual(profile["plugins"], {"enabled": []})
+        profile = profile_config_mapping(MAINTAINER_PROFILE, maintainer_sample())
+        self.assertEqual(profile["plugins"], {"enabled": ["scotty-guard"]})
         toolsets = profile["platform_toolsets"]
         assert isinstance(toolsets, dict)
         self.assertEqual(toolsets["discord"], ["*"])
         tools = profile["tools"]
         assert isinstance(tools, dict)
         self.assertEqual(tools["tool_search"], {"enabled": True})
-        self.assertNotIn("scotty", render_profile_config(MAINTAINER_PROFILE))
+        rendered = render_profile_config(MAINTAINER_PROFILE, maintainer_sample())
+        self.assertNotIn("scotty-business", rendered)
+        self.assertNotIn('discord: ["scotty"]', rendered)
 
     def test_the_base_configuration_is_bounded_so_a_failed_override_stays_bounded(self) -> None:
         """A profile widens its own surface. It never inherits a wider default."""
@@ -195,7 +197,7 @@ class ProfileConfigTests(unittest.TestCase):
     def test_each_client_profile_enables_only_the_bounded_scotty_toolset(self) -> None:
         for profile_name in CLIENT_PROFILES.values():
             with self.subTest(profile=profile_name):
-                profile = profile_config_mapping(profile_name)
+                profile = profile_config_mapping(profile_name, maintainer_sample())
                 self.assertEqual(profile["plugins"], {"enabled": ["scotty-business"]})
                 toolsets = profile["platform_toolsets"]
                 assert isinstance(toolsets, dict)
@@ -206,7 +208,7 @@ class ProfileConfigTests(unittest.TestCase):
 
     def test_an_unserved_profile_name_is_refused(self) -> None:
         with self.assertRaises(ProfileRouteError):
-            profile_config_mapping("not-a-served-profile")
+            profile_config_mapping("not-a-served-profile", maintainer_sample())
 
     def test_client_and_maintainer_profiles_are_distinct(self) -> None:
         self.assertNotIn(MAINTAINER_PROFILE, CLIENT_PROFILES.values())

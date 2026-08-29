@@ -35,6 +35,8 @@ from assistant.scotty_business.ingress import (  # noqa: E402
 from assistant.scotty_business.policy import (  # noqa: E402
     CODING_REFUSAL,
     EMPLOYEE_SUMMARY,
+    FIXED_WIZARD_COMMAND,
+    SETUP_WIZARD,
     Principal,
     Role,
     can_approve,
@@ -59,11 +61,19 @@ from assistant.scotty_business.routing import (  # noqa: E402
 from assistant.scotty_business.setup import (  # noqa: E402
     CODEX_AUTH_COMMAND,
     CODEX_PROVIDER,
+    DISCORD_ALLOWED_USERS_ENV,
+    GUARD_PLUGIN,
     SetupInputs,
+    discord_allowed_users,
     hermes_config_mapping,
     next_steps,
     private_mapping,
     profile_config_mapping,
+    runtime_environment,
+)
+from assistant.scotty_guard.guard import (  # noqa: E402
+    GuardConfig,
+    MaintainerGuard,
 )
 
 FIXTURES = ROOT / "fixtures"
@@ -183,8 +193,12 @@ def check_native_configuration(runtime_config: RuntimeConfig) -> None:
             match_profile_route(routes, candidate) is None,
         )
 
-    full = profile_config_mapping(MAINTAINER_PROFILE)
-    check("the full profile enables no bounded plugin", full["plugins"] == {"enabled": []})
+    inputs = setup_inputs(runtime_config)
+    full = profile_config_mapping(MAINTAINER_PROFILE, inputs)
+    check(
+        "the full profile enables only the authorization guard",
+        full["plugins"] == {"enabled": [GUARD_PLUGIN]},
+    )
     check(
         "the full profile keeps the normal tool inventory",
         full["platform_toolsets"] == {"discord": ["*"]},
@@ -194,7 +208,7 @@ def check_native_configuration(runtime_config: RuntimeConfig) -> None:
         "scotty-business" not in json.dumps(full),
     )
     for name in CLIENT_PROFILES.values():
-        bounded = profile_config_mapping(name)
+        bounded = profile_config_mapping(name, inputs)
         check(
             f"{name} enables only the bounded Scotty toolset",
             bounded["plugins"] == {"enabled": ["scotty-business"]}
@@ -204,6 +218,21 @@ def check_native_configuration(runtime_config: RuntimeConfig) -> None:
         "the base configuration is bounded so a failed override stays bounded",
         mapping["platform_toolsets"] == {"discord": ["scotty"]},
     )
+    for name in SERVED_PROFILES:
+        check(
+            f"{name} keeps the setup-selected provider and model",
+            profile_config_mapping(name, inputs)["model"] == mapping["model"],
+        )
+
+    environment = runtime_environment(inputs)
+    allowed = discord_allowed_users(inputs)
+    check(
+        "the gateway sender allowlist is exactly the three configured users",
+        environment[DISCORD_ALLOWED_USERS_ENV] == ",".join(allowed) and len(allowed) == 3,
+    )
+    rendered_env = "\n".join(f"{key}={value}" for key, value in environment.items())
+    for forbidden in ("DISCORD_ALLOW_ALL_USERS", "DISCORD_ALLOWED_ROLES", "everyone"):
+        check(f"no open sender policy is generated: {forbidden}", forbidden not in rendered_env)
 
 
 def check_routing(runtime_config: RuntimeConfig) -> None:
@@ -267,11 +296,116 @@ def check_routing(runtime_config: RuntimeConfig) -> None:
     check("rejected before dispatch: bot author", resolve_route(runtime_config, bot) is None)
 
 
+def check_maintainer_guard(runtime_config: RuntimeConfig) -> None:
+    """The profile-local gate that supplies the user match native routing lacks."""
+
+    route = runtime_config.maintainer_route
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+    with tempfile.TemporaryDirectory(prefix="scotty-guard-acceptance-") as directory:
+        sent: list[tuple[str, str]] = []
+        guard = MaintainerGuard(
+            GuardConfig(
+                guild_id=route.guild_id,
+                channel_id=route.channel_id,
+                user_id=route.user_id,
+                operator_channel_id=operator.channel_id,
+                state_dir=Path(directory),
+            ),
+            send=lambda channel, text: sent.append((channel, text)),
+        )
+
+        def guard_event(
+            guild: str, channel: str, user: str, text: str = "hello"
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                text=text,
+                message_id="800000000000000001",
+                source=source(guild, channel, user),
+            )
+
+        check(
+            "the guard admits the exact maintainer tuple",
+            guard(guard_event(route.guild_id, route.channel_id, route.user_id))
+            == {"action": "allow"},
+        )
+        denials = {
+            "unknown sender": ("999000000000000001",),
+            "operator in the private channel": (operator.user_id,),
+            "employee in the private channel": (employee.user_id,),
+        }
+        for label, (user,) in denials.items():
+            check(
+                f"the guard denies {label}",
+                guard(guard_event(route.guild_id, route.channel_id, user))
+                == {"action": "skip", "reason": "unauthorized"},
+            )
+        for label, candidate in (
+            (
+                "the maintainer in a client channel",
+                guard_event(operator.guild_id, operator.channel_id, route.user_id),
+            ),
+            (
+                "a wrong-parent thread",
+                SimpleNamespace(
+                    text="hello",
+                    message_id="800000000000000002",
+                    source=source(
+                        route.guild_id,
+                        "900000000000000001",
+                        route.user_id,
+                    ),
+                ),
+            ),
+        ):
+            check(
+                f"the guard denies {label}",
+                guard(candidate) == {"action": "skip", "reason": "unauthorized"},
+            )
+        check("no guard denial ever replies", sent == [])
+
+        wizard = guard_event(route.guild_id, route.channel_id, route.user_id, FIXED_WIZARD_COMMAND)
+        check(
+            "the exact trigger is handled before model execution",
+            guard(wizard) == {"action": "skip", "reason": "fixed-wizard"},
+        )
+        check(
+            "the fixed wizard reaches only the main-operator channel",
+            sent == [(operator.channel_id, SETUP_WIZARD)],
+        )
+        guard(wizard)
+        check("one inbound message delivers the wizard exactly once", len(sent) == 1)
+
+
 def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
     outbound: list[tuple[str, str]] = []
     guard = IngressGuard(runtime_config, lambda channel, text: outbound.append((channel, text)))
     operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
     employee = principal_for(runtime_config, Role.EMPLOYEE)
+
+    maintainer_source = source(
+        runtime_config.maintainer_route.guild_id,
+        runtime_config.maintainer_route.channel_id,
+        runtime_config.maintainer_route.user_id,
+    )
+    guard(SimpleNamespace(text=FIXED_WIZARD_COMMAND, source=maintainer_source))
+    check(
+        "the root hook also routes the fixed wizard only to the main operator",
+        outbound == [(operator.channel_id, SETUP_WIZARD)],
+    )
+    outbound.clear()
+    for wrong in (
+        SimpleNamespace(
+            text=FIXED_WIZARD_COMMAND,
+            source=source(operator.guild_id, operator.channel_id, operator.user_id),
+        ),
+        SimpleNamespace(
+            text=FIXED_WIZARD_COMMAND,
+            source=source(employee.guild_id, employee.channel_id, employee.user_id),
+        ),
+    ):
+        guard(wrong)
+    check("no client principal can trigger the wizard", outbound == [])
 
     guard(
         SimpleNamespace(
@@ -472,8 +606,13 @@ def check_secrecy(runtime_config: RuntimeConfig) -> None:
         [
             EMPLOYEE_SUMMARY,
             CODING_REFUSAL,
+            SETUP_WIZARD,
+            FIXED_WIZARD_COMMAND,
             *(provider_guidance(name).as_text() for name in PROVIDERS),
-            *(json.dumps(profile_config_mapping(name)) for name in CLIENT_PROFILES.values()),
+            *(
+                json.dumps(profile_config_mapping(name, setup_inputs(runtime_config)))
+                for name in CLIENT_PROFILES.values()
+            ),
         ]
     )
     for identifier in identifiers:
@@ -490,6 +629,7 @@ def main() -> int:
     runtime_config = config()
     check_native_configuration(runtime_config)
     check_routing(runtime_config)
+    check_maintainer_guard(runtime_config)
     check_fixed_paths(runtime_config)
     check_employee_denial(runtime_config)
     check_provider_guidance()

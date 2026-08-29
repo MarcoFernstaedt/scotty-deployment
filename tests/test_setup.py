@@ -325,10 +325,13 @@ class SetupTests(unittest.TestCase):
 
 
 def stage_client_plugins(root: Path) -> None:
-    """Mimic the installer staging the bounded plugin in each client home."""
+    """Mimic the installer staging each profile home's plugin."""
 
     for profile in SERVED_PROFILES:
         if profile == MAINTAINER_PROFILE:
+            staged = root / "profiles" / profile / "plugins" / "scotty_guard"
+            staged.mkdir(parents=True, exist_ok=True)
+            (staged / "plugin.yaml").write_text("name: scotty-guard\n", encoding="utf-8")
             continue
         staged = root / "profiles" / profile / "plugins" / "scotty_business"
         staged.mkdir(parents=True, exist_ok=True)
@@ -340,7 +343,9 @@ class ProfileHomeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="scotty-profiles-") as directory:
             root = Path(directory)
             stage_client_plugins(root)
-            homes = ensure_profile_homes(root, owner_uid=os.getuid(), owner_gid=os.getgid())
+            homes = ensure_profile_homes(
+                root, sample(), owner_uid=os.getuid(), owner_gid=os.getgid()
+            )
             self.assertEqual(set(homes), set(SERVED_PROFILES))
             self.assertEqual(len({str(path) for path in homes.values()}), 3)
             for profile, home in homes.items():
@@ -353,15 +358,19 @@ class ProfileHomeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="scotty-profiles-") as directory:
             root = Path(directory)
             stage_client_plugins(root)
-            first = ensure_profile_homes(root, owner_uid=os.getuid(), owner_gid=os.getgid())
-            second = ensure_profile_homes(root, owner_uid=os.getuid(), owner_gid=os.getgid())
+            first = ensure_profile_homes(
+                root, sample(), owner_uid=os.getuid(), owner_gid=os.getgid()
+            )
+            second = ensure_profile_homes(
+                root, sample(), owner_uid=os.getuid(), owner_gid=os.getgid()
+            )
             self.assertEqual(first, second)
 
     def test_a_client_profile_without_its_staged_plugin_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-profiles-") as directory:
             root = Path(directory)
             with self.assertRaises(SetupError):
-                ensure_profile_homes(root, owner_uid=os.getuid(), owner_gid=os.getgid())
+                ensure_profile_homes(root, sample(), owner_uid=os.getuid(), owner_gid=os.getgid())
 
     def test_the_full_profile_must_not_carry_the_bounded_plugin(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-profiles-") as directory:
@@ -371,7 +380,7 @@ class ProfileHomeTests(unittest.TestCase):
             leaked.mkdir(parents=True)
             (leaked / "plugin.yaml").write_text("name: scotty-business\n", encoding="utf-8")
             with self.assertRaises(SetupError):
-                ensure_profile_homes(root, owner_uid=os.getuid(), owner_gid=os.getgid())
+                ensure_profile_homes(root, sample(), owner_uid=os.getuid(), owner_gid=os.getgid())
 
 
 class MaintainerRouteSetupTests(unittest.TestCase):
@@ -513,7 +522,11 @@ class CodexAndOptionalProviderTests(unittest.TestCase):
                 discord_only_sample(), root, owner_uid=os.getuid(), owner_gid=os.getgid()
             )
             env = (root / ".env").read_text(encoding="utf-8")
-            self.assertEqual(env.strip(), "DISCORD_BOT_TOKEN=discord-secret")
+            self.assertIn("DISCORD_BOT_TOKEN=discord-secret", env)
+            self.assertEqual(
+                sorted(line.split("=", 1)[0] for line in env.strip().splitlines()),
+                ["DISCORD_ALLOWED_USERS", "DISCORD_BOT_TOKEN", "SCOTTY_PRIVATE_CONFIG"],
+            )
             for forbidden in ("OPENAI", "CODEX", "oauth", "refresh_token"):
                 self.assertNotIn(forbidden, env)
 

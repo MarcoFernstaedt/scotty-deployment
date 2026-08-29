@@ -227,6 +227,25 @@ gateway:
 - The base configuration is bounded, so a profile whose override fails to apply
   is bounded rather than unbounded.
 
+### 3b. Gateway sender authorization — added
+
+The generated `.env` carries `DISCORD_ALLOWED_USERS`, built deterministically
+from `route_user_id`, `operator_user_id` and `employee_user_id`. No wildcard, no
+role authorization, no `DISCORD_ALLOW_ALL_USERS`, and no manual post-install
+pairing. That is the gateway admission layer only; exact guild x channel x user
+tuple enforcement still runs before model dispatch and rejects every mixed
+tuple, including a mixed tuple whose sender is on the allowlist.
+
+### 3c. Fixed Trent wizard — restored
+
+`Scotty, send Trent the setup wizard.` works again. Only the exact maintainer
+tuple triggers it, it is handled before model execution, the destination comes
+from private configuration rather than the model, and one inbound message
+delivers exactly once even when two hooks observe it. Wrong users and mixed
+tuples get no wizard, no reply and no disclosure. Nothing is sent automatically
+after installation, and the wizard text never asks for a credential. The fixed
+employee summary is unchanged.
+
 ### 4. The inert plugin toolset hook — removed
 
 `resolve_enabled_toolsets_for_source` is not a plugin lifecycle hook and was
@@ -276,22 +295,39 @@ bot author, and every mixed cross-product receive no model run and no reply.
 Private-channel provisioning remains idempotent with permission readback, and
 `Administrator` is never required.
 
-### Retired capability
+### Pre-model enforcement paths
 
-The fixed command `Scotty, send Trent the setup wizard.` and its onboarding text
-are removed. Exactly three routes are served, the maintainer works from a full
-profile that deliberately does not load the bounded plugin, and no deterministic
-pre-model path can run there. The trigger was retired rather than handed to the
-model. The fixed employee summary is unchanged.
+There are two, and each is demonstrable rather than assumed:
+
+1. **Client profiles.** `scotty-business` is staged and enabled in each client
+   profile home and at the gateway root. Its `pre_gateway_dispatch` hook binds
+   the exact guild, channel and user, and rejects every mixed tuple before any
+   model runs.
+2. **The full maintainer profile.** `scotty-guard` is staged and enabled only in
+   that profile home. It registers one `pre_gateway_dispatch` hook and nothing
+   else: no model tools, no prompt section, no bounded client identity. It
+   supplies the user match that native profile routing does not perform, and it
+   owns the fixed wizard dispatch.
+
+The guard exists precisely so that maintainer enforcement does not depend on
+whether a root-registered hook also runs for a multiplexed profile turn.
+`make smoke` drives both paths inside the pinned image over the full
+admit/deny matrix, and `tests/test_pinned_smoke_contract.py` drives the same
+staged layout on the host.
 
 ### Remaining pinned-runtime uncertainty
 
-`make smoke` proves the generated configuration against the pinned image's own
-loader and asserts the routing shape and per-profile toolsets. It cannot prove
-that the runtime *reads* `profiles/<profile>/config.yaml` from each profile home,
-because that path convention was not verifiable here. The staging is hedged
-against both readings: the bounded plugin is present in each client profile home
-and absent from the full profile home, and the full profile's own configuration
-disables the plugin explicitly. Under either reading the failure direction is
-bounded clients, never an unbounded one. Confirm the profile-home path on the
-host before activation.
+`make smoke` is the only place these can be settled, and it needs the pinned
+image:
+
+- Whether the runtime reads `profiles/<profile>/config.yaml` from each profile
+  home. The staging is hedged: the bounded plugin is present in each client home
+  and absent from the full profile home, and the full profile's own
+  configuration enables only the guard. Under either reading the failure
+  direction is bounded clients, never an unbounded one.
+- The exact signature of `gateway/authz_mixin.py::_is_user_authorized`. The
+  probe locates it by name and drives it by introspection; if it cannot, the
+  smoke fails and prints the real signature rather than passing silently.
+- Whether the root-registered `pre_gateway_dispatch` hook runs for multiplexed
+  maintainer turns. The probe records which hook source it obtained. Enforcement
+  does not depend on the answer, because the profile-local guard covers it.
