@@ -1,0 +1,33 @@
+{
+  "_comment": "Synthetic Discord provisioning fixture. Every identifier is invented for tests and matches no real guild, user, bot, or channel.",
+  "bot": {
+    "id": "600000000000000001",
+    "bot": true,
+    "username": "synthetic-scotty-bot"
+  },
+  "guild": {
+    "id": "100000000000000001",
+    "owner_id": "999000000000000001",
+    "name": "Synthetic Client Guild"
+  },
+  "users": {
+    "main_operator": "301000000000000001",
+    "employee": "302000000000000001"
+  },
+  "roles": [
+    {
+      "id": "100000000000000001",
+      "name": "@everyone",
+      "permissions": "0"
+    },
+    {
+      "id": "400000000000000001",
+      "name": "synthetic-scotty-role",
+      "permissions": "16"
+    }
+  ],
+  "channel_names": {
+    "main_operator": "scotty-operator",
+    "employee": "scotty-employee"
+  }
+}
