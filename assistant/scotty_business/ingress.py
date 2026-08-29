@@ -10,8 +10,8 @@ from .policy import (
     FIXED_WIZARD_COMMAND,
     SETUP_WIZARD,
     Role,
-    authorize_source,
 )
+from .routing import RouteKind, resolve_route
 
 EMPLOYEE_SUMMARY_COMMAND = "Scotty, send the employee summary."
 CREDENTIAL_ROTATION_NOTICE = (
@@ -48,34 +48,24 @@ class IngressGuard:
 
     def __call__(self, event: object, **_: object) -> Mapping[str, str]:
         source = getattr(event, "source", None)
-        platform = getattr(getattr(source, "platform", None), "value", None)
-        if platform != "discord":
-            return {"action": "skip", "reason": "unauthorized"}
-        scope_id = getattr(source, "scope_id", None)
-        guild_id = getattr(source, "guild_id", None)
-        if scope_id is not None and guild_id is not None and scope_id != guild_id:
-            return {"action": "skip", "reason": "unauthorized"}
-        guild = scope_id if scope_id is not None else guild_id
-        if getattr(source, "is_bot", None) is not False:
-            return {"action": "skip", "reason": "unauthorized"}
-        principal = authorize_source(
-            self.config.principals,
-            guild,
-            getattr(source, "chat_id", None),
-            getattr(source, "user_id", None),
-            getattr(source, "parent_chat_id", None),
-        )
-        if principal is None:
+        route = resolve_route(self.config, source)
+        if route is None:
             return {"action": "skip", "reason": "unauthorized"}
         text = getattr(event, "text", None)
         if type(text) is not str:
             return {"action": "skip", "reason": "malformed"}
         stripped = text.strip()
+        if any(pattern.search(stripped) for pattern in _CREDENTIAL_PATTERNS):
+            # Credential text never reaches a model on any route.
+            if route.principal is not None:
+                self.enqueue(route.principal.channel_id, CREDENTIAL_ROTATION_NOTICE)
+            return {"action": "skip", "reason": "credential-redacted"}
+        if route.kind is RouteKind.MAINTAINER:
+            return {"action": "allow"}
+        principal = route.principal
+        assert principal is not None
         if stripped.startswith("/"):
             return {"action": "skip", "reason": "commands-disabled"}
-        if any(pattern.search(stripped) for pattern in _CREDENTIAL_PATTERNS):
-            self.enqueue(principal.channel_id, CREDENTIAL_ROTATION_NOTICE)
-            return {"action": "skip", "reason": "credential-redacted"}
         if any(pattern.search(stripped) for pattern in _CODING_PATTERNS):
             self.enqueue(principal.channel_id, CODING_REFUSAL)
             return {"action": "skip", "reason": "coding-refusal"}

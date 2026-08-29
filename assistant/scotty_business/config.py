@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .policy import Principal, Role
+
+_PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}[a-z0-9]")
 
 
 class ConfigError(ValueError):
@@ -34,6 +37,16 @@ def _texts(value: object, field: str, *, allow_empty: bool = False) -> tuple[str
 
 
 @dataclass(frozen=True, slots=True)
+class MaintainerRoute:
+    """Private full-profile route. Never rendered into client-facing text."""
+
+    guild_id: str
+    channel_id: str
+    user_id: str
+    profile: str
+
+
+@dataclass(frozen=True, slots=True)
 class TrelloScope:
     board_id: str
     list_ids: tuple[str, ...]
@@ -50,6 +63,19 @@ class RuntimeConfig:
     trello: TrelloScope
     ghl_location_id: str
     rentcast_endpoints: tuple[str, ...]
+    maintainer_route: MaintainerRoute | None = None
+
+    def client_discord_destinations(self) -> tuple[str, ...]:
+        """Every Discord destination a client-visible tool may ever reach."""
+
+        return tuple(
+            dict.fromkeys(
+                [
+                    *(principal.channel_id for principal in self.principals),
+                    *self.announcement_channel_ids,
+                ]
+            )
+        )
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> RuntimeConfig:
@@ -86,6 +112,7 @@ class RuntimeConfig:
             raise ConfigError("RentCast endpoints must be fixed /v1 paths")
 
         return cls(
+            maintainer_route=_maintainer_route(raw.get("maintainer_route"), principals),
             version=1,
             addons=addons,
             principals=tuple(principals),
@@ -106,3 +133,28 @@ class RuntimeConfig:
             ghl_location_id=_text(ghl.get("location_id"), "ghl.location_id"),
             rentcast_endpoints=endpoints,
         )
+
+
+def _maintainer_route(value: object, principals: Sequence[Principal]) -> MaintainerRoute | None:
+    """Parse the optional private full-profile route and fail closed on overlap."""
+
+    if value is None:
+        return None
+    raw = _mapping(value, "maintainer_route")
+    route = MaintainerRoute(
+        guild_id=_text(raw.get("guild_id"), "maintainer_route.guild_id"),
+        channel_id=_text(raw.get("channel_id"), "maintainer_route.channel_id"),
+        user_id=_text(raw.get("user_id"), "maintainer_route.user_id"),
+        profile=_text(raw.get("profile"), "maintainer_route.profile"),
+    )
+    if not _PROFILE_NAME.fullmatch(route.profile):
+        raise ConfigError("maintainer_route.profile must be a bounded lowercase slug")
+    if any(principal.guild_id == route.guild_id for principal in principals):
+        raise ConfigError("maintainer_route must not share a client guild")
+    if any(principal.channel_id == route.channel_id for principal in principals):
+        raise ConfigError("maintainer_route must not reuse a client channel")
+    if (route.guild_id, route.channel_id, route.user_id) in {
+        (principal.guild_id, principal.channel_id, principal.user_id) for principal in principals
+    }:
+        raise ConfigError("maintainer_route must not reuse a client principal tuple")
+    return route

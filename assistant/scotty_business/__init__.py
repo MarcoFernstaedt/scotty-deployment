@@ -170,6 +170,7 @@ def register(ctx: PluginContext) -> None:
             description=schema["description"],
         )
     ctx.register_hook("pre_gateway_dispatch", controller.ingress)
+    ctx.register_hook("resolve_enabled_toolsets_for_source", controller.toolsets_for_source)
     ctx.register_system_prompt_section(
         id="scotty.identity",
         content=_IDENTITY_PROMPT,

@@ -10,3 +10,4 @@ provides_tools:
   - scotty_calculate
 hooks:
   - pre_gateway_dispatch
+  - resolve_enabled_toolsets_for_source

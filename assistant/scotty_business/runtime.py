@@ -25,6 +25,7 @@ from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
 from .policy import Principal
 from .reminders import Reminder, ReminderStore, ReminderWorker
+from .routing import resolve_route, toolsets_for_route
 from .service import ScottyService
 
 logger = logging.getLogger(__name__)
@@ -148,15 +149,12 @@ class Runtime:
         self.home = home
         self.config = _load_private_config(home)
         transport = HttpTransport()
-        all_channels = tuple(
-            dict.fromkeys(
-                [
-                    *(principal.channel_id for principal in self.config.principals),
-                    *self.config.announcement_channel_ids,
-                ]
-            )
+        # Client-visible tools may only ever reach configured client destinations.
+        # The private full-profile route is deliberately absent from this allowlist.
+        client_channels = self.config.client_discord_destinations()
+        self.discord = DiscordAdapter(
+            transport, _required_env("DISCORD_BOT_TOKEN"), client_channels
         )
-        self.discord = DiscordAdapter(transport, _required_env("DISCORD_BOT_TOKEN"), all_channels)
         self.trello = TrelloAdapter(
             transport,
             _required_env("SCOTTY_TRELLO_API_KEY"),
@@ -348,6 +346,21 @@ class Controller:
         except Exception:
             return {"action": "skip", "reason": "unavailable"}
         return IngressGuard(runtime.config, self.enqueue)(event)
+
+    def toolsets_for_source(self, source: object = None, **kwargs: object) -> list[str]:
+        """Resolve the model toolset for one gateway source before dispatch.
+
+        The resolution fails closed: an unresolved source, or an unavailable
+        private configuration, yields no model toolset at all.
+        """
+
+        if source is None:
+            source = kwargs.get("session_source")
+        try:
+            runtime = self.runtime()
+        except Exception:
+            return []
+        return list(toolsets_for_route(resolve_route(runtime.config, source)))
 
     def tool(self, kind: str, args: object, **kwargs: object) -> str:
         try:

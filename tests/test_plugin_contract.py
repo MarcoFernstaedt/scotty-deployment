@@ -217,7 +217,10 @@ class PluginRegistrationTests(unittest.TestCase):
             self.assertEqual(registration["toolset"], "scotty")
             schema = registration["schema"]
             self.assertNotIn("principal", json.dumps(schema))
-        self.assertEqual(set(context.hooks), {"pre_gateway_dispatch"})
+        self.assertEqual(
+            set(context.hooks),
+            {"pre_gateway_dispatch", "resolve_enabled_toolsets_for_source"},
+        )
         self.assertIn("Scotty by The Closing Room", context.sections["scotty.identity"])
         self.assertNotIn("Hermes", context.sections["scotty.identity"])
         for unload in context.unloads:
@@ -229,6 +232,18 @@ class PluginRegistrationTests(unittest.TestCase):
         manifest = (root / "plugin.yaml").read_text(encoding="utf-8")
         self.assertIn("name: scotty-business", manifest)
         self.assertIn("version: 1.0.0", manifest)
+        self.assertIn("resolve_enabled_toolsets_for_source", manifest)
+
+    def test_toolset_resolution_hook_fails_closed_without_private_state(self) -> None:
+        plugin = importlib.import_module("assistant.scotty_business")
+        context = FakeContext()
+        plugin.register(context)
+        try:
+            resolve = context.hooks["resolve_enabled_toolsets_for_source"]
+            self.assertEqual(resolve(source=SimpleNamespace()), [])
+        finally:
+            for unload in context.unloads:
+                unload()
 
 
 if __name__ == "__main__":
