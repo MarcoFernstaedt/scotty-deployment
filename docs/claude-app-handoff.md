@@ -157,3 +157,114 @@ Open a pull request to `main` only after all gates pass. Do not merge it. Return
 Use this prompt after connecting Claude to the repository and selecting the feature branch:
 
 > Continue the Scotty basic release from `docs/claude-app-handoff.md`. Read that file, `docs/scotty-basic-release-engineering-contract.md`, `README.md`, `Makefile`, `install.sh`, `compose.yaml`, the plugin package, and all tests before editing. Preserve the verified `cbc8c83` baseline. Implement only the remaining private-channel provisioning, native multiplexed full-maintainer routing, provider setup guidance, and final command/test handoff. Use test-first development, synthetic fixtures, no real credentials or IDs, no live external mutations, and run `make verify`. Commit focused changes to `feature/scotty-basic-assistant`, push, and open but do not merge a PR to `main`. Stop on any security or pinned-runtime incompatibility and report it rather than weakening the design.
+
+---
+
+## Completion status
+
+Everything in "Remaining objective" above is implemented on this branch, with
+the two open items recorded at the end of this section.
+
+### 1. Private Discord channel provisioning — done
+
+`assistant/scotty_business/provisioning.py`, wired into `setup.py`.
+
+- The bot token is read from hidden local input or an exported environment
+  variable; `setup.py` contains no `argv` or `argparse` use, and the token lives
+  only inside a mapping that refuses to render itself.
+- Bot identity, guild identity, guild membership, and `Manage Channels` are all
+  verified before any mutation. `Administrator` is accepted but never required.
+- Creation happens only after an explicit local preview and confirmation.
+- `@everyone` is denied `View Channel`; the configured member and the bot each
+  receive only the permissions a chat needs, and never `Administrator` or
+  `Manage Channels` in-channel.
+- Reuse requires an exact match on guild, intended user, and permission
+  overwrites. A name collision, permission drift, or wrong-user channel stops the
+  run instead of hijacking it.
+- Every created channel is read back; differing privacy or membership fails
+  rather than reporting success.
+- Channel IDs reach only owner-only private runtime configuration.
+- Reruns are idempotent and create nothing.
+- Synthetic REST fixtures live in `fixtures/discord.provisioning.json`, with
+  negative tests for wrong guild, wrong bot, missing `Manage Channels`, name
+  collision, partial creation, permission drift, forbidden, timeout, ambiguous
+  response, and unavailable readback.
+- An unconfirmable create is recorded as unknown; a later run refuses to create
+  another and asks for reconciliation first.
+
+### 2. Full route profile, bounded client profiles — done, with one open item
+
+`assistant/scotty_business/routing.py`, enforced from
+`ingress.py` (`pre_gateway_dispatch`) and `runtime.py`
+(`resolve_enabled_toolsets_for_source`).
+
+- Client guild/channel sources resolve to per-role bounded profiles carrying
+  only the `scotty` toolset.
+- The exact route guild, private channel, and user resolve to a separate full
+  profile. The exact user ID is checked here because native profile routing
+  matches guild and channel but not the acting user.
+- A wrong user in the route channel is rejected before session or model
+  activity, silently, with no reply at all.
+- Toolset resolution fails closed. An unresolved source, or unavailable private
+  configuration, yields no model toolset — never a wider one.
+- Configuration rejects a route that shares a client guild, channel, or
+  principal tuple, so the route can never collapse into a client surface.
+- Client-visible Discord destinations are built from the client principals and
+  announcement channels only, so no client-visible tool can reach the route
+  channel and no fixed or proactive delivery path points at it.
+- Client profile state stays profile-local: each role has its own profile name,
+  and shared business data is reached only through bounded provider records.
+- `tests/test_maintainer_secrecy.py` proves no fixed client-facing string, tool
+  schema, prompt section, or profile name carries a route identifier or
+  discloses that a hidden route exists.
+
+**Open item.** The pinned runtime's own contracts
+(`gateway/profile_routing.py`, `gateway/run.py::_resolve_enabled_toolsets_for_source`,
+`gateway/platforms/base.py::toolsets_for_source`) could not be inspected while
+preparing this change, because the pinned image is not available in the
+environment used. Rather than assume a YAML schema, the generated `config.yaml`
+uses only keys already proven at `cbc8c83`, and the native profile-routing block
+is written beside it as `scotty/profile-routing.overlay.yaml`, owner-only and
+explicitly not merged. Verify those three contracts against the pinned image,
+then merge the overlay and confirm the hook name
+`resolve_enabled_toolsets_for_source` matches the runtime's own hook. Until that
+is confirmed, the failure direction is safe: the route degrades to the bounded
+client toolset rather than widening any client surface.
+
+### 3. Provider setup guidance — done
+
+`assistant/scotty_business/guidance.py`, surfaced through
+`scotty_read` with `operation: provider_setup`. No new tool is registered and the
+model inventory is unchanged at five tools.
+
+- Discord, Trello, GoHighLevel, RentCast, and a guidance-only Google Workspace
+  entry each state `not connected` when unconfigured, name the identifiers and
+  scopes to gather, list the provider-side steps, and direct the operator to the
+  local setup command.
+- No guidance string asks for a credential in Discord or accepts one from chat.
+- Discord guidance asks for `Manage Channels`, never `Administrator`.
+- Google Workspace is documented only. It is not installed, holds no add-on
+  slot, and adds no adapter.
+- A missing Trello, GoHighLevel, or RentCast credential no longer prevents the
+  runtime from loading. That provider degrades to a stand-in that refuses every
+  call before any network request.
+
+### 4. Final setup and acceptance handoff — done, with one open item
+
+See `docs/scotty-basic-release-commands.md` for the final install/configure
+command, the Codex OAuth step, `make acceptance`, the route, main-operator, and
+employee acceptance prompts, the exact wizard command, and the `not connected`
+behaviour.
+
+**Open item.** The exact Codex OAuth subcommand for pinned Hermes `0.20.6` is
+not recorded here. `make oauth-probe` reads it from the image itself in a
+disposable, network-disabled container; run it on the deployment host and record
+the printed command. Guessing a command name would have been a runtime
+assumption, which this handoff forbids.
+
+### Preserved
+
+The six-add-on cap and its fixed response, the approval state machine and its
+bound approver, tuple-scoped reminders, adapter isolation, the fixed coding
+refusal, credential redaction, and the `cbc8c83` behaviour are unchanged. The
+model inventory is still exactly the five bounded Scotty tools.

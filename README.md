@@ -14,6 +14,8 @@ The assistant adds these enforced boundaries:
 
 - Exact pre-model authorization matches `(guild_id, channel_id, user_id, role)` as one tuple. Mixed allowlist cross-products fail closed.
 - A thread is accepted only under the configured principal channel.
+- Profile routing is resolved from immutable gateway provenance before any session or model activity. Client channels resolve to per-role bounded profiles; an optional separate route resolves one exact guild, private channel, and user to a full profile. Toolset resolution fails closed, so an unresolved source or unavailable private configuration receives no model toolset at all.
+- Client-visible Discord destinations are limited to the configured principal and announcement channels by construction.
 - Native Discord slash commands and automatic threads are disabled.
 - Each Discord channel retains its own gateway session; provider resources are the only shared business truth.
 - The model inventory contains only `scotty_read`, `scotty_propose`, `scotty_approval`, `scotty_reminder`, and `scotty_calculate`.
@@ -21,7 +23,9 @@ The assistant adds these enforced boundaries:
 - Approval and reminder state use owner-only SQLite files below `/opt/data/scotty`.
 - Plugin-owned reminder polling does not register or expose native arbitrary cron.
 - Provider redirects and automatic mutation retries are disabled. Ambiguous outcomes require reconciliation.
-- Credentials are accepted only by the local hidden-input setup command and are stored in `/srv/Scotty/data/.env`, never in public configuration.
+- Credentials are accepted only by the local hidden-input setup command or an exported environment variable, are stored in `/srv/Scotty/data/.env`, and never reach `argv`, stdout, logs, or public configuration.
+- Private channels are created only after a local preview and confirmation, deny `View Channel` to `@everyone`, and are read back before they are recorded. An unconfirmable create is recorded as unknown and never resolved by creating a second channel.
+- An unconfigured provider reports `not connected` with fixed guidance instead of taking the assistant down, and never asks for a credential in Discord.
 
 A prompt, folder name, model, or persona is not a security boundary. The code, exact runtime configuration, container restrictions, network guard, and provider credential scopes collectively form the boundary.
 
@@ -29,6 +33,9 @@ A prompt, folder name, model, or persona is not a security boundary. The code, e
 
 - `assistant/scotty_business/`: installable Hermes plugin and bounded business domain.
 - `assistant/scotty_business/ingress.py`: exact Discord tuple gate and fixed pre-model paths.
+- `assistant/scotty_business/routing.py`: profile and toolset resolution from immutable gateway provenance, fail-closed.
+- `assistant/scotty_business/provisioning.py`: idempotent private-channel creation or reuse with preview, confirmation, and readback.
+- `assistant/scotty_business/guidance.py`: fixed, credential-free provider setup guidance.
 - `assistant/scotty_business/approvals.py`: SQLite proposal state machine with `BEGIN IMMEDIATE`, version compare-and-set, immutable fields, nonce claims, crash recovery, and reconciliation states.
 - `assistant/scotty_business/reminders.py`: tuple-scoped private reminders with atomic claims and no ambiguous retry.
 - `assistant/scotty_business/adapters/`: typed, versioned Discord, Trello, GoHighLevel v3, and RentCast v1 adapters over a bounded standard-library HTTP transport.
@@ -59,11 +66,17 @@ make format-check
 make lint
 make typecheck
 make test
+make acceptance
 make package
 make smoke
 make scan
 make checksums
 ```
+
+`make acceptance` runs a credential-free synthetic acceptance pass over the
+fixtures. `make oauth-probe` reads the pinned image's own login subcommand from
+a disposable, network-disabled container; it is not part of `make verify`
+because it needs the pinned image present.
 
 `make smoke` uses a disposable, network-disabled container from the pinned image and proves Hermes 0.20.6 discovers exactly the five Scotty tools. It does not use credentials or providers. `make package` writes ignored deterministic artifacts below `dist/`.
 
@@ -92,9 +105,13 @@ The command:
 1. verifies the `scotty` container exists and remains stopped;
 2. reads every credential with hidden terminal input;
 3. verifies the Discord bot identity and guild membership;
-4. verifies every configured Discord channel belongs to the exact guild and denies `View Channel` to `@everyone`, directly or through its category;
-5. writes `config.yaml`, `.env`, and `scotty/private.json` atomically with mode `0600` and UID/GID 10000;
-6. leaves the container stopped.
+4. offers to create the main-operator and employee private channels, previewing each one and waiting for an explicit local confirmation, or accepts existing channel IDs;
+5. verifies every configured Discord channel belongs to the exact guild and denies `View Channel` to `@everyone`, directly or through its category;
+6. writes `config.yaml`, `.env`, `scotty/private.json`, and any profile-routing overlay atomically with mode `0600` and UID/GID 10000;
+7. leaves the container stopped.
+
+The application needs `Manage Channels` plus normal messaging permissions.
+Discord `Administrator` is never required.
 
 If a credential is posted in Discord, do not reuse it. Rotate it and rerun local setup with the replacement.
 
@@ -118,5 +135,9 @@ Trello merge execution requires an exact normalized address or exact provider/pr
 RentCast is read-only. Provider records retain endpoint, source ID, retrieval time, revision, source fields, and missing attributes. Deterministic calculations use `Decimal`; every result is preliminary and requires qualified-professional verification.
 
 ## Activation boundary
+
+The final install and configure commands, the Codex OAuth step, the
+credential-free acceptance command, and the maintainer, operator, and employee
+acceptance prompts are in `docs/scotty-basic-release-commands.md`.
 
 This repository does not activate Scotty. Starting the container, validating real provider scopes, performing live reads, sending a harmless acceptance write, changing systemd/firewall/runtime state, publishing a branch, opening a pull request, merging, or releasing requires a separate approved operations phase. See `docs/scotty-basic-operations.md` for the acceptance and rollback plan.
