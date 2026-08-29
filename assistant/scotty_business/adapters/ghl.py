@@ -3,14 +3,21 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from .http import ProviderError, RedactedMapping, Transport, fixed_id, require_success
+from .http import (
+    AmbiguousEffectError,
+    ProviderError,
+    RedactedMapping,
+    Transport,
+    fixed_id,
+    require_success,
+)
 from .records import ProviderRecord, utc_now
 
 _BASE = "https://services.leadconnectorhq.com"
 
 
 class GHLAdapter:
-    api_version = "2021-07-28"
+    api_version = "v3"
 
     def __init__(self, transport: Transport, private_token: str, location_id: str):
         if not private_token:
@@ -21,7 +28,9 @@ class GHLAdapter:
             Authorization=f"Bearer {private_token}", Version=self.api_version
         )
 
-    def get_contact(self, contact_id: str, *, retrieved_at: datetime | None = None) -> ProviderRecord:
+    def get_contact(
+        self, contact_id: str, *, retrieved_at: datetime | None = None
+    ) -> ProviderRecord:
         contact = fixed_id(contact_id, "contact id")
         response = self.transport.request(
             "GET", f"{_BASE}/contacts/{contact}", headers=self._headers
@@ -75,7 +84,9 @@ class GHLAdapter:
 
     def send_sms(self, contact_id: str, normalized_destination: str, body: str) -> dict[str, str]:
         contact = fixed_id(contact_id, "contact id")
-        if type(normalized_destination) is not str or not re.fullmatch(r"\+[1-9][0-9]{7,14}", normalized_destination):
+        if type(normalized_destination) is not str or not re.fullmatch(
+            r"\+[1-9][0-9]{7,14}", normalized_destination
+        ):
             raise ProviderError("SMS destination must be normalized E.164")
         if type(body) is not str or not body.strip() or len(body) > 1600:
             raise ProviderError("SMS body must contain 1-1600 characters")
@@ -83,7 +94,13 @@ class GHLAdapter:
             "POST",
             f"{_BASE}/conversations/messages",
             headers=self._headers,
-            json_body={"type": "SMS", "contactId": contact, "message": body},
+            json_body={
+                "type": "SMS",
+                "contactId": contact,
+                "toNumber": normalized_destination,
+                "message": body,
+                "status": "pending",
+            },
         )
         result = require_success(response, expected=(200, 201))
         if not isinstance(result, dict):
@@ -98,12 +115,12 @@ class GHLAdapter:
             or not conversation_id
             or returned_contact != contact
         ):
-            raise ProviderError("GoHighLevel SMS acknowledgement identity mismatch")
+            raise AmbiguousEffectError(
+                "GoHighLevel SMS acknowledgement is malformed; reconcile before retry"
+            )
         return {"message_id": message_id, "conversation_id": conversation_id, "contact_id": contact}
 
-    def get_message(
-        self, conversation_id: str, message_id: str, contact_id: str
-    ) -> ProviderRecord:
+    def get_message(self, conversation_id: str, message_id: str, contact_id: str) -> ProviderRecord:
         conversation = fixed_id(conversation_id, "conversation id")
         message = fixed_id(message_id, "message id")
         contact = fixed_id(contact_id, "contact id")

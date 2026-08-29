@@ -63,9 +63,7 @@ class ApprovalStoreTests(unittest.TestCase):
         wrong = Principal("100", "999", "301", Role.MAIN_OPERATOR)
         with self.assertRaises(ApprovalError):
             self.store.approve(proposal.proposal_id, wrong, expected_version=1)
-        approved = self.store.approve(
-            proposal.proposal_id, self.approver, expected_version=1
-        )
+        approved = self.store.approve(proposal.proposal_id, self.approver, expected_version=1)
         self.assertEqual(approved.status, ProposalStatus.APPROVED)
         self.assertEqual(approved.version, 2)
 
@@ -101,9 +99,7 @@ class ApprovalStoreTests(unittest.TestCase):
                 execution_nonce=approved.execution_nonce,
                 current_source_revision="rev-1",
             )
-        self.assertEqual(
-            self.store.get(approved.proposal_id).status, ProposalStatus.EXPIRED
-        )
+        self.assertEqual(self.store.get(approved.proposal_id).status, ProposalStatus.EXPIRED)
 
     def test_execution_claim_is_single_use_under_race(self) -> None:
         proposal = self.propose()

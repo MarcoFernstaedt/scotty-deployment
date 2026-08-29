@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import socket
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Protocol
 
 
 class ProviderError(RuntimeError):
@@ -30,7 +30,15 @@ class HttpResponse:
 
 
 class Transport(Protocol):
-    def request(self, method: str, url: str, **kwargs: object) -> HttpResponse: ...
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        query: Mapping[str, object] | None = None,
+        json_body: Mapping[str, object] | None = None,
+    ) -> HttpResponse: ...
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -78,7 +86,8 @@ class HttpTransport:
                 raise ProviderError("provider request body exceeds the limit")
             request_headers["Content-Type"] = "application/json"
         request_headers.setdefault("Accept", "application/json")
-        request = urllib.request.Request(
+        # The scheme and authority were parsed and restricted to HTTPS above.
+        request = urllib.request.Request(  # noqa: S310
             url, data=body_bytes, headers=request_headers, method=upper
         )
         try:
@@ -94,9 +103,11 @@ class HttpTransport:
         except urllib.error.HTTPError as exc:
             raw = exc.read(self.max_response_bytes + 1)
             if len(raw) > self.max_response_bytes:
-                raise ProviderError(f"provider returned HTTP {exc.code} with oversized body") from None
+                raise ProviderError(
+                    f"provider returned HTTP {exc.code} with oversized body"
+                ) from None
             return HttpResponse(int(exc.code), {}, _parse_json(raw))
-        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+        except (TimeoutError, urllib.error.URLError):
             if upper in {"POST", "PUT"}:
                 raise AmbiguousEffectError(
                     "provider mutation outcome is unknown; reconcile before any retry"
@@ -122,6 +133,9 @@ def require_success(response: HttpResponse, *, expected: tuple[int, ...] = (200,
 def fixed_id(value: object, field: str) -> str:
     if type(value) is not str or not value or len(value) > 128:
         raise ProviderError(f"{field} must be a bounded non-empty string")
-    if any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in value):
+    if any(
+        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        for char in value
+    ):
         raise ProviderError(f"{field} contains forbidden characters")
     return value

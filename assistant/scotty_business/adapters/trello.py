@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Mapping
 
 from ..config import TrelloScope
-from .http import ProviderError, RedactedMapping, Transport, fixed_id, require_success
+from .http import (
+    AmbiguousEffectError,
+    ProviderError,
+    RedactedMapping,
+    Transport,
+    fixed_id,
+    require_success,
+)
 from .records import ProviderRecord, utc_now
 
 _BASE = "https://api.trello.com/1"
@@ -66,6 +73,14 @@ class TrelloAdapter:
             missing_attributes=missing,
         )
 
+    def _mutation_record(self, body: object) -> ProviderRecord:
+        try:
+            return self._record(body)
+        except ProviderError as exc:
+            raise AmbiguousEffectError(
+                "Trello mutation acknowledgement is malformed; reconcile before retry"
+            ) from exc
+
     def get_card(self, card_id: str, *, retrieved_at: datetime | None = None) -> ProviderRecord:
         card = fixed_id(card_id, "card id")
         response = self.transport.request(
@@ -94,7 +109,7 @@ class TrelloAdapter:
         response = self.transport.request(
             "POST", f"{_BASE}/cards", query=self._query({"idList": list_id, **fields})
         )
-        return self._record(require_success(response, expected=(200, 201)))
+        return self._mutation_record(require_success(response, expected=(200, 201)))
 
     def update_card(self, card_id: str, fields: Mapping[str, object]) -> ProviderRecord:
         self._validate_fields(fields, _UPDATE_FIELDS)
@@ -103,7 +118,7 @@ class TrelloAdapter:
             f"{_BASE}/cards/{fixed_id(card_id, 'card id')}",
             query=self._query(fields),
         )
-        return self._record(require_success(response))
+        return self._mutation_record(require_success(response))
 
     def move_card(self, card_id: str, list_id: str) -> ProviderRecord:
         if list_id not in self.scope.list_ids:
@@ -113,9 +128,11 @@ class TrelloAdapter:
             f"{_BASE}/cards/{fixed_id(card_id, 'card id')}",
             query=self._query({"idList": list_id}),
         )
-        return self._record(require_success(response))
+        return self._mutation_record(require_success(response))
 
-    def set_custom_field(self, card_id: str, field_id: str, value: Mapping[str, object]) -> ProviderRecord:
+    def set_custom_field(
+        self, card_id: str, field_id: str, value: Mapping[str, object]
+    ) -> ProviderRecord:
         if field_id not in self.scope.custom_field_ids:
             raise ProviderError("Trello custom field is not configured")
         if set(value) - {"text", "number", "checked", "date"} or len(value) != 1:
@@ -135,18 +152,24 @@ class TrelloAdapter:
             f"{_BASE}/cards/{fixed_id(card_id, 'card id')}",
             query=self._query({"closed": True}),
         )
-        record = self._record(require_success(response))
+        record = self._mutation_record(require_success(response))
         if record.fields.get("closed") is not True:
-            raise ProviderError("Trello archive acknowledgement is malformed")
+            raise AmbiguousEffectError(
+                "Trello archive acknowledgement is malformed; reconcile before retry"
+            )
         return record
 
-    def _validate_fields(self, fields: Mapping[str, object], allowed: set[str] | frozenset[str]) -> None:
+    def _validate_fields(
+        self, fields: Mapping[str, object], allowed: set[str] | frozenset[str]
+    ) -> None:
         if not isinstance(fields, Mapping) or not fields:
             raise ProviderError("Trello fields must be a non-empty object")
         unknown = set(fields) - set(allowed)
         if unknown:
             raise ProviderError("Trello update contains forbidden fields")
         labels = fields.get("idLabels")
-        if labels is not None:
-            if not isinstance(labels, list) or any(label not in self.scope.label_ids for label in labels):
-                raise ProviderError("Trello labels are outside configured scope")
+        if labels is not None and (
+            not isinstance(labels, list)
+            or any(label not in self.scope.label_ids for label in labels)
+        ):
+            raise ProviderError("Trello labels are outside configured scope")

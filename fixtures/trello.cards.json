@@ -1,0 +1,21 @@
+[
+  {
+    "customFieldItems": [
+      {
+        "idCustomField": "synthetic-field-1",
+        "value": {
+          "text": "property-synthetic-1"
+        }
+      }
+    ],
+    "dateLastActivity": "2026-08-28T12:00:00Z",
+    "desc": "Synthetic lead fixture",
+    "id": "synthetic-card-1",
+    "idBoard": "synthetic-board-1",
+    "idLabels": [
+      "synthetic-label-1"
+    ],
+    "idList": "synthetic-list-1",
+    "name": "123 Synthetic Avenue"
+  }
+]

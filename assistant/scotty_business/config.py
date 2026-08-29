@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from .policy import Principal, Role
 
@@ -52,7 +52,7 @@ class RuntimeConfig:
     rentcast_endpoints: tuple[str, ...]
 
     @classmethod
-    def from_mapping(cls, raw: Mapping[str, object]) -> "RuntimeConfig":
+    def from_mapping(cls, raw: Mapping[str, object]) -> RuntimeConfig:
         if type(raw.get("version")) is not int or raw["version"] != 1:
             raise ConfigError("version must be 1")
         addons = _texts(raw.get("addons"), "addons")
@@ -66,7 +66,9 @@ class RuntimeConfig:
             principals.append(
                 Principal(
                     guild_id=_text(values.get("guild_id"), f"principals.{role.value}.guild_id"),
-                    channel_id=_text(values.get("channel_id"), f"principals.{role.value}.channel_id"),
+                    channel_id=_text(
+                        values.get("channel_id"), f"principals.{role.value}.channel_id"
+                    ),
                     user_id=_text(values.get("user_id"), f"principals.{role.value}.user_id"),
                     role=role,
                 )

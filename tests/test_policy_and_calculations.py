@@ -33,9 +33,7 @@ class PolicyTests(unittest.TestCase):
         for guild_id, channel_id, user_id in mixed:
             with self.subTest(tuple=(guild_id, channel_id, user_id)):
                 self.assertIsNone(
-                    authorize_source(
-                        self.principals, guild_id, channel_id, user_id, None
-                    )
+                    authorize_source(self.principals, guild_id, channel_id, user_id, None)
                 )
 
     def test_threads_require_the_configured_parent_and_tuple_channel(self) -> None:
@@ -43,12 +41,8 @@ class PolicyTests(unittest.TestCase):
             authorize_source(self.principals, "100", "900", "301", "201"),
             self.operator,
         )
-        self.assertIsNone(
-            authorize_source(self.principals, "100", "900", "301", "202")
-        )
-        self.assertIsNone(
-            authorize_source(self.principals, "100", "900", "302", "201")
-        )
+        self.assertIsNone(authorize_source(self.principals, "100", "900", "301", "202"))
+        self.assertIsNone(authorize_source(self.principals, "100", "900", "302", "201"))
 
     def test_role_approval_policy_is_fail_closed(self) -> None:
         self.assertTrue(can_approve(self.maintainer, "trello_write"))

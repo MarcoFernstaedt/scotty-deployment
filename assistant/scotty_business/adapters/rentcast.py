@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Mapping
 
 from .http import ProviderError, RedactedMapping, Transport, require_success
 from .records import ProviderRecord, utc_now
@@ -44,10 +44,23 @@ class RentCastAdapter:
             fields = dict(body)
         else:
             raise ProviderError("RentCast response is malformed")
-        source_id = fields.get("id") or fields.get("propertyId") or fields.get("formattedAddress")
+        subject = fields.get("subjectProperty")
+        subject_fields = subject if isinstance(subject, dict) else fields
+        source_id = (
+            fields.get("id")
+            or fields.get("propertyId")
+            or fields.get("formattedAddress")
+            or subject_fields.get("id")
+            or subject_fields.get("formattedAddress")
+        )
         if type(source_id) is not str or not source_id:
             raise ProviderError("RentCast response is missing a provider record ID")
-        revision = fields.get("lastUpdatedDate") or fields.get("retrievedAt") or "unversioned"
+        revision = (
+            fields.get("lastUpdatedDate")
+            or fields.get("retrievedAt")
+            or subject_fields.get("lastUpdatedDate")
+            or "unversioned"
+        )
         if type(revision) is not str:
             raise ProviderError("RentCast source revision is malformed")
         expected = ("formattedAddress", "latitude", "longitude")
@@ -57,5 +70,5 @@ class RentCastAdapter:
             retrieved_at=retrieved_at or utc_now(),
             source_revision=revision,
             fields={"endpoint": endpoint, **fields},
-            missing_attributes=tuple(field for field in expected if field not in fields),
+            missing_attributes=tuple(field for field in expected if field not in subject_fields),
         )

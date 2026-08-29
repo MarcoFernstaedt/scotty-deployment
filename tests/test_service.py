@@ -3,17 +3,19 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from assistant.scotty_business.adapters import AmbiguousEffectError, ProviderError, ProviderRecord
-from assistant.scotty_business.approvals import ApprovalStore, ProposalStatus
+from assistant.scotty_business.approvals import ApprovalError, ApprovalStore, ProposalStatus
 from assistant.scotty_business.config import RuntimeConfig
-from assistant.scotty_business.policy import Principal, Role
+from assistant.scotty_business.policy import Role
 from assistant.scotty_business.service import ScottyService, normalize_address
 
 
 def record(provider: str, source_id: str, revision: str, **fields: object) -> ProviderRecord:
-    return ProviderRecord(provider, source_id, datetime(2026, 8, 28, tzinfo=UTC), revision, fields, ())
+    return ProviderRecord(
+        provider, source_id, datetime(2026, 8, 28, tzinfo=UTC), revision, fields, ()
+    )
 
 
 class FakeTrello:
@@ -50,7 +52,11 @@ class FakeTrello:
     def get_card(self, card_id: str):
         self.calls.append(f"get:{card_id}")
         current = self.cards[card_id]
-        if self.readback_mismatch and card_id == "destination" and "update:destination" in self.calls:
+        if (
+            self.readback_mismatch
+            and card_id == "destination"
+            and "update:destination" in self.calls
+        ):
             return record("trello", "destination", "d3", **{**current.fields, "desc": "wrong"})
         return current
 
@@ -133,12 +139,16 @@ class ServiceTests(unittest.TestCase):
                     "custom_field_ids": ["field-1"],
                 },
                 "ghl": {"location_id": "location-1"},
-                "rentcast": {"endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]},
+                "rentcast": {
+                    "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
+                },
             }
         )
         self.operator = next(p for p in self.config.principals if p.role == Role.MAIN_OPERATOR)
         self.employee = next(p for p in self.config.principals if p.role == Role.EMPLOYEE)
-        self.store = ApprovalStore(os.path.join(self.tempdir.name, "approvals.db"), clock=lambda: self.now)
+        self.store = ApprovalStore(
+            os.path.join(self.tempdir.name, "approvals.db"), clock=lambda: self.now
+        )
         self.store.initialize()
         self.trello = FakeTrello()
 
@@ -158,15 +168,29 @@ class ServiceTests(unittest.TestCase):
 
     def test_address_normalization_is_deterministic_not_fuzzy(self) -> None:
         self.assertEqual(normalize_address(" 123 Synthetic Avenue. "), "123 synthetic avenue")
-        self.assertNotEqual(normalize_address("123 Synthetic Ave"), normalize_address("123 Synthetic Avenue"))
+        self.assertNotEqual(
+            normalize_address("123 Synthetic Ave"), normalize_address("123 Synthetic Avenue")
+        )
 
     def test_merge_requires_exact_address_or_provider_identifier(self) -> None:
         service = self.service()
         self.trello.cards["source"] = record(
-            "trello", "source", "s1", id="source", idBoard="board-1", idList="list-1", name="123 Synthetic Avenue"
+            "trello",
+            "source",
+            "s1",
+            id="source",
+            idBoard="board-1",
+            idList="list-1",
+            name="123 Synthetic Avenue",
         )
         self.trello.cards["destination"] = record(
-            "trello", "destination", "d1", id="destination", idBoard="board-1", idList="list-1", name="123 Synthetic Ave"
+            "trello",
+            "destination",
+            "d1",
+            id="destination",
+            idBoard="board-1",
+            idList="list-1",
+            name="123 Synthetic Ave",
         )
         with self.assertRaises(ProviderError):
             service.propose_trello_merge(self.operator, "source", "destination")
@@ -174,7 +198,9 @@ class ServiceTests(unittest.TestCase):
     def test_merge_preview_binds_conflicts_and_archives_only_after_readback(self) -> None:
         service = self.service()
         proposal = service.propose_trello_merge(self.operator, "source", "destination")
-        self.assertEqual(proposal.payload["conflicts"]["desc"], {"source": "source notes", "destination": ""})
+        self.assertEqual(
+            proposal.payload["conflicts"]["desc"], {"source": "source notes", "destination": ""}
+        )
         approved = service.approve(self.operator, proposal.proposal_id, 1)
         result = service.execute(
             self.operator,
@@ -239,7 +265,7 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(result.status, ProposalStatus.UNKNOWN)
         self.assertEqual(ghl.send_count, 1)
-        with self.assertRaises(Exception):
+        with self.assertRaises(ApprovalError):
             service.execute(
                 self.operator,
                 result.proposal_id,

@@ -4,6 +4,7 @@ import unittest
 from datetime import UTC, datetime
 
 from assistant.scotty_business.adapters import (
+    AmbiguousEffectError,
     DiscordAdapter,
     GHLAdapter,
     HttpResponse,
@@ -61,16 +62,55 @@ class TrelloAdapterTests(unittest.TestCase):
             {"id": "card-1", "idBoard": "board-1", "idList": "other"},
         ):
             with self.subTest(body=body):
-                adapter = TrelloAdapter(FakeTransport([HttpResponse(200, {}, body)]), "k", "t", self.scope)
+                adapter = TrelloAdapter(
+                    FakeTransport([HttpResponse(200, {}, body)]), "k", "t", self.scope
+                )
                 with self.assertRaises(ProviderError):
                     adapter.get_card("card-1")
 
     def test_create_update_move_and_archive_are_scoped(self) -> None:
         responses = [
-            HttpResponse(200, {}, {"id": "card-1", "idBoard": "board-1", "idList": "list-1", "dateLastActivity": "r1"}),
-            HttpResponse(200, {}, {"id": "card-1", "idBoard": "board-1", "idList": "list-1", "dateLastActivity": "r2"}),
-            HttpResponse(200, {}, {"id": "card-1", "idBoard": "board-1", "idList": "list-2", "dateLastActivity": "r3"}),
-            HttpResponse(200, {}, {"id": "card-1", "idBoard": "board-1", "idList": "list-2", "closed": True, "dateLastActivity": "r4"}),
+            HttpResponse(
+                200,
+                {},
+                {
+                    "id": "card-1",
+                    "idBoard": "board-1",
+                    "idList": "list-1",
+                    "dateLastActivity": "r1",
+                },
+            ),
+            HttpResponse(
+                200,
+                {},
+                {
+                    "id": "card-1",
+                    "idBoard": "board-1",
+                    "idList": "list-1",
+                    "dateLastActivity": "r2",
+                },
+            ),
+            HttpResponse(
+                200,
+                {},
+                {
+                    "id": "card-1",
+                    "idBoard": "board-1",
+                    "idList": "list-2",
+                    "dateLastActivity": "r3",
+                },
+            ),
+            HttpResponse(
+                200,
+                {},
+                {
+                    "id": "card-1",
+                    "idBoard": "board-1",
+                    "idList": "list-2",
+                    "closed": True,
+                    "dateLastActivity": "r4",
+                },
+            ),
         ]
         transport = FakeTransport(responses)
         adapter = TrelloAdapter(transport, "k", "t", self.scope)
@@ -78,8 +118,14 @@ class TrelloAdapterTests(unittest.TestCase):
         adapter.update_card("card-1", {"name": "Updated synthetic property"})
         adapter.move_card("card-1", "list-2")
         adapter.archive_card("card-1")
-        self.assertEqual([call["method"] for call in transport.calls], ["POST", "PUT", "PUT", "PUT"])
-        self.assertTrue(all(str(call["url"]).startswith("https://api.trello.com/1/") for call in transport.calls))
+        self.assertEqual(
+            [call["method"] for call in transport.calls], ["POST", "PUT", "PUT", "PUT"]
+        )
+        self.assertTrue(
+            all(
+                str(call["url"]).startswith("https://api.trello.com/1/") for call in transport.calls
+            )
+        )
         with self.assertRaises(ProviderError):
             adapter.create_card("other-list", {"name": "blocked"})
         with self.assertRaises(ProviderError):
@@ -94,8 +140,26 @@ class GHLAdapterTests(unittest.TestCase):
     def test_location_is_bound_for_reads_and_sms(self) -> None:
         transport = FakeTransport(
             [
-                HttpResponse(200, {}, {"contact": {"id": "contact-1", "locationId": "location-1", "dateUpdated": "rev-1"}}),
-                HttpResponse(201, {}, {"messageId": "message-1", "conversationId": "conversation-1", "contactId": "contact-1"}),
+                HttpResponse(
+                    200,
+                    {},
+                    {
+                        "contact": {
+                            "id": "contact-1",
+                            "locationId": "location-1",
+                            "dateUpdated": "rev-1",
+                        }
+                    },
+                ),
+                HttpResponse(
+                    201,
+                    {},
+                    {
+                        "messageId": "message-1",
+                        "conversationId": "conversation-1",
+                        "contactId": "contact-1",
+                    },
+                ),
             ]
         )
         adapter = GHLAdapter(transport, "pit-secret", "location-1")
@@ -104,22 +168,62 @@ class GHLAdapterTests(unittest.TestCase):
         self.assertEqual(contact.source_revision, "rev-1")
         self.assertEqual(receipt["message_id"], "message-1")
         send_call = transport.calls[1]
-        self.assertEqual(send_call["url"], "https://services.leadconnectorhq.com/conversations/messages")
-        self.assertEqual(send_call["json_body"], {"type": "SMS", "contactId": "contact-1", "message": "Synthetic body"})
+        self.assertEqual(
+            send_call["url"], "https://services.leadconnectorhq.com/conversations/messages"
+        )
+        self.assertEqual(send_call["headers"]["Version"], "v3")
+        self.assertEqual(
+            send_call["json_body"],
+            {
+                "type": "SMS",
+                "contactId": "contact-1",
+                "toNumber": "+15550000001",
+                "message": "Synthetic body",
+                "status": "pending",
+            },
+        )
         self.assertNotIn("pit-secret", repr(transport.calls))
 
     def test_mismatched_location_or_contact_response_is_rejected(self) -> None:
         adapter = GHLAdapter(
-            FakeTransport([HttpResponse(200, {}, {"contact": {"id": "other", "locationId": "location-1"}})]),
+            FakeTransport(
+                [HttpResponse(200, {}, {"contact": {"id": "other", "locationId": "location-1"}})]
+            ),
             "pit",
             "location-1",
         )
         with self.assertRaises(ProviderError):
             adapter.get_contact("contact-1")
 
+    def test_malformed_success_acknowledgement_is_ambiguous(self) -> None:
+        adapter = GHLAdapter(
+            FakeTransport([HttpResponse(200, {}, {"conversationId": "conversation-1"})]),
+            "pit",
+            "location-1",
+        )
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.send_sms("contact-1", "+15550000001", "Synthetic body")
+
     def test_authoritative_message_readback_binds_conversation_and_contact(self) -> None:
         transport = FakeTransport(
-            [HttpResponse(200, {}, {"messages": {"messages": [{"id": "message-1", "contactId": "contact-1", "conversationId": "conversation-1", "body": "Synthetic body"}]}})]
+            [
+                HttpResponse(
+                    200,
+                    {},
+                    {
+                        "messages": {
+                            "messages": [
+                                {
+                                    "id": "message-1",
+                                    "contactId": "contact-1",
+                                    "conversationId": "conversation-1",
+                                    "body": "Synthetic body",
+                                }
+                            ]
+                        }
+                    },
+                )
+            ]
         )
         adapter = GHLAdapter(transport, "pit", "location-1")
         record = adapter.get_message("conversation-1", "message-1", "contact-1")
@@ -130,7 +234,9 @@ class GHLAdapterTests(unittest.TestCase):
 class RentCastAdapterTests(unittest.TestCase):
     def test_only_configured_get_endpoints_are_available(self) -> None:
         endpoints = ("/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term")
-        transport = FakeTransport([HttpResponse(200, {}, {"id": "property-1", "formattedAddress": "123 Synthetic Ave"})])
+        transport = FakeTransport(
+            [HttpResponse(200, {}, {"id": "property-1", "formattedAddress": "123 Synthetic Ave"})]
+        )
         adapter = RentCastAdapter(transport, "rent-secret", endpoints)
         record = adapter.fetch("/v1/properties", {"address": "123 Synthetic Ave"})
         self.assertEqual(record.provider, "rentcast")
@@ -139,6 +245,27 @@ class RentCastAdapterTests(unittest.TestCase):
         with self.assertRaises(ProviderError):
             adapter.fetch("/v1/markets", {})
         self.assertFalse(hasattr(adapter, "post"))
+
+    def test_avm_response_uses_subject_property_identity_and_retains_comparables(self) -> None:
+        body = {
+            "price": 210000,
+            "subjectProperty": {
+                "id": "property-1",
+                "formattedAddress": "123 Synthetic Ave",
+                "latitude": 33.0,
+                "longitude": -112.0,
+            },
+            "comparables": [{"id": "comparable-1", "price": 205000}],
+        }
+        adapter = RentCastAdapter(
+            FakeTransport([HttpResponse(200, {}, body)]),
+            "rent-secret",
+            ("/v1/avm/value",),
+        )
+        record = adapter.fetch("/v1/avm/value", {"address": "123 Synthetic Ave"})
+        self.assertEqual(record.source_id, "property-1")
+        self.assertEqual(record.fields["comparables"], body["comparables"])
+        self.assertEqual(record.missing_attributes, ())
 
 
 class DiscordAdapterTests(unittest.TestCase):

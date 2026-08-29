@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Callable, Mapping, Protocol
+from typing import Protocol
 
 from .adapters import AmbiguousEffectError, ProviderError, ProviderRecord
 from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
@@ -50,8 +51,12 @@ class TrelloPort(Protocol):
 
 class GHLPort(Protocol):
     def get_contact(self, contact_id: str) -> ProviderRecord: ...
-    def send_sms(self, contact_id: str, normalized_destination: str, body: str) -> Mapping[str, str]: ...
-    def get_message(self, conversation_id: str, message_id: str, contact_id: str) -> ProviderRecord: ...
+    def send_sms(
+        self, contact_id: str, normalized_destination: str, body: str
+    ) -> Mapping[str, str]: ...
+    def get_message(
+        self, conversation_id: str, message_id: str, contact_id: str
+    ) -> ProviderRecord: ...
 
 
 class DiscordPort(Protocol):
@@ -113,9 +118,7 @@ class ScottyService:
         source = self.trello.get_card(source_card_id)
         destination = self.trello.get_card(destination_card_id)
         source_address = _string_field(source, "normalized_address", "address", "name")
-        destination_address = _string_field(
-            destination, "normalized_address", "address", "name"
-        )
+        destination_address = _string_field(destination, "normalized_address", "address", "name")
         source_provider_id = _string_field(
             source, "provider_property_id", "rentcast_id", "property_id"
         )
@@ -216,7 +219,6 @@ class ScottyService:
         requester: Principal,
         list_id: str,
         fields: Mapping[str, object],
-        source_revision: str,
     ) -> Proposal:
         return self.approvals.propose(
             requester=requester,
@@ -224,7 +226,7 @@ class ScottyService:
             action_class="trello_write",
             target_ids=(self.config.trello.board_id, list_id),
             payload={"operation": "create", "list_id": list_id, "fields": dict(fields)},
-            source_revision=source_revision,
+            source_revision="configured-board-v1",
             expires_at=self._now() + timedelta(minutes=10),
         )
 
@@ -400,7 +402,9 @@ class ScottyService:
             if observed.get("content") != content:
                 raise ProviderError("Discord readback content mismatch")
         except ProviderError:
-            return self._unknown(executing, {"verified": False, "reason": "Discord readback failed"})
+            return self._unknown(
+                executing, {"verified": False, "reason": "Discord readback failed"}
+            )
         return self.approvals.complete_execution(
             executing.proposal_id,
             ProposalStatus.VERIFIED,
@@ -425,7 +429,9 @@ class ScottyService:
                     raise ProviderError("Trello create fields are malformed")
                 result = self.trello.create_card(list_id, fields)
             except AmbiguousEffectError:
-                return self._unknown(executing, {"verified": False, "reason": "ambiguous Trello create"})
+                return self._unknown(
+                    executing, {"verified": False, "reason": "ambiguous Trello create"}
+                )
             except ProviderError as exc:
                 return self._failed(executing, str(exc))
             return self.approvals.complete_execution(
@@ -446,7 +452,9 @@ class ScottyService:
                     raise ProviderError("Trello update fields are malformed")
                 result = self.trello.update_card(card_id, fields)
             elif operation == "move":
-                result = self.trello.move_card(card_id, _payload_text(proposal.payload, "destination_list_id"))
+                result = self.trello.move_card(
+                    card_id, _payload_text(proposal.payload, "destination_list_id")
+                )
             elif operation == "archive":
                 result = self.trello.archive_card(card_id)
             else:

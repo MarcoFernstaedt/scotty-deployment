@@ -36,7 +36,10 @@ class ReminderTests(unittest.TestCase):
         )
         self.assertEqual(reminder.channel_id, self.operator.channel_id)
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
-        self.assertEqual([item.reminder_id for item in self.store.list_for(self.operator)], [reminder.reminder_id])
+        self.assertEqual(
+            [item.reminder_id for item in self.store.list_for(self.operator)],
+            [reminder.reminder_id],
+        )
         self.assertEqual(self.store.list_for(self.employee), ())
         with self.assertRaises(ReminderError):
             self.store.cancel(self.employee, reminder.reminder_id)

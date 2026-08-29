@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from .http import ProviderError, RedactedMapping, Transport, fixed_id, require_success
+from .http import (
+    AmbiguousEffectError,
+    ProviderError,
+    RedactedMapping,
+    Transport,
+    fixed_id,
+    require_success,
+)
 
 _BASE = "https://discord.com/api/v10"
 
@@ -35,7 +42,9 @@ class DiscordAdapter:
         message_id = body.get("id")
         returned_channel = body.get("channel_id")
         if type(message_id) is not str or not message_id or returned_channel != channel:
-            raise ProviderError("Discord acknowledgement identity mismatch")
+            raise AmbiguousEffectError(
+                "Discord acknowledgement is malformed; reconcile before retry"
+            )
         return {"message_id": message_id, "channel_id": channel}
 
     def get_message(self, channel_id: str, message_id: str) -> dict[str, object]:
@@ -47,6 +56,10 @@ class DiscordAdapter:
             "GET", f"{_BASE}/channels/{channel}/messages/{message}", headers=self._headers
         )
         body = require_success(response)
-        if not isinstance(body, dict) or body.get("id") != message or body.get("channel_id") != channel:
+        if (
+            not isinstance(body, dict)
+            or body.get("id") != message
+            or body.get("channel_id") != channel
+        ):
             raise ProviderError("Discord readback identity mismatch")
         return dict(body)

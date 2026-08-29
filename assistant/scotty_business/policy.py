@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Iterable, Sequence
 
 ADDON_CAP_RESPONSE = (
     "Scotty is capped at six add-ons for this VPS deployment. To add another, "
@@ -61,7 +61,9 @@ def authorize_source(
     """
     if not all(type(value) is str and value for value in (guild_id, channel_id, user_id)):
         return None
-    if parent_channel_id is not None and (type(parent_channel_id) is not str or not parent_channel_id):
+    if parent_channel_id is not None and (
+        type(parent_channel_id) is not str or not parent_channel_id
+    ):
         return None
     for principal in principals:
         expected_channel = parent_channel_id or channel_id

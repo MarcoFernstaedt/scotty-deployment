@@ -5,11 +5,11 @@ import os
 import secrets
 import sqlite3
 import uuid
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Callable, Mapping
 
 from .policy import Principal, Role, can_approve
 
@@ -227,9 +227,13 @@ class ApprovalStore:
             target_ids = json.loads(row["target_ids_json"])
             payload = json.loads(row["payload_json"])
             receipt = json.loads(row["receipt_json"]) if row["receipt_json"] else None
-            if not isinstance(target_ids, list) or any(type(item) is not str for item in target_ids):
+            if not isinstance(target_ids, list) or any(
+                type(item) is not str for item in target_ids
+            ):
                 raise ValueError
-            if not isinstance(payload, dict) or (receipt is not None and not isinstance(receipt, dict)):
+            if not isinstance(payload, dict) or (
+                receipt is not None and not isinstance(receipt, dict)
+            ):
                 raise ValueError
             expires_at = datetime.fromisoformat(row["expires_at"])
             if expires_at.tzinfo is None:
