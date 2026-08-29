@@ -232,7 +232,25 @@ class PluginRegistrationTests(unittest.TestCase):
         manifest = (root / "plugin.yaml").read_text(encoding="utf-8")
         self.assertIn("name: scotty-business", manifest)
         self.assertIn("version: 1.0.0", manifest)
-        self.assertIn("resolve_enabled_toolsets_for_source", manifest)
+        self.assertIn("pre_gateway_dispatch", manifest)
+
+    def test_registration_survives_a_runtime_without_the_optional_hook(self) -> None:
+        plugin = importlib.import_module("assistant.scotty_business")
+
+        class NarrowContext(FakeContext):
+            def register_hook(self, name: str, callback: object) -> None:
+                if name != "pre_gateway_dispatch":
+                    raise ValueError("unknown hook")
+                super().register_hook(name, callback)
+
+        context = NarrowContext()
+        plugin.register(context)
+        try:
+            self.assertEqual(set(context.hooks), {"pre_gateway_dispatch"})
+            self.assertEqual(len(context.tools), 5)
+        finally:
+            for unload in context.unloads:
+                unload()
 
     def test_toolset_resolution_hook_fails_closed_without_private_state(self) -> None:
         plugin = importlib.import_module("assistant.scotty_business")

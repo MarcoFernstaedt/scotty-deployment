@@ -10,4 +10,7 @@ provides_tools:
   - scotty_calculate
 hooks:
   - pre_gateway_dispatch
-  - resolve_enabled_toolsets_for_source
+# resolve_enabled_toolsets_for_source is registered defensively at runtime.
+# It is not declared here until its name is verified against the pinned image;
+# if the runtime does not offer it, toolset resolution stays bounded and
+# authorization still runs in pre_gateway_dispatch.

@@ -227,9 +227,12 @@ uses only keys already proven at `cbc8c83`, and the native profile-routing block
 is written beside it as `scotty/profile-routing.overlay.yaml`, owner-only and
 explicitly not merged. Verify those three contracts against the pinned image,
 then merge the overlay and confirm the hook name
-`resolve_enabled_toolsets_for_source` matches the runtime's own hook. Until that
-is confirmed, the failure direction is safe: the route degrades to the bounded
-client toolset rather than widening any client surface.
+`resolve_enabled_toolsets_for_source` matches the runtime's own hook. That hook
+is registered defensively and is not declared in `plugin.yaml`, so a runtime
+that does not offer it still loads the plugin unchanged. Until the name is
+confirmed, the failure direction is safe: the route degrades to the bounded
+client toolset rather than widening any client surface, and authorization still
+runs in `pre_gateway_dispatch`.
 
 ### 3. Provider setup guidance — done
 
