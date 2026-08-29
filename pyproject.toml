@@ -8,7 +8,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 ignore = ["E501", "S101"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["S108", "S603"]
+# Synthetic keyword literals in tests are fixtures, never real credentials.
+"tests/*.py" = ["S106", "S108", "S603"]
 "tools/*.py" = ["S603", "S607"]
 
 [tool.mypy]

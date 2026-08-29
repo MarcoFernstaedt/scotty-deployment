@@ -5,11 +5,11 @@ import logging
 import os
 import queue
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal, overload
+from typing import Literal, Protocol, overload
 
 from .adapters import (
     DiscordAdapter,
@@ -21,12 +21,13 @@ from .adapters import (
 )
 from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
+from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
 from .policy import Principal
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .routing import resolve_route, toolsets_for_route
-from .service import ScottyService
+from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,67 @@ def _required_env(name: str) -> str:
     return value
 
 
+class ProviderNotConnected(RuntimeError):
+    """A provider has no configured credential, so no call is attempted."""
+
+
+class TrelloReadPort(TrelloPort, Protocol):
+    def list_cards(self) -> Sequence[ProviderRecord]: ...
+
+
+class GHLReadPort(GHLPort, Protocol):
+    def search_conversations(self, contact_id: str) -> Sequence[ProviderRecord]: ...
+
+
+class UnconnectedProvider:
+    """Stand-in adapter for a provider whose credential is not configured.
+
+    Every bounded operation fails before any network call, so an unconfigured
+    provider degrades to `not connected` instead of taking the assistant down.
+    """
+
+    def __init__(self, provider: str):
+        self.provider = provider
+
+    def _deny(self) -> ProviderNotConnected:
+        return ProviderNotConnected(f"{self.provider} is not connected")
+
+    def get_card(self, card_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def list_cards(self) -> Sequence[ProviderRecord]:
+        raise self._deny()
+
+    def create_card(self, list_id: str, fields: Mapping[str, object]) -> ProviderRecord:
+        raise self._deny()
+
+    def update_card(self, card_id: str, fields: Mapping[str, object]) -> ProviderRecord:
+        raise self._deny()
+
+    def move_card(self, card_id: str, list_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def archive_card(self, card_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def get_contact(self, contact_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def search_conversations(self, contact_id: str) -> Sequence[ProviderRecord]:
+        raise self._deny()
+
+    def get_message(self, conversation_id: str, message_id: str, contact_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def send_sms(
+        self, contact_id: str, normalized_destination: str, body: str
+    ) -> Mapping[str, str]:
+        raise self._deny()
+
+    def fetch(self, endpoint: str, query: Mapping[str, object]) -> ProviderRecord:
+        raise self._deny()
+
+
 def _record_json(record: ProviderRecord) -> dict[str, object]:
     return {
         "provider": record.provider,
@@ -95,6 +157,20 @@ def _proposal_json(proposal: Proposal) -> dict[str, object]:
         "status": proposal.status.value,
         "payload": dict(proposal.payload),
         "receipt": dict(proposal.receipt) if proposal.receipt else None,
+    }
+
+
+def _guidance_json(provider: str, connected: bool) -> dict[str, object]:
+    item = provider_guidance(provider, connected=connected)
+    return {
+        "provider": item.provider,
+        "name": item.display_name,
+        "status": item.status,
+        "summary": item.summary,
+        "required_ids": list(item.required_ids),
+        "required_scopes": list(item.required_scopes),
+        "steps": list(item.steps),
+        "guidance": item.as_text(),
     }
 
 
@@ -155,21 +231,30 @@ class Runtime:
         self.discord = DiscordAdapter(
             transport, _required_env("DISCORD_BOT_TOKEN"), client_channels
         )
-        self.trello = TrelloAdapter(
-            transport,
-            _required_env("SCOTTY_TRELLO_API_KEY"),
-            _required_env("SCOTTY_TRELLO_TOKEN"),
-            self.config.trello,
+        trello_key = os.environ.get("SCOTTY_TRELLO_API_KEY")
+        trello_token = os.environ.get("SCOTTY_TRELLO_TOKEN")
+        ghl_token = os.environ.get("SCOTTY_GHL_PRIVATE_TOKEN")
+        rentcast_key = os.environ.get("SCOTTY_RENTCAST_API_KEY")
+        self.connected = {
+            "discord": True,
+            "trello": bool(trello_key and trello_token),
+            "ghl": bool(ghl_token),
+            "rentcast": bool(rentcast_key),
+        }
+        self.trello: TrelloReadPort = (
+            TrelloAdapter(transport, trello_key or "", trello_token or "", self.config.trello)
+            if self.connected["trello"]
+            else UnconnectedProvider("Trello")
         )
-        self.ghl = GHLAdapter(
-            transport,
-            _required_env("SCOTTY_GHL_PRIVATE_TOKEN"),
-            self.config.ghl_location_id,
+        self.ghl: GHLReadPort = (
+            GHLAdapter(transport, ghl_token or "", self.config.ghl_location_id)
+            if self.connected["ghl"]
+            else UnconnectedProvider("GoHighLevel")
         )
-        self.rentcast = RentCastAdapter(
-            transport,
-            _required_env("SCOTTY_RENTCAST_API_KEY"),
-            self.config.rentcast_endpoints,
+        self.rentcast: RentCastPort = (
+            RentCastAdapter(transport, rentcast_key or "", self.config.rentcast_endpoints)
+            if self.connected["rentcast"]
+            else UnconnectedProvider("RentCast")
         )
         state_dir = home / "scotty"
         self.approvals = ApprovalStore(state_dir / "approvals.db")
@@ -191,6 +276,22 @@ class Runtime:
     def principal(self, session_id: object) -> Principal:
         return self.resolver.resolve(session_id)
 
+    def provider_connection_status(self) -> dict[str, bool]:
+        return provider_status(self.connected)
+
+    def _provider_setup(self, args: Mapping[str, object]) -> dict[str, object]:
+        status = self.provider_connection_status()
+        name = _text(args, "provider", optional=True)
+        if name is None:
+            return {
+                "providers": {
+                    provider: _guidance_json(provider, status[provider]) for provider in PROVIDERS
+                }
+            }
+        if name not in PROVIDERS:
+            raise ValueError("provider is not part of this deployment")
+        return _guidance_json(name, status[name])
+
     def handle_read(self, principal: Principal, args: Mapping[str, object]) -> object:
         del principal
         operation = _text(args, "operation")
@@ -200,6 +301,8 @@ class Runtime:
                 "addons": list(self.config.addons),
                 "addon_slots_remaining": 6 - len(self.config.addons),
             }
+        if operation == "provider_setup":
+            return self._provider_setup(args)
         if operation == "trello_card":
             return _record_json(self.trello.get_card(_text(args, "card_id")))
         if operation == "trello_cards":

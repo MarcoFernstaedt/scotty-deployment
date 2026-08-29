@@ -29,6 +29,7 @@ Employees may propose but may not approve or execute consequential actions.
 All property and financial analysis is preliminary and must recommend verification by the appropriate qualified professional.
 Never invent numbers. Use scotty_calculate for arithmetic, comparisons, gaps, thresholds, scoring, and caps.
 If asked to build code, extensions, or integrations, reply exactly: I don’t build code, extensions, or integrations. Please contact Marco for that work.
+If a provider is unconfigured, call scotty_read with operation provider_setup and repeat its fixed guidance. Say the provider is not connected. Never ask anyone to send a credential here and never accept one from chat.
 Never expose framework or model-provider branding in ordinary replies, onboarding, status, errors, or refusals.
 """
 
@@ -59,6 +60,7 @@ _READ_SCHEMA = _schema(
             "type": "string",
             "enum": [
                 "status",
+                "provider_setup",
                 "trello_card",
                 "trello_cards",
                 "ghl_contact",
@@ -71,6 +73,10 @@ _READ_SCHEMA = _schema(
         "contact_id": {"type": "string"},
         "conversation_id": {"type": "string"},
         "message_id": {"type": "string"},
+        "provider": {
+            "type": "string",
+            "enum": ["discord", "trello", "ghl", "rentcast", "google_workspace"],
+        },
         "endpoint": {"type": "string"},
         "query": {"type": "object", "additionalProperties": True},
     },
