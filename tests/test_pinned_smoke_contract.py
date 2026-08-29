@@ -58,20 +58,6 @@ class ProbeSourceTests(unittest.TestCase):
     def test_the_probe_body_is_valid_python(self) -> None:
         ast.parse(SMOKE.PROBE)
 
-    def test_the_probe_covers_every_required_verification(self) -> None:
-        for required in (
-            "DISCORD_ALLOWED_USERS",
-            "gateway.authz_mixin",
-            "_is_user_authorized",
-            "denies an unknown sender",
-            "before model execution",
-            "the profile guard admits the exact maintainer tuple",
-            "the fixed wizard goes only to the main-operator channel",
-            "keeps the setup-selected provider and model",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, SMOKE.PROBE)
-
     def test_the_probe_uses_synthetic_identifiers_only(self) -> None:
         for value in (
             IDS.guild_id,
@@ -88,9 +74,139 @@ class ProbeSourceTests(unittest.TestCase):
 
     def test_the_smoke_makes_no_network_call_of_its_own(self) -> None:
         source_text = Path("tools/pinned_smoke.py").read_text(encoding="utf-8")
-        self.assertIn('"--network",\n            "none",', source_text)
+        self.assertIn('"--network",\n        "none",', source_text)
         self.assertNotIn("urlopen", source_text)
         self.assertNotIn("https://discord.com", source_text)
+
+
+class SenderAuthorizationContractTests(unittest.TestCase):
+    """The probe must drive the real pinned method with a real SessionSource."""
+
+    def test_the_probe_builds_a_real_session_source(self) -> None:
+        self.assertIn("gateway.session", SMOKE.PROBE)
+        self.assertIn("SessionSource", SMOKE.PROBE)
+        self.assertIn("def build_session_source(", SMOKE.PROBE)
+        self.assertIn("SessionSource(**kwargs)", SMOKE.PROBE)
+        self.assertIn("inspect.signature(SessionSource)", SMOKE.PROBE)
+
+    def test_the_probe_never_passes_a_bare_user_string_to_the_pinned_method(self) -> None:
+        """The original defect: `method(instance, user)` with a string user ID."""
+
+        self.assertNotIn("method(instance, user)", SMOKE.PROBE)
+        self.assertIn("method(instance, session_source", SMOKE.PROBE)
+
+    def test_the_probe_resolves_the_runtime_platform_rather_than_a_stand_in(self) -> None:
+        self.assertIn("def resolve_platform(", SMOKE.PROBE)
+        self.assertIn("the runtime Discord platform value could not be resolved", SMOKE.PROBE)
+
+    def test_the_probe_asserts_admission_and_denial_through_the_pinned_method(self) -> None:
+        self.assertIn("the pinned runtime admits each configured sender", SMOKE.PROBE)
+        self.assertIn("the pinned runtime denies an unknown sender", SMOKE.PROBE)
+        self.assertIn("_is_user_authorized", SMOKE.PROBE)
+
+    def test_the_probe_fails_loudly_when_the_pinned_method_cannot_be_driven(self) -> None:
+        self.assertIn("the pinned authorization method could not be driven", SMOKE.PROBE)
+
+    def test_the_probe_checks_the_method_takes_a_source_parameter(self) -> None:
+        self.assertIn(
+            "the pinned authorization method takes a SessionSource, not a user string",
+            SMOKE.PROBE,
+        )
+
+
+class LifecycleDispatchContractTests(unittest.TestCase):
+    """The hook must be invoked through the pinned lifecycle, with no fallback."""
+
+    def test_the_probe_dispatches_through_the_pinned_lifecycle(self) -> None:
+        self.assertIn("def lifecycle_dispatch(", SMOKE.PROBE)
+        self.assertIn('"pre_gateway_dispatch"', SMOKE.PROBE)
+        self.assertIn("discover_plugins(force=True)", SMOKE.PROBE)
+        self.assertIn("get_plugin_manager()", SMOKE.PROBE)
+
+    def test_the_probe_never_constructs_the_hook_object_directly(self) -> None:
+        """A direct construction proves the class, not the registration."""
+
+        for forbidden in (
+            "IngressGuard(",
+            "from scotty_business.ingress import",
+            "MaintainerGuard(",
+            "_load_private_config",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, SMOKE.PROBE)
+
+    def test_the_probe_has_no_manager_hooks_attribute_assumption(self) -> None:
+        self.assertNotIn("manager.hooks", SMOKE.PROBE)
+        self.assertNotIn('getattr(manager, "hooks"', SMOKE.PROBE)
+
+    def test_missing_lifecycle_dispatch_is_a_failure_not_a_fallback(self) -> None:
+        self.assertIn("no pinned lifecycle dispatch entry point could be driven", SMOKE.PROBE)
+        self.assertIn("raise RuntimeError(", SMOKE.PROBE)
+
+    def test_a_dispatch_that_does_not_reach_the_hook_is_a_failure(self) -> None:
+        self.assertIn("so the registered hook did not decide", SMOKE.PROBE)
+        self.assertIn("def hook_decision(", SMOKE.PROBE)
+
+    def test_asynchronous_dispatch_is_driven_rather_than_bypassed(self) -> None:
+        self.assertIn("inspect.isawaitable", SMOKE.PROBE)
+        self.assertIn("asyncio.run", SMOKE.PROBE)
+
+    def test_the_registered_hook_is_asserted_for_admit_and_deny(self) -> None:
+        self.assertIn("registered pre_gateway_dispatch admits", SMOKE.PROBE)
+        self.assertIn("registered pre_gateway_dispatch denies", SMOKE.PROBE)
+        self.assertIn("before model execution", SMOKE.PROBE)
+
+    def test_the_wizard_is_proven_through_lifecycle_dispatch_only(self) -> None:
+        self.assertIn("the wizard trigger is intercepted before model execution", SMOKE.PROBE)
+        self.assertIn("the fixed wizard goes only to the main-operator channel", SMOKE.PROBE)
+        self.assertIn("one inbound message delivers the wizard exactly once", SMOKE.PROBE)
+        self.assertIn("no wrong sender can trigger the wizard", SMOKE.PROBE)
+        # Delivery is observed by replacing the module-level sender, never by
+        # constructing the guard, and the decision comes from dispatch.
+        self.assertIn("guard_module.send_fixed_message", SMOKE.PROBE)
+        self.assertIn("dispatch_decision(", SMOKE.PROBE)
+
+    def test_both_profile_homes_are_probed(self) -> None:
+        self.assertEqual((SMOKE.ROLE_ROOT, SMOKE.ROLE_MAINTAINER), ("root", "maintainer"))
+        self.assertIn('if ROLE == "root":', SMOKE.PROBE)
+        self.assertIn('elif ROLE == "maintainer":', SMOKE.PROBE)
+        self.assertIn("the maintainer guard is loaded in its own profile home", SMOKE.PROBE)
+        self.assertIn("the full profile exposes no bounded Scotty tool", SMOKE.PROBE)
+
+
+class EnvironmentHygieneTests(unittest.TestCase):
+    def test_the_probe_rejects_an_inherited_allowlist_or_open_policy(self) -> None:
+        self.assertIn("no open sender policy is inherited or set", SMOKE.PROBE)
+        self.assertIn("the container carries no unexpected Discord environment", SMOKE.PROBE)
+        self.assertIn("the probe uses its staged profile home", SMOKE.PROBE)
+
+    def test_the_host_discord_environment_is_stripped_before_docker_runs(self) -> None:
+        source_text = Path("tools/pinned_smoke.py").read_text(encoding="utf-8")
+        self.assertIn('if name.startswith("DISCORD_"):', source_text)
+        self.assertIn("environment.pop(name)", source_text)
+
+    def test_the_container_environment_is_supplied_explicitly(self) -> None:
+        command = SMOKE._command(
+            Path("/tmp/scotty-smoke"), SMOKE.ROLE_ROOT, "/opt/data", "1,2,3", "{}"
+        )
+        joined = " ".join(command)
+        self.assertIn("DISCORD_ALLOWED_USERS=1,2,3", joined)
+        self.assertIn("SCOTTY_SMOKE_ROLE=root", joined)
+        self.assertIn("HERMES_HOME=/opt/data", joined)
+        self.assertIn("--network none", joined)
+        self.assertIn(SMOKE.IMAGE, command)
+
+    def test_both_roles_run_against_their_own_profile_home(self) -> None:
+        source_text = Path("tools/pinned_smoke.py").read_text(encoding="utf-8")
+        self.assertIn('(ROLE_ROOT, "/opt/data")', source_text)
+        self.assertIn("(ROLE_MAINTAINER, maintainer_home)", source_text)
+
+    def test_the_identifier_payload_carries_both_homes(self) -> None:
+        identifiers = json.loads(SMOKE._identifiers())
+        self.assertEqual(identifiers["home"]["root"], "/opt/data")
+        self.assertEqual(identifiers["home"]["maintainer"], "/opt/data/profiles/scotty-maintainer")
+        self.assertEqual(identifiers["wizard_command"], WIZARD)
+        self.assertEqual(len(identifiers["expected_tools"]), 5)
 
 
 class StagedDeploymentTests(unittest.TestCase):
