@@ -7,32 +7,50 @@ import re
 import shutil
 import subprocess
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-from .adapters.http import HttpTransport, ProviderError, RedactedMapping, require_success
+from .adapters.http import HttpTransport, ProviderError, RedactedMapping
 from .policy import Role
 from .provisioning import (
+    BOT_ALLOW,
+    MEMBER_ALLOW,
     ChannelPlan,
     DiscordProvisioningApi,
     DiscordProvisioningClient,
     ProvisionStatus,
     ensure_private_channels,
 )
-from .routing import client_profile
+from .routing import (
+    CLIENT_PROFILES,
+    MAINTAINER_PROFILE,
+    SERVED_PROFILES,
+    ProfileRouteError,
+    parse_profile_routes,
+)
 
 _DATA_DIR = Path("/srv/Scotty/data")
+_PROFILES_DIRNAME = "profiles"
 _VIEW_CHANNEL = 1 << 10
+_SEND_MESSAGES = 1 << 11
+_READ_HISTORY = 1 << 16
+
+#: Codex authenticates natively through the pinned runtime's own OAuth flow.
+CODEX_PROVIDER = "openai-codex"
+CODEX_AUTH_COMMAND = "hermes auth add openai-codex"
 _MODEL_SECRET_ENV = {
     "openrouter": "OPENROUTER_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
-_SECRET_NAMES = (
-    "DISCORD_BOT_TOKEN",
+_MODEL_PROVIDERS = (CODEX_PROVIDER, *sorted(_MODEL_SECRET_ENV))
+
+#: Only Discord is required on day one. Every other provider connects later.
+REQUIRED_SECRETS = ("DISCORD_BOT_TOKEN",)
+OPTIONAL_SECRETS = (
     "SCOTTY_TRELLO_API_KEY",
     "SCOTTY_TRELLO_TOKEN",
     "SCOTTY_GHL_PRIVATE_TOKEN",
@@ -51,42 +69,46 @@ class SetupInputs:
     model_provider: str
     model_name: str
     guild_id: str
-    maintainer_channel_id: str
-    maintainer_user_id: str
     operator_channel_id: str
     operator_user_id: str
     employee_channel_id: str
     employee_user_id: str
-    announcement_channel_ids: tuple[str, ...]
-    trello_board_id: str
-    trello_list_ids: tuple[str, ...]
-    trello_label_ids: tuple[str, ...]
-    trello_custom_field_ids: tuple[str, ...]
-    ghl_location_id: str
+    route_guild_id: str
+    route_channel_id: str
+    route_user_id: str
     secrets: Mapping[str, str]
-    maintainer_route_guild_id: str = ""
-    maintainer_route_channel_id: str = ""
-    maintainer_route_user_id: str = ""
-    maintainer_route_profile: str = ""
+    announcement_channel_ids: tuple[str, ...] = ()
+    trello_board_id: str = ""
+    trello_list_ids: tuple[str, ...] = ()
+    trello_label_ids: tuple[str, ...] = ()
+    trello_custom_field_ids: tuple[str, ...] = ()
+    ghl_location_id: str = ""
     provision_channel_names: Mapping[str, str] | None = None
 
-    def route_fields(self) -> tuple[str, str, str, str]:
-        return (
-            self.maintainer_route_guild_id,
-            self.maintainer_route_channel_id,
-            self.maintainer_route_user_id,
-            self.maintainer_route_profile,
-        )
+    @property
+    def client_user_ids(self) -> tuple[str, ...]:
+        return (self.operator_user_id, self.employee_user_id)
 
 
 class DiscordSetupReader(Protocol):
     def get(self, path: str) -> object: ...
+
+    def status_get(self, path: str) -> tuple[int, object]: ...
 
 
 def _visible(input_fn: Callable[[str], str], prompt: str) -> str:
     value = input_fn(prompt).strip()
     if not value or len(value) > 256 or any(ord(char) < 32 for char in value):
         raise SetupError("setup value is missing or malformed")
+    return value
+
+
+def _optional(input_fn: Callable[[str], str], prompt: str) -> str:
+    value = input_fn(prompt).strip()
+    if not value:
+        return ""
+    if len(value) > 256 or any(ord(char) < 32 for char in value):
+        raise SetupError("setup value is malformed")
     return value
 
 
@@ -112,20 +134,37 @@ def _hidden(hidden_fn: Callable[[str], str], prompt: str) -> str:
     return value
 
 
+def _hidden_optional(hidden_fn: Callable[[str], str], prompt: str) -> str:
+    value = hidden_fn(prompt)
+    if not value:
+        return ""
+    if len(value) > 4096 or not _SAFE_SECRET.fullmatch(value):
+        raise SetupError("hidden credential contains unsupported characters")
+    return value
+
+
+def _environment_secret(environ: Mapping[str, str], name: str) -> str:
+    value = environ.get(name, "")
+    if value and not _SAFE_SECRET.fullmatch(value):
+        raise SetupError("an environment credential contains unsupported characters")
+    return value
+
+
 def collect_inputs(
     *,
     input_fn: Callable[[str], str] = input,
     hidden_fn: Callable[[str], str] = getpass.getpass,
     environ: Mapping[str, str] | None = None,
 ) -> SetupInputs:
+    """Collect setup answers. Credentials never come from argv."""
+
     environ = os.environ if environ is None else environ
-    provider = _visible(input_fn, "Model provider (openrouter, openai, anthropic): ").lower()
-    if provider not in _MODEL_SECRET_ENV:
+    provider = _visible(input_fn, f"Model provider ({', '.join(_MODEL_PROVIDERS)}): ").lower()
+    if provider not in _MODEL_PROVIDERS:
         raise SetupError("model provider is not supported by bounded setup")
     model_name = _visible(input_fn, "Model name: ")
+
     guild_id = _visible(input_fn, "Discord guild ID: ")
-    maintainer_channel = _visible(input_fn, "Maintainer private channel ID: ")
-    maintainer_user = _visible(input_fn, "Maintainer Discord user ID: ")
     provision = _visible(
         input_fn, "Create the operator and employee private channels now? (yes/no): "
     ).lower()
@@ -145,67 +184,82 @@ def collect_inputs(
     operator_user = _visible(input_fn, "Main-operator Discord user ID: ")
     employee_user = _visible(input_fn, "Employee Discord user ID: ")
     announcements = _csv(
-        input_fn, "Configured Discord announcement channel IDs (comma-separated): "
-    )
-    board_id = _visible(input_fn, "Trello board ID: ")
-    list_ids = _csv(input_fn, "Trello list IDs (comma-separated): ")
-    label_ids = _csv(
-        input_fn, "Trello label IDs (comma-separated, blank for none): ", allow_empty=True
-    )
-    custom_fields = _csv(
         input_fn,
-        "Trello custom-field IDs (comma-separated, blank for none): ",
+        "Configured Discord announcement channel IDs (comma-separated, blank for none): ",
         allow_empty=True,
     )
-    location_id = _visible(input_fn, "GoHighLevel location ID: ")
-    route = _visible(input_fn, "Configure the private full-profile route? (yes/no): ").lower()
-    if route not in {"yes", "no"}:
-        raise SetupError("answer the route question with yes or no")
-    route_guild = route_channel = route_user = route_profile = ""
-    if route == "yes":
-        route_guild = _visible(input_fn, "Route guild ID: ")
-        route_channel = _visible(input_fn, "Route private channel ID: ")
-        route_user = _visible(input_fn, "Route Discord user ID: ")
-        route_profile = _visible(input_fn, "Route profile name: ").lower()
+
+    route_guild = _visible(input_fn, "Private route guild ID: ")
+    route_channel = _visible(input_fn, "Private route channel ID: ")
+    route_user = _visible(input_fn, "Private route Discord user ID: ")
+
+    board_id = _optional(input_fn, "Trello board ID (blank to connect later): ")
+    list_ids = _csv(input_fn, "Trello list IDs (comma-separated): ") if board_id else ()
+    label_ids = (
+        _csv(input_fn, "Trello label IDs (comma-separated, blank for none): ", allow_empty=True)
+        if board_id
+        else ()
+    )
+    custom_fields = (
+        _csv(
+            input_fn,
+            "Trello custom-field IDs (comma-separated, blank for none): ",
+            allow_empty=True,
+        )
+        if board_id
+        else ()
+    )
+    location_id = _optional(input_fn, "GoHighLevel location ID (blank to connect later): ")
+
     secrets: dict[str, str] = {}
-    secrets[_MODEL_SECRET_ENV[provider]] = _hidden(hidden_fn, "Model API credential (hidden): ")
+    if provider != CODEX_PROVIDER:
+        name = _MODEL_SECRET_ENV[provider]
+        secrets[name] = _environment_secret(environ, name) or _hidden(
+            hidden_fn, "Model API credential (hidden): "
+        )
     for name, prompt in (
         ("DISCORD_BOT_TOKEN", "Discord bot token (hidden): "),
-        ("SCOTTY_TRELLO_API_KEY", "Trello API key (hidden): "),
-        ("SCOTTY_TRELLO_TOKEN", "Trello token (hidden): "),
-        ("SCOTTY_GHL_PRIVATE_TOKEN", "GoHighLevel Private Integration Token (hidden): "),
-        ("SCOTTY_RENTCAST_API_KEY", "RentCast API key (hidden): "),
+        ("SCOTTY_TRELLO_API_KEY", "Trello API key (hidden, blank to connect later): "),
+        ("SCOTTY_TRELLO_TOKEN", "Trello token (hidden, blank to connect later): "),
+        (
+            "SCOTTY_GHL_PRIVATE_TOKEN",
+            "GoHighLevel Private Integration Token (hidden, blank to connect later): ",
+        ),
+        ("SCOTTY_RENTCAST_API_KEY", "RentCast API key (hidden, blank to connect later): "),
     ):
         # A credential is read from hidden terminal input, or from the process
         # environment when the operator exported it. It is never read from argv.
-        environment = environ.get(name)
-        if environment:
-            if not _SAFE_SECRET.fullmatch(environment):
-                raise SetupError("an environment credential contains unsupported characters")
-            secrets[name] = environment
-            continue
-        secrets[name] = _hidden(hidden_fn, prompt)
+        value = _environment_secret(environ, name)
+        if not value:
+            value = (
+                _hidden(hidden_fn, prompt)
+                if name in REQUIRED_SECRETS
+                else _hidden_optional(hidden_fn, prompt)
+            )
+        if value:
+            secrets[name] = value
+    for name in REQUIRED_SECRETS:
+        if not secrets.get(name):
+            raise SetupError("the Discord bot token is required for initial setup")
+
     return SetupInputs(
         model_provider=provider,
         model_name=model_name,
         guild_id=guild_id,
-        maintainer_channel_id=maintainer_channel,
-        maintainer_user_id=maintainer_user,
         operator_channel_id=operator_channel,
         operator_user_id=operator_user,
         employee_channel_id=employee_channel,
         employee_user_id=employee_user,
         announcement_channel_ids=announcements,
+        route_guild_id=route_guild,
+        route_channel_id=route_channel,
+        route_user_id=route_user,
         trello_board_id=board_id,
         trello_list_ids=list_ids,
         trello_label_ids=label_ids,
         trello_custom_field_ids=custom_fields,
         ghl_location_id=location_id,
         secrets=secrets,
-        maintainer_route_guild_id=route_guild,
-        maintainer_route_channel_id=route_channel,
-        maintainer_route_user_id=route_user,
-        maintainer_route_profile=route_profile,
         provision_channel_names=provision_names,
     )
 
@@ -215,16 +269,23 @@ class DiscordSetupClient:
         self.transport = HttpTransport(timeout=20.0, max_response_bytes=262_144)
         self.headers = RedactedMapping(Authorization=f"Bot {token}")
 
-    def get(self, path: str) -> object:
+    def _url(self, path: str) -> str:
         if not path.startswith("/") or ".." in path or "?" in path or "#" in path:
             raise SetupError("Discord setup path is invalid")
+        return f"https://discord.com/api/v10{path}"
+
+    def status_get(self, path: str) -> tuple[int, object]:
         try:
-            response = self.transport.request(
-                "GET", f"https://discord.com/api/v10{path}", headers=self.headers
-            )
-            return require_success(response)
+            response = self.transport.request("GET", self._url(path), headers=self.headers)
         except ProviderError as exc:
             raise SetupError("Discord setup validation failed") from exc
+        return response.status, response.body
+
+    def get(self, path: str) -> object:
+        status, body = self.status_get(path)
+        if status != 200:
+            raise SetupError("Discord setup validation failed")
+        return body
 
 
 def _snowflake(value: object, field: str) -> str:
@@ -233,51 +294,62 @@ def _snowflake(value: object, field: str) -> str:
     return value
 
 
-def _private_channel(channel: Mapping[str, object], guild_id: str) -> bool:
+def _overwrite(channel: Mapping[str, object], identifier: str) -> Mapping[str, object] | None:
     overwrites = channel.get("permission_overwrites")
     if not isinstance(overwrites, list):
-        return False
+        return None
     for overwrite in overwrites:
-        if not isinstance(overwrite, dict):
-            continue
-        if overwrite.get("id") != guild_id or overwrite.get("type") != 0:
-            continue
-        deny = overwrite.get("deny")
-        if type(deny) is not str or not deny.isdigit():
-            return False
-        return bool(int(deny) & _VIEW_CHANNEL)
-    return False
+        if isinstance(overwrite, Mapping) and overwrite.get("id") == identifier:
+            return overwrite
+    return None
+
+
+def _bits(overwrite: Mapping[str, object] | None, key: str) -> int:
+    if overwrite is None:
+        return 0
+    value = overwrite.get(key)
+    if type(value) is not str or not value.isdigit():
+        raise SetupError("Discord permission overwrite is malformed")
+    return int(value)
+
+
+def _private_channel(channel: Mapping[str, object], guild_id: str) -> bool:
+    everyone = _overwrite(channel, guild_id)
+    if everyone is None or everyone.get("type") != 0:
+        return False
+    return bool(_bits(everyone, "deny") & _VIEW_CHANNEL)
 
 
 def validate_discord_scope(inputs: SetupInputs, client: DiscordSetupReader) -> None:
+    """Verify the client guild, the bot's membership, and channel privacy."""
+
     guild = _snowflake(inputs.guild_id, "guild_id")
     bot = client.get("/users/@me")
-    if not isinstance(bot, dict) or type(bot.get("id")) is not str:
+    if not isinstance(bot, Mapping) or type(bot.get("id")) is not str:
         raise SetupError("Discord bot identity is malformed")
     member = client.get(f"/guilds/{guild}/members/@me")
     if (
-        not isinstance(member, dict)
-        or not isinstance(member.get("user"), dict)
+        not isinstance(member, Mapping)
+        or not isinstance(member.get("user"), Mapping)
         or member["user"].get("id") != bot["id"]
     ):
         raise SetupError("Discord bot is not a verified member of the configured guild")
     channel_ids = tuple(
         dict.fromkeys(
             (
-                inputs.maintainer_channel_id,
                 inputs.operator_channel_id,
                 inputs.employee_channel_id,
                 *inputs.announcement_channel_ids,
             )
         )
     )
-    if len(channel_ids) != 3 + len(inputs.announcement_channel_ids):
+    if len(channel_ids) != 2 + len(inputs.announcement_channel_ids):
         raise SetupError("Discord principal and announcement channels must be distinct")
     for raw_channel_id in channel_ids:
         channel_id = _snowflake(raw_channel_id, "channel_id")
         channel = client.get(f"/channels/{channel_id}")
         if (
-            not isinstance(channel, dict)
+            not isinstance(channel, Mapping)
             or channel.get("id") != channel_id
             or channel.get("guild_id") != guild
         ):
@@ -287,7 +359,7 @@ def validate_discord_scope(inputs: SetupInputs, client: DiscordSetupReader) -> N
         if not private and type(parent_id) is str and parent_id:
             parent = client.get(f"/channels/{_snowflake(parent_id, 'parent_id')}")
             private = (
-                isinstance(parent, dict)
+                isinstance(parent, Mapping)
                 and parent.get("guild_id") == guild
                 and _private_channel(parent, guild)
             )
@@ -295,72 +367,205 @@ def validate_discord_scope(inputs: SetupInputs, client: DiscordSetupReader) -> N
             raise SetupError("every configured Discord channel must deny View Channel to @everyone")
 
 
-def _yaml_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
+def validate_maintainer_route(inputs: SetupInputs, client: DiscordSetupReader) -> None:
+    """Read the private route back from Discord before it is ever configured.
 
-
-def _yaml_list(values: tuple[str, ...]) -> str:
-    return "[" + ", ".join(_yaml_string(value) for value in values) + "]"
-
-
-def render_hermes_config(inputs: SetupInputs) -> str:
-    """Render owner-only gateway configuration using proven pinned-runtime keys.
-
-    The private route channel is admitted here so the gateway delivers its
-    messages at all. Which profile and toolset that source receives is decided
-    by the plugin before dispatch, never by this file.
+    Every failure message here stays generic. Nothing that reaches a client
+    surface names the guild, the channel, the user, or the profile.
     """
 
-    _require_provisioned(inputs)
-    channels = tuple(
-        dict.fromkeys(
-            item
-            for item in (
-                inputs.maintainer_channel_id,
-                inputs.operator_channel_id,
-                inputs.employee_channel_id,
-                inputs.maintainer_route_channel_id,
-            )
-            if item
-        )
-    )
-    return "\n".join(
-        (
-            "model:",
-            f"  provider: {_yaml_string(inputs.model_provider)}",
-            f"  default: {_yaml_string(inputs.model_name)}",
-            "platform_toolsets:",
-            "  discord: [scotty]",
-            "tools:",
-            "  tool_search:",
-            "    enabled: off",
-            "plugins:",
-            "  enabled: [scotty-business]",
-            "discord:",
-            "  slash_commands: false",
-            "  auto_thread: false",
-            "  history_backfill: false",
-            "  require_mention: false",
-            "  group_sessions_per_user: true",
-            f"  allowed_channels: {_yaml_list(channels)}",
-            f"  free_response_channels: {_yaml_list(channels)}",
-            "approvals:",
-            "  mode: manual",
-            "  cron_mode: deny",
-            "security:",
-            "  tirith_enabled: true",
-            "gateway:",
-            "  platforms:",
-            "    discord:",
-            "      enabled: true",
-            "",
-        )
-    )
+    guild = _snowflake(inputs.route_guild_id, "route guild_id")
+    channel_id = _snowflake(inputs.route_channel_id, "route channel_id")
+    user_id = _snowflake(inputs.route_user_id, "route user_id")
+    if guild == inputs.guild_id:
+        raise SetupError("the private route must not share the client guild")
+
+    identity = client.get("/users/@me")
+    if not isinstance(identity, Mapping) or type(identity.get("id")) is not str:
+        raise SetupError("Discord bot identity is malformed")
+    bot_id = _snowflake(identity["id"], "bot id")
+    member = client.get(f"/guilds/{guild}/members/@me")
+    if (
+        not isinstance(member, Mapping)
+        or not isinstance(member.get("user"), Mapping)
+        or member["user"].get("id") != bot_id
+    ):
+        raise SetupError("the assistant is not a verified member of the private route guild")
+
+    channel = client.get(f"/channels/{channel_id}")
+    if not isinstance(channel, Mapping) or channel.get("id") != channel_id:
+        raise SetupError("the private route channel does not exist")
+    if channel.get("guild_id") != guild:
+        raise SetupError("the private route channel is not in its configured guild")
+    if channel.get("type") != 0:
+        raise SetupError("the private route channel must be a text channel")
+    if not _private_channel(channel, guild):
+        raise SetupError("the private route channel must deny View Channel to @everyone")
+
+    if not _bits(_overwrite(channel, user_id), "allow") & _VIEW_CHANNEL:
+        raise SetupError("the configured private route user cannot view the route channel")
+    if _bits(_overwrite(channel, user_id), "deny") & _VIEW_CHANNEL:
+        raise SetupError("the configured private route user is denied the route channel")
+
+    required = _VIEW_CHANNEL | _SEND_MESSAGES | _READ_HISTORY
+    bot_allow = _bits(_overwrite(channel, bot_id), "allow")
+    if bot_allow & required != required:
+        raise SetupError("the assistant cannot view, send, and read history in the route channel")
+    if _bits(_overwrite(channel, bot_id), "deny") & required:
+        raise SetupError("the assistant is denied access in the route channel")
+
+    for client_user in inputs.client_user_ids:
+        identifier = _snowflake(client_user, "client user_id")
+        if _bits(_overwrite(channel, identifier), "allow") & _VIEW_CHANNEL:
+            raise SetupError("a client principal can view the private route channel")
+        status, _ = client.status_get(f"/guilds/{guild}/members/{identifier}")
+        if status == 200:
+            raise SetupError("a client principal belongs to the private route guild")
+        if status != 404:
+            raise SetupError("private route membership could not be verified")
+
+
+def _yaml_scalar(value: object) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if type(value) is int:
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _emit(value: object, indent: int) -> list[str]:
+    pad = "  " * indent
+    lines: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(item, Mapping):
+                lines.append(f"{pad}{key}:")
+                lines.extend(_emit(item, indent + 1))
+            elif isinstance(item, list):
+                if not item:
+                    lines.append(f"{pad}{key}: []")
+                elif all(isinstance(entry, Mapping) for entry in item):
+                    lines.append(f"{pad}{key}:")
+                    for entry in item:
+                        rendered = _emit(entry, indent + 2)
+                        lines.append(f"{'  ' * (indent + 1)}- {rendered[0].strip()}")
+                        lines.extend(rendered[1:])
+                else:
+                    inline = ", ".join(_yaml_scalar(entry) for entry in item)
+                    lines.append(f"{pad}{key}: [{inline}]")
+            else:
+                lines.append(f"{pad}{key}: {_yaml_scalar(item)}")
+    return lines
+
+
+def render_mapping(mapping: Mapping[str, object]) -> str:
+    return "\n".join(_emit(mapping, 0)) + "\n"
 
 
 def _require_provisioned(inputs: SetupInputs) -> None:
     if not inputs.operator_channel_id or not inputs.employee_channel_id:
         raise SetupError("the operator and employee private channels are not provisioned yet")
+
+
+def profile_routes(inputs: SetupInputs) -> list[dict[str, str]]:
+    """The three native `gateway.profile_routes` entries this deployment serves."""
+
+    _require_provisioned(inputs)
+    return [
+        {
+            "name": "maintainer-private-channel",
+            "platform": "discord",
+            "guild_id": inputs.route_guild_id,
+            "chat_id": inputs.route_channel_id,
+            "profile": MAINTAINER_PROFILE,
+        },
+        {
+            "name": "main-operator-private-channel",
+            "platform": "discord",
+            "guild_id": inputs.guild_id,
+            "chat_id": inputs.operator_channel_id,
+            "profile": CLIENT_PROFILES[Role.MAIN_OPERATOR],
+        },
+        {
+            "name": "employee-private-channel",
+            "platform": "discord",
+            "guild_id": inputs.guild_id,
+            "chat_id": inputs.employee_channel_id,
+            "profile": CLIENT_PROFILES[Role.EMPLOYEE],
+        },
+    ]
+
+
+def hermes_config_mapping(inputs: SetupInputs) -> dict[str, object]:
+    """Owner-only gateway configuration, including native profile routing.
+
+    The base configuration is bounded. A profile widens its own surface only by
+    overriding these values, so a profile whose configuration fails to apply is
+    bounded rather than unbounded.
+    """
+
+    _require_provisioned(inputs)
+    routes = profile_routes(inputs)
+    channels = [str(route["chat_id"]) for route in routes]
+    model: dict[str, object] = {
+        "provider": inputs.model_provider,
+        "default": inputs.model_name,
+    }
+    return {
+        "model": model,
+        "platform_toolsets": {"discord": ["scotty"]},
+        "tools": {"tool_search": {"enabled": False}},
+        "plugins": {"enabled": ["scotty-business"]},
+        "discord": {
+            "slash_commands": False,
+            "auto_thread": False,
+            "history_backfill": False,
+            "require_mention": False,
+            "group_sessions_per_user": True,
+            "allowed_channels": channels,
+            "free_response_channels": channels,
+        },
+        "approvals": {"mode": "manual", "cron_mode": "deny"},
+        "security": {"tirith_enabled": True},
+        "gateway": {
+            "multiplex_profiles": True,
+            "multiplex_profile_allowlist": list(SERVED_PROFILES),
+            "profile_routes": routes,
+            "platforms": {"discord": {"enabled": True}},
+        },
+    }
+
+
+def render_hermes_config(inputs: SetupInputs) -> str:
+    mapping = hermes_config_mapping(inputs)
+    parse_profile_routes(mapping)
+    return render_mapping(mapping)
+
+
+def profile_config_mapping(profile: str) -> dict[str, object]:
+    """Per-profile configuration for one served profile."""
+
+    if profile not in SERVED_PROFILES:
+        raise ProfileRouteError("profile is not served by this deployment")
+    if profile == MAINTAINER_PROFILE:
+        # A normal full profile: no bounded plugin, no bounded toolset, and no
+        # bounded identity section, because the plugin is not installed here.
+        return {
+            "plugins": {"enabled": []},
+            "platform_toolsets": {"discord": ["*"]},
+            "tools": {"tool_search": {"enabled": True}},
+        }
+    return {
+        "plugins": {"enabled": ["scotty-business"]},
+        "platform_toolsets": {"discord": ["scotty"]},
+        "tools": {"tool_search": {"enabled": False}},
+    }
+
+
+def render_profile_config(profile: str) -> str:
+    return render_mapping(profile_config_mapping(profile))
 
 
 def channel_plans(inputs: SetupInputs) -> tuple[ChannelPlan, ...]:
@@ -373,12 +578,7 @@ def channel_plans(inputs: SetupInputs) -> tuple[ChannelPlan, ...]:
         raise SetupError("provisioning covers exactly the main-operator and employee channels")
     users = {"main_operator": inputs.operator_user_id, "employee": inputs.employee_user_id}
     return tuple(
-        ChannelPlan(
-            key=key,
-            name=names[key],
-            guild_id=inputs.guild_id,
-            user_id=users[key],
-        )
+        ChannelPlan(key=key, name=names[key], guild_id=inputs.guild_id, user_id=users[key])
         for key in ("main_operator", "employee")
     )
 
@@ -397,16 +597,10 @@ def resolve_provisioned_channels(
 
 def private_mapping(inputs: SetupInputs) -> dict[str, object]:
     _require_provisioned(inputs)
-    route = _route_mapping(inputs)
     mapping: dict[str, object] = {
         "version": 1,
         "addons": ["discord", "trello", "ghl", "rentcast"],
         "principals": {
-            "maintainer": {
-                "guild_id": inputs.guild_id,
-                "channel_id": inputs.maintainer_channel_id,
-                "user_id": inputs.maintainer_user_id,
-            },
             "main_operator": {
                 "guild_id": inputs.guild_id,
                 "channel_id": inputs.operator_channel_id,
@@ -419,78 +613,28 @@ def private_mapping(inputs: SetupInputs) -> dict[str, object]:
             },
         },
         "discord": {"announcement_channel_ids": list(inputs.announcement_channel_ids)},
-        "trello": {
+        "maintainer_route": {
+            "guild_id": inputs.route_guild_id,
+            "channel_id": inputs.route_channel_id,
+            "user_id": inputs.route_user_id,
+            "profile": MAINTAINER_PROFILE,
+        },
+    }
+    # An unconfigured provider is absent, never a placeholder that looks connected.
+    if inputs.trello_board_id:
+        mapping["trello"] = {
             "board_id": inputs.trello_board_id,
             "list_ids": list(inputs.trello_list_ids),
             "label_ids": list(inputs.trello_label_ids),
             "custom_field_ids": list(inputs.trello_custom_field_ids),
-        },
-        "ghl": {"location_id": inputs.ghl_location_id},
-        "rentcast": {
-            "endpoints": [
-                "/v1/properties",
-                "/v1/avm/value",
-                "/v1/avm/rent/long-term",
-            ]
-        },
-    }
-    if route is not None:
-        mapping["maintainer_route"] = route
+        }
+    if inputs.ghl_location_id:
+        mapping["ghl"] = {"location_id": inputs.ghl_location_id}
+    if inputs.secrets.get("SCOTTY_RENTCAST_API_KEY"):
+        mapping["rentcast"] = {
+            "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
+        }
     return mapping
-
-
-def _route_mapping(inputs: SetupInputs) -> dict[str, str] | None:
-    fields = inputs.route_fields()
-    if not any(fields):
-        return None
-    if not all(fields):
-        raise SetupError("the private route needs a guild, channel, user, and profile")
-    guild_id, channel_id, user_id, profile = fields
-    return {
-        "guild_id": guild_id,
-        "channel_id": channel_id,
-        "user_id": user_id,
-        "profile": profile,
-    }
-
-
-_OVERLAY_HEADER = (
-    "# Native multiplexed profile routing overlay.\n"
-    "# This file is NOT merged automatically. Verify these keys against the pinned\n"
-    "# Hermes 0.20.6 gateway profile-routing contract before merging any of it into\n"
-    "# config.yaml. Until then the plugin decides every profile and toolset before\n"
-    "# dispatch and fails closed. Owner-only: never copy this file into a client\n"
-    "# channel, a public repository, or any client-facing text.\n"
-)
-
-
-def render_profile_routing_overlay(inputs: SetupInputs) -> str:
-    """Render the reviewed-but-unmerged native profile-routing overlay."""
-
-    route = _route_mapping(inputs)
-    if route is None:
-        return ""
-    client_channels = (
-        (client_profile(Role.MAINTAINER), inputs.maintainer_channel_id),
-        (client_profile(Role.MAIN_OPERATOR), inputs.operator_channel_id),
-        (client_profile(Role.EMPLOYEE), inputs.employee_channel_id),
-    )
-    lines = [_OVERLAY_HEADER, "profiles:"]
-    for name, _ in client_channels:
-        lines.append(f"  {name}:")
-        lines.append("    toolsets: [scotty]")
-    lines.append(f"  {route['profile']}:")
-    lines.append("    toolsets: [__all__]")
-    lines.append("routing:")
-    lines.append("  discord:")
-    for name, channel_id in client_channels:
-        lines.append(f"    - guild_id: {_yaml_string(inputs.guild_id)}")
-        lines.append(f"      channel_id: {_yaml_string(channel_id)}")
-        lines.append(f"      profile: {_yaml_string(name)}")
-    lines.append(f"    - guild_id: {_yaml_string(route['guild_id'])}")
-    lines.append(f"      channel_id: {_yaml_string(route['channel_id'])}")
-    lines.append(f"      profile: {_yaml_string(route['profile'])}")
-    return "\n".join(lines) + "\n"
 
 
 def _ensure_directory(path: Path, uid: int, gid: int) -> None:
@@ -532,6 +676,51 @@ def _atomic_private_write(path: Path, content: bytes, uid: int, gid: int) -> Non
             temp.unlink(missing_ok=True)
 
 
+def profile_home(root: Path, profile: str) -> Path:
+    if profile not in SERVED_PROFILES:
+        raise ProfileRouteError("profile is not served by this deployment")
+    return root / _PROFILES_DIRNAME / profile
+
+
+def ensure_profile_homes(
+    root: Path,
+    profiles: Sequence[str] = SERVED_PROFILES,
+    *,
+    owner_uid: int = 10000,
+    owner_gid: int = 10000,
+) -> dict[str, Path]:
+    """Create or idempotently verify one home per served profile.
+
+    A routed profile without a home is a fail-closed setup error, never a silent
+    fall back to the default profile. The bounded plugin must be staged in each
+    client profile home and absent from the full profile home.
+    """
+
+    homes: dict[str, Path] = {}
+    _ensure_directory(root / _PROFILES_DIRNAME, owner_uid, owner_gid)
+    for profile in profiles:
+        home = profile_home(root, profile)
+        _ensure_directory(home, owner_uid, owner_gid)
+        _atomic_private_write(
+            home / "config.yaml",
+            render_profile_config(profile).encode("utf-8"),
+            owner_uid,
+            owner_gid,
+        )
+        staged = home / "plugins" / "scotty_business" / "plugin.yaml"
+        if profile == MAINTAINER_PROFILE:
+            if staged.exists():
+                raise SetupError("the full profile must not carry the bounded Scotty plugin")
+        elif not staged.is_file() or staged.is_symlink():
+            raise SetupError(
+                "a client profile is missing its staged Scotty plugin; reinstall before setup"
+            )
+        if not home.is_dir():
+            raise SetupError("a served profile home is missing")
+        homes[profile] = home
+    return homes
+
+
 def write_private_state(
     inputs: SetupInputs,
     root: Path = _DATA_DIR,
@@ -555,20 +744,10 @@ def write_private_state(
         if not _SAFE_SECRET.fullmatch(value):
             raise SetupError("credential contains unsupported characters")
         env_lines.append(f"{name}={value}")
+    ensure_profile_homes(root, owner_uid=owner_uid, owner_gid=owner_gid)
     _atomic_private_write(scotty_dir / "private.json", private_json, owner_uid, owner_gid)
-    overlay = render_profile_routing_overlay(inputs)
-    if overlay:
-        _atomic_private_write(
-            scotty_dir / "profile-routing.overlay.yaml",
-            overlay.encode("utf-8"),
-            owner_uid,
-            owner_gid,
-        )
     _atomic_private_write(
-        root / "config.yaml",
-        render_hermes_config(inputs).encode("utf-8"),
-        owner_uid,
-        owner_gid,
+        root / "config.yaml", render_hermes_config(inputs).encode("utf-8"), owner_uid, owner_gid
     )
     _atomic_private_write(
         root / ".env", ("\n".join(env_lines) + "\n").encode("utf-8"), owner_uid, owner_gid
@@ -628,9 +807,35 @@ def provision_private_channels(
             detail = f"{detail} (unknown: {', '.join(unknown)})"
         raise SetupError(detail)
     return resolve_provisioned_channels(
-        inputs,
-        {key: channel.channel_id or "" for key, channel in outcome.channels.items()},
+        inputs, {key: channel.channel_id or "" for key, channel in outcome.channels.items()}
     )
+
+
+def next_steps(inputs: SetupInputs) -> tuple[str, ...]:
+    """Fixed, non-secret instructions printed after a successful setup."""
+
+    steps = ["Scotty private setup completed. The container remains stopped."]
+    if inputs.model_provider == CODEX_PROVIDER:
+        steps.append(
+            "Authenticate the model locally with the runtime's own OAuth flow: "
+            f"{CODEX_AUTH_COMMAND}. Complete the browser or device-code prompt as "
+            "the maintainer. Scotty never handles, stores, or logs that token."
+        )
+    missing = [
+        name
+        for name, connected in (
+            ("Trello", bool(inputs.trello_board_id)),
+            ("GoHighLevel", bool(inputs.ghl_location_id)),
+            ("RentCast", bool(inputs.secrets.get("SCOTTY_RENTCAST_API_KEY"))),
+        )
+        if not connected
+    ]
+    if missing:
+        steps.append(
+            f"{', '.join(missing)} stayed unconfigured. Scotty reports each as not "
+            "connected and explains its setup steps. Rerun local setup to connect one."
+        )
+    return tuple(steps)
 
 
 def main() -> int:
@@ -640,7 +845,38 @@ def main() -> int:
     inputs = collect_inputs()
     token = inputs.secrets["DISCORD_BOT_TOKEN"]
     inputs = provision_private_channels(inputs, token=token)
-    validate_discord_scope(inputs, DiscordSetupClient(token))
+    reader = DiscordSetupClient(token)
+    validate_discord_scope(inputs, reader)
+    validate_maintainer_route(inputs, reader)
     write_private_state(inputs)
-    print("Scotty private setup completed. The container remains stopped.")
+    for step in next_steps(inputs):
+        print(step)
     return 0
+
+
+__all__ = [
+    "BOT_ALLOW",
+    "CODEX_AUTH_COMMAND",
+    "CODEX_PROVIDER",
+    "MEMBER_ALLOW",
+    "SetupError",
+    "SetupInputs",
+    "channel_plans",
+    "collect_inputs",
+    "ensure_profile_homes",
+    "hermes_config_mapping",
+    "main",
+    "next_steps",
+    "private_mapping",
+    "profile_config_mapping",
+    "profile_home",
+    "profile_routes",
+    "provision_private_channels",
+    "render_hermes_config",
+    "render_mapping",
+    "render_profile_config",
+    "resolve_provisioned_channels",
+    "validate_discord_scope",
+    "validate_maintainer_route",
+    "write_private_state",
+]

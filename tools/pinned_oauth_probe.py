@@ -1,9 +1,13 @@
-"""Discover the pinned runtime's own OAuth/login command.
+"""Confirm the pinned runtime's own OAuth command.
 
-The Codex OAuth step must use the command the pinned Hermes 0.20.6 image
-actually supports. This probe reads that from the image itself instead of
-guessing it, using a disposable, network-disabled container. It performs no
-login, stores no credential, and mutates nothing.
+Initial setup authenticates the model with the runtime's native flow:
+
+    hermes auth add openai-codex
+
+This probe confirms that subcommand exists in the pinned Hermes 0.20.6 image,
+using a disposable, network-disabled container. It performs no login, stores no
+credential, and mutates nothing. The browser or device-code flow stays entirely
+inside the runtime; Scotty never sees, stores, or logs an OAuth token.
 
 Run it on a host that has the pinned image loaded:
 
@@ -20,7 +24,11 @@ import json
 import subprocess
 
 candidates = []
-for argv in (["hermes", "--help"], ["hermes", "auth", "--help"], ["hermes", "login", "--help"]):
+for argv in (
+    ["hermes", "--help"],
+    ["hermes", "auth", "--help"],
+    ["hermes", "auth", "add", "--help"],
+):
     result = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=60)
     candidates.append(
         {
@@ -56,8 +64,9 @@ def main() -> int:
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "pinned-image OAuth probe failed")
     print(
-        "\nUse the exact subcommand printed above for the Codex OAuth step. "
-        "Do not substitute a command from another Hermes version."
+        "\nThe Codex OAuth step is: hermes auth add openai-codex. "
+        "Confirm it appears in the help output above before activation, and do "
+        "not substitute a command from another Hermes version."
     )
     return 0
 

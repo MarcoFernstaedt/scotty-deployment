@@ -3,12 +3,13 @@ from __future__ import annotations
 import unittest
 from decimal import Decimal
 
+import synthetic
+
 from assistant.scotty_business.calculations import preliminary_analysis
 from assistant.scotty_business.config import ConfigError, RuntimeConfig
 from assistant.scotty_business.policy import (
     ADDON_CAP_RESPONSE,
     CODING_REFUSAL,
-    FIXED_WIZARD_COMMAND,
     Principal,
     Role,
     authorize_source,
@@ -61,7 +62,6 @@ class PolicyTests(unittest.TestCase):
             enforce_addon_cap(["a", "b", "c", "d", "e", "f"], "g")
 
     def test_fixed_public_text_is_exact(self) -> None:
-        self.assertEqual(FIXED_WIZARD_COMMAND, "Scotty, send Trent the setup wizard.")
         self.assertEqual(
             CODING_REFUSAL,
             "I don’t build code, extensions, or integrations. Please contact Marco for that work.",
@@ -69,31 +69,30 @@ class PolicyTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_synthetic_config_builds_three_unique_principals(self) -> None:
-        config = RuntimeConfig.from_mapping(
-            {
-                "version": 1,
-                "addons": ["discord", "trello", "ghl", "rentcast"],
-                "principals": {
-                    "maintainer": {"guild_id": "100", "channel_id": "200", "user_id": "300"},
-                    "main_operator": {"guild_id": "100", "channel_id": "201", "user_id": "301"},
-                    "employee": {"guild_id": "100", "channel_id": "202", "user_id": "302"},
-                },
-                "discord": {"announcement_channel_ids": ["210"]},
-                "trello": {
-                    "board_id": "board-1",
-                    "list_ids": ["list-1", "list-2"],
-                    "label_ids": ["label-1"],
-                    "custom_field_ids": ["field-1"],
-                },
-                "ghl": {"location_id": "location-1"},
-                "rentcast": {
-                    "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
-                },
-            }
+    def test_synthetic_config_builds_two_unique_client_principals(self) -> None:
+        config = synthetic.config()
+        self.assertEqual(len(config.principals), 2)
+        self.assertEqual(
+            {principal.role for principal in config.principals},
+            {Role.MAIN_OPERATOR, Role.EMPLOYEE},
         )
-        self.assertEqual(len(config.principals), 3)
         self.assertEqual(config.addons, ("discord", "trello", "ghl", "rentcast"))
+
+    def test_a_client_guild_maintainer_principal_is_rejected(self) -> None:
+        mapping = synthetic.private_mapping()
+        principals = dict(mapping["principals"])  # type: ignore[arg-type]
+        principals["maintainer"] = {
+            "guild_id": synthetic.CLIENT_GUILD,
+            "channel_id": "200000000000000001",
+            "user_id": "300000000000000001",
+        }
+        mapping["principals"] = principals
+        with self.assertRaises(ConfigError):
+            RuntimeConfig.from_mapping(mapping)
+
+    def test_the_private_route_is_required(self) -> None:
+        with self.assertRaises(ConfigError):
+            RuntimeConfig.from_mapping(synthetic.private_mapping(maintainer_route=None))
 
     def test_more_than_six_addons_is_rejected(self) -> None:
         with self.assertRaises(ConfigError):

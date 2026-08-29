@@ -35,8 +35,6 @@ from assistant.scotty_business.ingress import (  # noqa: E402
 from assistant.scotty_business.policy import (  # noqa: E402
     CODING_REFUSAL,
     EMPLOYEE_SUMMARY,
-    FIXED_WIZARD_COMMAND,
-    SETUP_WIZARD,
     Principal,
     Role,
     can_approve,
@@ -49,9 +47,23 @@ from assistant.scotty_business.provisioning import (  # noqa: E402
 )
 from assistant.scotty_business.routing import (  # noqa: E402
     ALL_TOOLSETS,
+    CLIENT_PROFILES,
     CLIENT_TOOLSETS,
+    MAINTAINER_PROFILE,
+    SERVED_PROFILES,
     RouteKind,
+    match_profile_route,
+    parse_profile_routes,
     resolve_route,
+)
+from assistant.scotty_business.setup import (  # noqa: E402
+    CODEX_AUTH_COMMAND,
+    CODEX_PROVIDER,
+    SetupInputs,
+    hermes_config_mapping,
+    next_steps,
+    private_mapping,
+    profile_config_mapping,
 )
 
 FIXTURES = ROOT / "fixtures"
@@ -69,8 +81,32 @@ def check(label: str, condition: bool) -> None:
 
 
 def config() -> RuntimeConfig:
-    raw = json.loads((FIXTURES / "scotty.private.route.example.json").read_text("utf-8"))
+    raw = json.loads((FIXTURES / "scotty.private.example.json").read_text("utf-8"))
     return RuntimeConfig.from_mapping(raw)
+
+
+def discord_only_config() -> RuntimeConfig:
+    raw = json.loads((FIXTURES / "scotty.private.discord-only.example.json").read_text("utf-8"))
+    return RuntimeConfig.from_mapping(raw)
+
+
+def setup_inputs(runtime_config: RuntimeConfig) -> SetupInputs:
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+    route = runtime_config.maintainer_route
+    return SetupInputs(
+        model_provider=CODEX_PROVIDER,
+        model_name="synthetic/codex",
+        guild_id=operator.guild_id,
+        operator_channel_id=operator.channel_id,
+        operator_user_id=operator.user_id,
+        employee_channel_id=employee.channel_id,
+        employee_user_id=employee.user_id,
+        route_guild_id=route.guild_id,
+        route_channel_id=route.channel_id,
+        route_user_id=route.user_id,
+        secrets={"DISCORD_BOT_TOKEN": "synthetic-discord-token"},
+    )
 
 
 def source(guild: str, channel: str, user: str, *, parent: str | None = None) -> SimpleNamespace:
@@ -89,10 +125,90 @@ def principal_for(runtime_config: RuntimeConfig, role: Role) -> Principal:
     return next(item for item in runtime_config.principals if item.role == role)
 
 
+def check_native_configuration(runtime_config: RuntimeConfig) -> None:
+    mapping = hermes_config_mapping(setup_inputs(runtime_config))
+    gateway = mapping["gateway"]
+    assert isinstance(gateway, dict)
+    check("gateway.multiplex_profiles is enabled", gateway["multiplex_profiles"] is True)
+    routes = parse_profile_routes(mapping)
+    check("the native parser sees exactly three profile routes", len(routes) == 3)
+    check(
+        "every routed profile is in the served allowlist",
+        set(gateway["multiplex_profile_allowlist"]) == set(SERVED_PROFILES)
+        and all(item.profile in SERVED_PROFILES for item in routes),
+    )
+    check(
+        "every route uses only the native keys",
+        all(
+            set(entry) == {"name", "platform", "guild_id", "chat_id", "profile"}
+            for entry in gateway["profile_routes"]
+        ),
+    )
+
+    operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
+    employee = principal_for(runtime_config, Role.EMPLOYEE)
+    private = runtime_config.maintainer_route
+    check(
+        "the exact private tuple resolves to the full profile natively",
+        match_profile_route(routes, source(private.guild_id, private.channel_id, private.user_id))
+        == MAINTAINER_PROFILE,
+    )
+    check(
+        "the main-operator channel resolves to its bounded profile natively",
+        match_profile_route(
+            routes, source(operator.guild_id, operator.channel_id, operator.user_id)
+        )
+        == CLIENT_PROFILES[Role.MAIN_OPERATOR],
+    )
+    check(
+        "the employee channel resolves to its bounded profile natively",
+        match_profile_route(
+            routes, source(employee.guild_id, employee.channel_id, employee.user_id)
+        )
+        == CLIENT_PROFILES[Role.EMPLOYEE],
+    )
+    for label, candidate in (
+        ("wrong guild", source("999000000000000001", operator.channel_id, operator.user_id)),
+        (
+            "private channel in the client guild",
+            source(operator.guild_id, private.channel_id, private.user_id),
+        ),
+        (
+            "client channel in the private guild",
+            source(private.guild_id, operator.channel_id, operator.user_id),
+        ),
+    ):
+        check(
+            f"native routing matches no route: {label}",
+            match_profile_route(routes, candidate) is None,
+        )
+
+    full = profile_config_mapping(MAINTAINER_PROFILE)
+    check("the full profile enables no bounded plugin", full["plugins"] == {"enabled": []})
+    check(
+        "the full profile keeps the normal tool inventory",
+        full["platform_toolsets"] == {"discord": ["*"]},
+    )
+    check(
+        "the full profile config carries no bounded Scotty identity",
+        "scotty-business" not in json.dumps(full),
+    )
+    for name in CLIENT_PROFILES.values():
+        bounded = profile_config_mapping(name)
+        check(
+            f"{name} enables only the bounded Scotty toolset",
+            bounded["plugins"] == {"enabled": ["scotty-business"]}
+            and bounded["platform_toolsets"] == {"discord": ["scotty"]},
+        )
+    check(
+        "the base configuration is bounded so a failed override stays bounded",
+        mapping["platform_toolsets"] == {"discord": ["scotty"]},
+    )
+
+
 def check_routing(runtime_config: RuntimeConfig) -> None:
     route = runtime_config.maintainer_route
-    assert route is not None
-    for role in Role:
+    for role in (Role.MAIN_OPERATOR, Role.EMPLOYEE):
         principal = principal_for(runtime_config, role)
         resolved = resolve_route(
             runtime_config, source(principal.guild_id, principal.channel_id, principal.user_id)
@@ -111,14 +227,13 @@ def check_routing(runtime_config: RuntimeConfig) -> None:
 
     operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
     employee = principal_for(runtime_config, Role.EMPLOYEE)
-    maintainer = principal_for(runtime_config, Role.MAINTAINER)
     rejects = [
         ("wrong guild", source("999000000000000001", operator.channel_id, operator.user_id)),
         ("wrong channel", source(operator.guild_id, employee.channel_id, operator.user_id)),
         ("wrong user", source(operator.guild_id, operator.channel_id, employee.user_id)),
         (
             "client user in the private channel",
-            source(route.guild_id, route.channel_id, maintainer.user_id),
+            source(route.guild_id, route.channel_id, employee.user_id),
         ),
         (
             "private user in a client channel",
@@ -155,29 +270,8 @@ def check_routing(runtime_config: RuntimeConfig) -> None:
 def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
     outbound: list[tuple[str, str]] = []
     guard = IngressGuard(runtime_config, lambda channel, text: outbound.append((channel, text)))
-    maintainer = principal_for(runtime_config, Role.MAINTAINER)
     operator = principal_for(runtime_config, Role.MAIN_OPERATOR)
     employee = principal_for(runtime_config, Role.EMPLOYEE)
-
-    guard(
-        SimpleNamespace(
-            text=FIXED_WIZARD_COMMAND,
-            source=source(maintainer.guild_id, maintainer.channel_id, maintainer.user_id),
-        )
-    )
-    check(
-        "the exact command sends the fixed wizard only to the main operator",
-        outbound == [(operator.channel_id, SETUP_WIZARD)],
-    )
-
-    outbound.clear()
-    guard(
-        SimpleNamespace(
-            text=FIXED_WIZARD_COMMAND,
-            source=source(operator.guild_id, operator.channel_id, operator.user_id),
-        )
-    )
-    check("the operator cannot trigger the wizard", outbound == [])
 
     guard(
         SimpleNamespace(
@@ -203,7 +297,6 @@ def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
     )
 
     route = runtime_config.maintainer_route
-    assert route is not None
     destinations = {channel for channel, _ in outbound}
     check(
         "no fixed path ever targets the private route",
@@ -219,6 +312,8 @@ def check_employee_denial(runtime_config: RuntimeConfig) -> None:
     check("an employee cannot approve an SMS send", not can_approve(employee, "ghl_sms"))
     check("the main operator can approve a Trello write", can_approve(operator, "trello_write"))
 
+    trello = runtime_config.trello
+    assert trello is not None
     with tempfile.TemporaryDirectory(prefix="scotty-acceptance-") as directory:
         store = ApprovalStore(Path(directory) / "approvals.db")
         store.initialize()
@@ -228,7 +323,7 @@ def check_employee_denial(runtime_config: RuntimeConfig) -> None:
             requester=employee,
             approver=operator,
             action_class="trello_write",
-            target_ids=(runtime_config.trello.board_id, runtime_config.trello.list_ids[0]),
+            target_ids=(trello.board_id, trello.list_ids[0]),
             payload={"operation": "create", "fields": {"name": "Synthetic acceptance card"}},
             source_revision="configured-board-v1",
             expires_at=datetime.now(UTC) + timedelta(minutes=10),
@@ -355,17 +450,30 @@ def check_provisioning(runtime_config: RuntimeConfig) -> None:
     )
 
 
+def check_codex_and_optional_providers(runtime_config: RuntimeConfig) -> None:
+    inputs = setup_inputs(discord_only_config())
+    check("Codex setup needs no model API key", set(inputs.secrets) == {"DISCORD_BOT_TOKEN"})
+    steps = "\n".join(next_steps(inputs))
+    check("Codex setup names the runtime's own OAuth command", CODEX_AUTH_COMMAND in steps)
+    check("no OAuth material is ever collected", "refresh_token" not in steps)
+    mapping = private_mapping(inputs)
+    for absent in ("trello", "ghl", "rentcast"):
+        check(f"{absent} stays absent rather than a placeholder", absent not in mapping)
+    bare = discord_only_config()
+    check("a Discord-only deployment still loads", bare.trello is None)
+    check("a Discord-only deployment reports no RentCast scope", bare.rentcast_endpoints == ())
+    del runtime_config
+
+
 def check_secrecy(runtime_config: RuntimeConfig) -> None:
     route = runtime_config.maintainer_route
-    assert route is not None
-    identifiers = (route.guild_id, route.channel_id, route.user_id, route.profile)
+    identifiers = (route.guild_id, route.channel_id, route.user_id)
     client_text = "\n".join(
         [
-            SETUP_WIZARD,
             EMPLOYEE_SUMMARY,
             CODING_REFUSAL,
-            FIXED_WIZARD_COMMAND,
             *(provider_guidance(name).as_text() for name in PROVIDERS),
+            *(json.dumps(profile_config_mapping(name)) for name in CLIENT_PROFILES.values()),
         ]
     )
     for identifier in identifiers:
@@ -380,10 +488,12 @@ def check_secrecy(runtime_config: RuntimeConfig) -> None:
 
 def main() -> int:
     runtime_config = config()
+    check_native_configuration(runtime_config)
     check_routing(runtime_config)
     check_fixed_paths(runtime_config)
     check_employee_denial(runtime_config)
     check_provider_guidance()
+    check_codex_and_optional_providers(runtime_config)
     check_provisioning(runtime_config)
     check_secrecy(runtime_config)
     for label in CHECKS:

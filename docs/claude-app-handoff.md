@@ -162,112 +162,136 @@ Use this prompt after connecting Claude to the repository and selecting the feat
 
 ## Completion status
 
-Everything in "Remaining objective" above is implemented on this branch, with
-the two open items recorded at the end of this section.
+Everything in "Remaining objective" above is implemented on this branch. Two
+independent reviews of `8ef7442` found native-integration defects; this section
+records the corrected state.
 
 ### 1. Private Discord channel provisioning — done
 
 `assistant/scotty_business/provisioning.py`, wired into `setup.py`.
 
 - The bot token is read from hidden local input or an exported environment
-  variable; `setup.py` contains no `argv` or `argparse` use, and the token lives
-  only inside a mapping that refuses to render itself.
-- Bot identity, guild identity, guild membership, and `Manage Channels` are all
+  variable; `setup.py` contains no `argv` or `argparse` use.
+- Bot identity, guild identity, guild membership, and `Manage Channels` are
   verified before any mutation. `Administrator` is accepted but never required.
-- Creation happens only after an explicit local preview and confirmation.
-- `@everyone` is denied `View Channel`; the configured member and the bot each
-  receive only the permissions a chat needs, and never `Administrator` or
-  `Manage Channels` in-channel.
+- Creation happens only after an explicit local preview and confirmation, denies
+  `View Channel` to `@everyone`, and grants the configured member and the bot
+  only the permissions a chat needs.
 - Reuse requires an exact match on guild, intended user, and permission
   overwrites. A name collision, permission drift, or wrong-user channel stops the
   run instead of hijacking it.
-- Every created channel is read back; differing privacy or membership fails
-  rather than reporting success.
-- Channel IDs reach only owner-only private runtime configuration.
-- Reruns are idempotent and create nothing.
-- Synthetic REST fixtures live in `fixtures/discord.provisioning.json`, with
-  negative tests for wrong guild, wrong bot, missing `Manage Channels`, name
-  collision, partial creation, permission drift, forbidden, timeout, ambiguous
-  response, and unavailable readback.
-- An unconfirmable create is recorded as unknown; a later run refuses to create
-  another and asks for reconciliation first.
+- Every created channel is read back; differing privacy or membership fails.
+- An unconfirmable create is recorded as unknown and never resolved by creating a
+  second channel, on that run or a later one.
 
-### 2. Full route profile, bounded client profiles — done, with one open item
+### 2. Native multiplexed profile routing — corrected
 
-`assistant/scotty_business/routing.py`, enforced from
-`ingress.py` (`pre_gateway_dispatch`) and `runtime.py`
-(`resolve_enabled_toolsets_for_source`).
+The previous top-level `profiles:`/`routing:` overlay was not a native contract
+and created zero routes. It is gone. Setup now renders the runtime's own keys:
 
-- Client guild/channel sources resolve to per-role bounded profiles carrying
+```yaml
+gateway:
+  multiplex_profiles: true
+  multiplex_profile_allowlist: [...]
+  profile_routes:
+    - name: ...
+      platform: discord
+      guild_id: ...
+      chat_id: ...
+      profile: ...
+```
+
+- Exactly three routes are rendered, using only `name`, `platform`, `guild_id`,
+  `chat_id`, and `profile`. `channel_id` never appears in a route.
+- `routing.parse_profile_routes` and `routing.match_profile_route` model that
+  contract and validate the generated configuration before a host loads it.
+  `render_hermes_config` parses its own output and refuses to emit a
+  configuration that does not satisfy it.
+- `make smoke` loads the generated configuration inside the pinned image with the
+  runtime's own YAML loader and asserts three routes, the native key set, the
+  served allowlist, and each profile's toolset.
+
+### 3. Three real, separately served profiles — corrected
+
+- `scotty-maintainer` is a normal full profile: no bounded plugin, the normal
+  tool inventory, and no Scotty client identity section.
+- `scotty-main-operator` and `scotty-employee` load `scotty-business` and expose
   only the `scotty` toolset.
-- The exact route guild, private channel, and user resolve to a separate full
-  profile. The exact user ID is checked here because native profile routing
-  matches guild and channel but not the acting user.
-- A wrong user in the route channel is rejected before session or model
-  activity, silently, with no reply at all.
-- Toolset resolution fails closed. An unresolved source, or unavailable private
-  configuration, yields no model toolset — never a wider one.
-- Configuration rejects a route that shares a client guild, channel, or
-  principal tuple, so the route can never collapse into a client surface.
-- Client-visible Discord destinations are built from the client principals and
-  announcement channels only, so no client-visible tool can reach the route
-  channel and no fixed or proactive delivery path points at it.
-- Client profile state stays profile-local: each role has its own profile name,
-  and shared business data is reached only through bounded provider records.
-- `tests/test_maintainer_secrecy.py` proves no fixed client-facing string, tool
-  schema, prompt section, or profile name carries a route identifier or
-  discloses that a hidden route exists.
+- The installer creates one home per served profile under
+  `/srv/Scotty/data/profiles/` and stages the bounded plugin into the two client
+  homes only. It verifies the full profile home carries no plugin.
+- `ensure_profile_homes` creates or idempotently verifies each home and its
+  configuration, and fails closed when a routed profile has no home, a client
+  home lacks its staged plugin, or the full profile home carries one. There is no
+  silent fall back to the default profile.
+- The base configuration is bounded, so a profile whose override fails to apply
+  is bounded rather than unbounded.
 
-**Open item.** The pinned runtime's own contracts
-(`gateway/profile_routing.py`, `gateway/run.py::_resolve_enabled_toolsets_for_source`,
-`gateway/platforms/base.py::toolsets_for_source`) could not be inspected while
-preparing this change, because the pinned image is not available in the
-environment used. Rather than assume a YAML schema, the generated `config.yaml`
-uses only keys already proven at `cbc8c83`, and the native profile-routing block
-is written beside it as `scotty/profile-routing.overlay.yaml`, owner-only and
-explicitly not merged. Verify those three contracts against the pinned image,
-then merge the overlay and confirm the hook name
-`resolve_enabled_toolsets_for_source` matches the runtime's own hook. That hook
-is registered defensively and is not declared in `plugin.yaml`, so a runtime
-that does not offer it still loads the plugin unchanged. Until the name is
-confirmed, the failure direction is safe: the route degrades to the bounded
-client toolset rather than widening any client surface, and authorization still
-runs in `pre_gateway_dispatch`.
+### 4. The inert plugin toolset hook — removed
 
-### 3. Provider setup guidance — done
+`resolve_enabled_toolsets_for_source` is not a plugin lifecycle hook and was
+never invoked. Its registration, its `Controller.toolsets_for_source`
+implementation, and its manifest entry are all removed. `pre_gateway_dispatch`
+is the only hook registered, and a regression test asserts exactly that. Tool
+boundaries now come from native profile isolation alone.
 
-`assistant/scotty_business/guidance.py`, surfaced through
-`scotty_read` with `operation: provider_setup`. No new tool is registered and the
-model inventory is unchanged at five tools.
+### 5. Codex OAuth-only initial setup — done
 
-- Discord, Trello, GoHighLevel, RentCast, and a guidance-only Google Workspace
-  entry each state `not connected` when unconfigured, name the identifiers and
-  scopes to gather, list the provider-side steps, and direct the operator to the
-  local setup command.
-- No guidance string asks for a credential in Discord or accepts one from chat.
-- Discord guidance asks for `Manage Channels`, never `Administrator`.
-- Google Workspace is documented only. It is not installed, holds no add-on
-  slot, and adds no adapter.
-- A missing Trello, GoHighLevel, or RentCast credential no longer prevents the
-  runtime from loading. That provider degrades to a stand-in that refuses every
-  call before any network request.
+- Provider `openai-codex` is supported and collects no model API key.
+- Setup prints the native command `hermes auth add openai-codex` and instructs
+  the maintainer to complete the flow locally.
+- No OAuth token is collected, stored, printed, logged, or written to `.env`,
+  argv, tests, fixtures, or this repository. `make oauth-probe` only confirms the
+  subcommand exists in the pinned image.
 
-### 4. Final setup and acceptance handoff — done, with one open item
+### 6. Deferred optional provider credentials — done
 
-See `docs/scotty-basic-release-commands.md` for the final install/configure
-command, the Codex OAuth step, `make acceptance`, the route, main-operator, and
-employee acceptance prompts, the exact wizard command, and the `not connected`
-behaviour.
+- Initial setup requires only the Discord bot token, the Discord identifiers, and
+  the local Codex OAuth step.
+- Trello, GoHighLevel, RentCast, and Google Workspace are optional. Their
+  configuration sections are omitted entirely when unconfigured; no placeholder
+  is ever recorded as a connection.
+- A provider counts as connected only when both its credential and its configured
+  resource scope are present. Otherwise Scotty starts normally and reports
+  `not connected` with fixed setup guidance.
+- `fixtures/scotty.private.discord-only.example.json` is the synthetic
+  Discord-only starting state.
 
-**Open item.** The exact Codex OAuth subcommand for pinned Hermes `0.20.6` is
-not recorded here. `make oauth-probe` reads it from the image itself in a
-disposable, network-disabled container; run it on the deployment host and record
-the printed command. Guessing a command name would have been a runtime
-assumption, which this handoff forbids.
+### 7. Private route validation — done
 
-### Preserved
+`setup.validate_maintainer_route` reads the route back from Discord before any
+configuration is written, and rejects a route that does not exist, is public, is
+in the client guild, is in a different guild than configured, is not a text
+channel, cannot be viewed by the configured user, cannot be viewed, posted to and
+read by the assistant, or that either client principal can view or whose guild
+either client principal belongs to. Every failure message is generic and names no
+private identifier.
 
-The six-add-on cap and its fixed response, the approval state machine and its
-bound approver, tuple-scoped reminders, adapter isolation, the fixed coding
-refusal, credential redaction, and the `cbc8c83` behaviour are unchanged. The
-model inventory is still exactly the five bounded Scotty tools.
+### 8. Client authorization and channel privacy — preserved
+
+The exact Discord tuple is still enforced before model dispatch by the plugin's
+`pre_gateway_dispatch` gate inside the client profiles, binding the acting user
+that native routing does not match. Wrong guild, channel, user, thread parent,
+bot author, and every mixed cross-product receive no model run and no reply.
+Private-channel provisioning remains idempotent with permission readback, and
+`Administrator` is never required.
+
+### Retired capability
+
+The fixed command `Scotty, send Trent the setup wizard.` and its onboarding text
+are removed. Exactly three routes are served, the maintainer works from a full
+profile that deliberately does not load the bounded plugin, and no deterministic
+pre-model path can run there. The trigger was retired rather than handed to the
+model. The fixed employee summary is unchanged.
+
+### Remaining pinned-runtime uncertainty
+
+`make smoke` proves the generated configuration against the pinned image's own
+loader and asserts the routing shape and per-profile toolsets. It cannot prove
+that the runtime *reads* `profiles/<profile>/config.yaml` from each profile home,
+because that path convention was not verifiable here. The staging is hedged
+against both readings: the bounded plugin is present in each client profile home
+and absent from the full profile home, and the full profile's own configuration
+disables the plugin explicitly. Under either reading the failure direction is
+bounded clients, never an unbounded one. Confirm the profile-home path on the
+host before activation.

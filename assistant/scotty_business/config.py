@@ -8,6 +8,9 @@ from .policy import Principal, Role
 
 _PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}[a-z0-9]")
 
+#: The roles that hold a bounded Discord channel in the client guild.
+CLIENT_ROLES: tuple[Role, ...] = (Role.MAIN_OPERATOR, Role.EMPLOYEE)
+
 
 class ConfigError(ValueError):
     """Private runtime configuration is absent or unsafe."""
@@ -60,10 +63,10 @@ class RuntimeConfig:
     addons: tuple[str, ...]
     principals: tuple[Principal, ...]
     announcement_channel_ids: tuple[str, ...]
-    trello: TrelloScope
-    ghl_location_id: str
-    rentcast_endpoints: tuple[str, ...]
-    maintainer_route: MaintainerRoute | None = None
+    maintainer_route: MaintainerRoute
+    trello: TrelloScope | None = None
+    ghl_location_id: str | None = None
+    rentcast_endpoints: tuple[str, ...] = ()
 
     def client_discord_destinations(self) -> tuple[str, ...]:
         """Every Discord destination a client-visible tool may ever reach."""
@@ -77,6 +80,12 @@ class RuntimeConfig:
             )
         )
 
+    def principal_for(self, role: Role) -> Principal:
+        for principal in self.principals:
+            if principal.role == role:
+                return principal
+        raise ConfigError(f"{role.value} is not a configured client principal")
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> RuntimeConfig:
         if type(raw.get("version")) is not int or raw["version"] != 1:
@@ -86,8 +95,13 @@ class RuntimeConfig:
             raise ConfigError("addons exceeds the six-add-on deployment cap")
 
         principal_raw = _mapping(raw.get("principals"), "principals")
+        expected = {role.value for role in CLIENT_ROLES}
+        if set(principal_raw) != expected:
+            raise ConfigError(
+                "principals must contain exactly the main_operator and employee tuples"
+            )
         principals: list[Principal] = []
-        for role in Role:
+        for role in CLIENT_ROLES:
             values = _mapping(principal_raw.get(role.value), f"principals.{role.value}")
             principals.append(
                 Principal(
@@ -99,47 +113,63 @@ class RuntimeConfig:
                     role=role,
                 )
             )
-        identity_tuples = {(p.guild_id, p.channel_id, p.user_id) for p in principals}
-        if len(identity_tuples) != 3:
+        identities = {(p.guild_id, p.channel_id, p.user_id) for p in principals}
+        if len(identities) != len(principals):
             raise ConfigError("principal tuples must be unique")
+        if len({p.guild_id for p in principals}) != 1:
+            raise ConfigError("client principals must share one configured guild")
 
         discord = _mapping(raw.get("discord"), "discord")
-        trello_raw = _mapping(raw.get("trello"), "trello")
-        ghl = _mapping(raw.get("ghl"), "ghl")
-        rentcast = _mapping(raw.get("rentcast"), "rentcast")
-        endpoints = _texts(rentcast.get("endpoints"), "rentcast.endpoints")
-        if any(not endpoint.startswith("/v1/") or ".." in endpoint for endpoint in endpoints):
-            raise ConfigError("RentCast endpoints must be fixed /v1 paths")
-
         return cls(
-            maintainer_route=_maintainer_route(raw.get("maintainer_route"), principals),
             version=1,
             addons=addons,
             principals=tuple(principals),
             announcement_channel_ids=_texts(
                 discord.get("announcement_channel_ids"),
                 "discord.announcement_channel_ids",
+                allow_empty=True,
             ),
-            trello=TrelloScope(
-                board_id=_text(trello_raw.get("board_id"), "trello.board_id"),
-                list_ids=_texts(trello_raw.get("list_ids"), "trello.list_ids"),
-                label_ids=_texts(trello_raw.get("label_ids"), "trello.label_ids", allow_empty=True),
-                custom_field_ids=_texts(
-                    trello_raw.get("custom_field_ids"),
-                    "trello.custom_field_ids",
-                    allow_empty=True,
-                ),
-            ),
-            ghl_location_id=_text(ghl.get("location_id"), "ghl.location_id"),
-            rentcast_endpoints=endpoints,
+            maintainer_route=_maintainer_route(raw.get("maintainer_route"), principals),
+            trello=_trello(raw.get("trello")),
+            ghl_location_id=_ghl(raw.get("ghl")),
+            rentcast_endpoints=_rentcast(raw.get("rentcast")),
         )
 
 
-def _maintainer_route(value: object, principals: Sequence[Principal]) -> MaintainerRoute | None:
-    """Parse the optional private full-profile route and fail closed on overlap."""
+def _trello(value: object) -> TrelloScope | None:
+    """Trello is optional; an absent section means the provider is not connected."""
 
     if value is None:
         return None
+    raw = _mapping(value, "trello")
+    return TrelloScope(
+        board_id=_text(raw.get("board_id"), "trello.board_id"),
+        list_ids=_texts(raw.get("list_ids"), "trello.list_ids"),
+        label_ids=_texts(raw.get("label_ids"), "trello.label_ids", allow_empty=True),
+        custom_field_ids=_texts(
+            raw.get("custom_field_ids"), "trello.custom_field_ids", allow_empty=True
+        ),
+    )
+
+
+def _ghl(value: object) -> str | None:
+    if value is None:
+        return None
+    return _text(_mapping(value, "ghl").get("location_id"), "ghl.location_id")
+
+
+def _rentcast(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    endpoints = _texts(_mapping(value, "rentcast").get("endpoints"), "rentcast.endpoints")
+    if any(not endpoint.startswith("/v1/") or ".." in endpoint for endpoint in endpoints):
+        raise ConfigError("RentCast endpoints must be fixed /v1 paths")
+    return endpoints
+
+
+def _maintainer_route(value: object, principals: Sequence[Principal]) -> MaintainerRoute:
+    """Parse the required private full-profile route and fail closed on overlap."""
+
     raw = _mapping(value, "maintainer_route")
     route = MaintainerRoute(
         guild_id=_text(raw.get("guild_id"), "maintainer_route.guild_id"),
@@ -153,8 +183,6 @@ def _maintainer_route(value: object, principals: Sequence[Principal]) -> Maintai
         raise ConfigError("maintainer_route must not share a client guild")
     if any(principal.channel_id == route.channel_id for principal in principals):
         raise ConfigError("maintainer_route must not reuse a client channel")
-    if (route.guild_id, route.channel_id, route.user_id) in {
-        (principal.guild_id, principal.channel_id, principal.user_id) for principal in principals
-    }:
-        raise ConfigError("maintainer_route must not reuse a client principal tuple")
+    if any(principal.user_id == route.user_id for principal in principals):
+        raise ConfigError("maintainer_route must not reuse a client user")
     return route

@@ -35,6 +35,30 @@ class InstallerPackageTests(unittest.TestCase):
         self.assertIn("/srv/Scotty/operator/setup-scotty", installer)
         self.assertNotRegex(installer, r"docker compose .*\b(?:up|start|run)\b")
 
+    def test_installer_creates_one_home_per_served_profile(self) -> None:
+        installer = Path("install.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            "readonly -a SERVED_PROFILES=(scotty-maintainer scotty-main-operator scotty-employee)",
+            installer,
+        )
+        self.assertIn(
+            "readonly -a CLIENT_PROFILES=(scotty-main-operator scotty-employee)", installer
+        )
+        self.assertIn('install_profile_dir "${PROFILES_DIR}/${served_profile}"', installer)
+
+    def test_installer_stages_the_bounded_plugin_only_in_client_profile_homes(self) -> None:
+        installer = Path("install.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'install_plugin_file "$plugin_file" '
+            '"${PROFILES_DIR}/${client_profile}/plugins/scotty_business"',
+            installer,
+        )
+        self.assertIn(
+            "[[ ! -e ${PROFILES_DIR}/scotty-maintainer/plugins ]]",
+            installer,
+        )
+        self.assertNotIn("${PROFILES_DIR}/scotty-maintainer/plugins/scotty_business", installer)
+
     def test_setup_wrapper_imports_only_the_installed_package(self) -> None:
         wrapper = Path("setup-scotty").read_text(encoding="utf-8")
         ast.parse(wrapper)

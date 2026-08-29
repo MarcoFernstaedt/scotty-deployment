@@ -7,7 +7,10 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 
-from test_routing import MAINT_CHANNEL, MAINT_GUILD, MAINT_USER, routed_config
+import synthetic
+from synthetic import ROUTE_CHANNEL as MAINT_CHANNEL
+from synthetic import ROUTE_GUILD as MAINT_GUILD
+from synthetic import ROUTE_USER as MAINT_USER
 from test_setup import maintainer_sample
 
 from assistant.scotty_business import guidance
@@ -16,13 +19,11 @@ from assistant.scotty_business.policy import (
     ADDON_CAP_RESPONSE,
     CODING_REFUSAL,
     EMPLOYEE_SUMMARY,
-    FIXED_WIZARD_COMMAND,
-    SETUP_WIZARD,
 )
-from assistant.scotty_business.routing import client_profile
-from assistant.scotty_business.setup import render_hermes_config
+from assistant.scotty_business.routing import CLIENT_PROFILES, MAINTAINER_PROFILE
+from assistant.scotty_business.setup import render_hermes_config, render_profile_config
 
-_ROUTE_IDENTIFIERS = (MAINT_GUILD, MAINT_CHANNEL, MAINT_USER, "operations-full")
+_ROUTE_IDENTIFIERS = (MAINT_GUILD, MAINT_CHANNEL, MAINT_USER)
 _DISCLOSURE_PATTERNS = (
     re.compile(r"maintainer (?:guild|server|channel|route|profile)", re.I),
     re.compile(r"hidden (?:route|admin|channel|profile|server)", re.I),
@@ -34,14 +35,14 @@ _DISCLOSURE_PATTERNS = (
 def client_facing_strings() -> dict[str, str]:
     plugin = importlib.import_module("assistant.scotty_business")
     strings = {
-        "setup_wizard": SETUP_WIZARD,
         "employee_summary": EMPLOYEE_SUMMARY,
         "coding_refusal": CODING_REFUSAL,
         "addon_cap": ADDON_CAP_RESPONSE,
         "credential_notice": CREDENTIAL_ROTATION_NOTICE,
-        "wizard_command": FIXED_WIZARD_COMMAND,
         "identity_prompt": plugin._IDENTITY_PROMPT,
     }
+    for profile_name in CLIENT_PROFILES.values():
+        strings[f"profile_config:{profile_name}"] = render_profile_config(profile_name)
     for name in guidance.PROVIDERS:
         strings[f"guidance:{name}"] = guidance.provider_guidance(name).as_text()
     strings["guidance:index"] = guidance.all_provider_guidance_text()
@@ -81,12 +82,11 @@ class ClientFacingSecrecyTests(unittest.TestCase):
                 with self.subTest(string=name, pattern=pattern.pattern):
                     self.assertIsNone(pattern.search(value))
 
-    def test_client_profile_names_carry_no_maintainer_identifier(self) -> None:
-        config = routed_config()
-        for principal in config.principals:
-            name = client_profile(principal.role)
+    def test_client_profile_names_carry_no_route_identifier(self) -> None:
+        for name in CLIENT_PROFILES.values():
             for identifier in _ROUTE_IDENTIFIERS:
                 self.assertNotIn(identifier, name)
+            self.assertNotEqual(name, MAINTAINER_PROFILE)
 
     def test_registered_tool_schemas_and_prompts_stay_free_of_route_identifiers(self) -> None:
         plugin = importlib.import_module("assistant.scotty_business")
@@ -131,7 +131,12 @@ class OwnerOnlyRuntimeConfigTests(unittest.TestCase):
     def test_gateway_config_admits_the_route_without_widening_client_toolsets(self) -> None:
         rendered = render_hermes_config(maintainer_sample())
         self.assertIn(MAINT_CHANNEL, rendered)
-        self.assertIn("discord: [scotty]", rendered)
+        self.assertIn('discord: ["scotty"]', rendered)
+
+    def test_the_full_profile_config_carries_no_bounded_client_identity(self) -> None:
+        rendered = render_profile_config(MAINTAINER_PROFILE)
+        self.assertNotIn("scotty-business", rendered)
+        self.assertNotIn("Scotty by The Closing Room", rendered)
 
     def test_the_gateway_config_is_never_a_tracked_repository_artifact(self) -> None:
         self.assertFalse(Path("config.yaml").exists())
@@ -139,13 +144,12 @@ class OwnerOnlyRuntimeConfigTests(unittest.TestCase):
 
 
 class ClientDestinationIsolationTests(unittest.TestCase):
-    def test_maintainer_channel_is_never_a_client_discord_destination(self) -> None:
-        config = routed_config()
+    def test_route_channel_is_never_a_client_discord_destination(self) -> None:
+        config = synthetic.config()
         self.assertNotIn(MAINT_CHANNEL, config.client_discord_destinations())
 
-    def test_client_announcement_scope_cannot_be_widened_to_the_maintainer_route(self) -> None:
-        config = routed_config()
-        assert config.maintainer_route is not None
+    def test_client_announcement_scope_cannot_be_widened_to_the_route(self) -> None:
+        config = synthetic.config()
         self.assertNotIn(config.maintainer_route.channel_id, config.announcement_channel_ids)
 
 

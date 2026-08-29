@@ -4,13 +4,7 @@ import re
 from collections.abc import Callable, Mapping
 
 from .config import RuntimeConfig
-from .policy import (
-    CODING_REFUSAL,
-    EMPLOYEE_SUMMARY,
-    FIXED_WIZARD_COMMAND,
-    SETUP_WIZARD,
-    Role,
-)
+from .policy import CODING_REFUSAL, EMPLOYEE_SUMMARY, Role
 from .routing import RouteKind, resolve_route
 
 EMPLOYEE_SUMMARY_COMMAND = "Scotty, send the employee summary."
@@ -71,15 +65,6 @@ class IngressGuard:
         if any(pattern.search(stripped) for pattern in _CODING_PATTERNS):
             self.enqueue(principal.channel_id, CODING_REFUSAL)
             return {"action": "skip", "reason": "coding-refusal"}
-        if stripped == FIXED_WIZARD_COMMAND:
-            if principal.role == Role.MAINTAINER:
-                destination = next(
-                    item.channel_id
-                    for item in self.config.principals
-                    if item.role == Role.MAIN_OPERATOR
-                )
-                self.enqueue(destination, SETUP_WIZARD)
-            return {"action": "skip", "reason": "fixed-wizard"}
         if stripped == EMPLOYEE_SUMMARY_COMMAND:
             destination = next(
                 item.channel_id for item in self.config.principals if item.role == Role.EMPLOYEE

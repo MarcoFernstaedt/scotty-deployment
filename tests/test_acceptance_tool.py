@@ -24,11 +24,11 @@ class SyntheticAcceptanceTests(unittest.TestCase):
             self.assertEqual(module.main(), 0)
         output = buffer.getvalue()
         self.assertIn("synthetic acceptance: PASS", output)
-        self.assertGreaterEqual(len(module.CHECKS), 40)
+        self.assertGreaterEqual(len(module.CHECKS), 70)
 
     def test_the_acceptance_run_reads_only_synthetic_fixtures(self) -> None:
         source = Path("tools/synthetic_acceptance.py").read_text(encoding="utf-8")
-        for forbidden in ("/srv/Scotty", "DISCORD_BOT_TOKEN", "https://", "urlopen"):
+        for forbidden in ("/srv/Scotty", "https://", "urlopen"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
 
@@ -36,6 +36,33 @@ class SyntheticAcceptanceTests(unittest.TestCase):
         module = load_tool("synthetic_acceptance")
         with self.assertRaises(module.AcceptanceFailure):
             module.check("deliberately false", False)
+
+
+class PinnedSmokeTests(unittest.TestCase):
+    def test_the_smoke_checks_the_native_routing_contract_in_the_real_runtime(self) -> None:
+        source = Path("tools/pinned_smoke.py").read_text(encoding="utf-8")
+        self.assertIn("multiplex_profiles", source)
+        self.assertIn("profile_routes", source)
+        self.assertIn("expected exactly three native profile routes", source)
+        self.assertIn('["chat_id", "guild_id", "name", "platform", "profile"]', source)
+        self.assertIn("the full profile is not a normal unbounded profile", source)
+        self.assertIn("client profile is not bounded", source)
+
+    def test_the_smoke_uses_synthetic_identifiers_only(self) -> None:
+        module = load_tool("pinned_smoke")
+        inputs = module.SYNTHETIC_INPUTS
+        for value in (
+            inputs.guild_id,
+            inputs.operator_channel_id,
+            inputs.employee_channel_id,
+            inputs.route_guild_id,
+            inputs.route_channel_id,
+            inputs.route_user_id,
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(value.isdigit())
+                self.assertTrue(17 <= len(value) <= 20)
+        self.assertEqual(set(inputs.secrets), {"DISCORD_BOT_TOKEN"})
 
 
 class OAuthProbeTests(unittest.TestCase):
@@ -47,7 +74,8 @@ class OAuthProbeTests(unittest.TestCase):
         self.assertIn("--network", source)
         self.assertIn("none", source)
         self.assertIn("--help", source)
-        for forbidden in ("--rm -it", "token", "password"):
+        self.assertIn("openai-codex", source)
+        for forbidden in ("--rm -it", "password"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
 

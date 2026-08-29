@@ -14,7 +14,9 @@ The assistant adds these enforced boundaries:
 
 - Exact pre-model authorization matches `(guild_id, channel_id, user_id, role)` as one tuple. Mixed allowlist cross-products fail closed.
 - A thread is accepted only under the configured principal channel.
-- Profile routing is resolved from immutable gateway provenance before any session or model activity. Client channels resolve to per-role bounded profiles; an optional separate route resolves one exact guild, private channel, and user to a full profile. Toolset resolution fails closed, so an unresolved source or unavailable private configuration receives no model toolset at all.
+- The gateway serves exactly three native profile routes: one full profile for the private route channel and one bounded profile per client channel. Each profile has its own home; the bounded plugin is staged only in the two client homes.
+- The plugin's own pre-dispatch gate additionally binds the acting user, which native routing does not match, and every unresolved source is rejected before any session or model activity.
+- The base configuration is bounded, so a profile widens its own surface only by overriding it. A profile whose override fails to apply is bounded, never unbounded.
 - Client-visible Discord destinations are limited to the configured principal and announcement channels by construction.
 - Native Discord slash commands and automatic threads are disabled.
 - Each Discord channel retains its own gateway session; provider resources are the only shared business truth.
@@ -23,7 +25,8 @@ The assistant adds these enforced boundaries:
 - Approval and reminder state use owner-only SQLite files below `/opt/data/scotty`.
 - Plugin-owned reminder polling does not register or expose native arbitrary cron.
 - Provider redirects and automatic mutation retries are disabled. Ambiguous outcomes require reconciliation.
-- Credentials are accepted only by the local hidden-input setup command or an exported environment variable, are stored in `/srv/Scotty/data/.env`, and never reach `argv`, stdout, logs, or public configuration.
+- Credentials are accepted only by the local hidden-input setup command or an exported environment variable, are stored in `/srv/Scotty/data/.env`, and never reach `argv`, stdout, logs, or public configuration. The model authenticates through the runtime's own `openai-codex` OAuth flow, which Scotty never sees, stores, or logs.
+- Only the Discord bot token is required on day one. Trello, GoHighLevel and RentCast connect later; no placeholder is ever recorded as a connection.
 - Private channels are created only after a local preview and confirmation, deny `View Channel` to `@everyone`, and are read back before they are recorded. An unconfirmable create is recorded as unknown and never resolved by creating a second channel.
 - An unconfigured provider reports `not connected` with fixed guidance instead of taking the assistant down, and never asks for a credential in Discord.
 
@@ -33,7 +36,7 @@ A prompt, folder name, model, or persona is not a security boundary. The code, e
 
 - `assistant/scotty_business/`: installable Hermes plugin and bounded business domain.
 - `assistant/scotty_business/ingress.py`: exact Discord tuple gate and fixed pre-model paths.
-- `assistant/scotty_business/routing.py`: profile and toolset resolution from immutable gateway provenance, fail-closed.
+- `assistant/scotty_business/routing.py`: the native profile-routing contract plus the plugin's own fail-closed pre-dispatch tuple gate.
 - `assistant/scotty_business/provisioning.py`: idempotent private-channel creation or reuse with preview, confirmation, and readback.
 - `assistant/scotty_business/guidance.py`: fixed, credential-free provider setup guidance.
 - `assistant/scotty_business/approvals.py`: SQLite proposal state machine with `BEGIN IMMEDIATE`, version compare-and-set, immutable fields, nonce claims, crash recovery, and reconciliation states.
@@ -78,7 +81,7 @@ fixtures. `make oauth-probe` reads the pinned image's own login subcommand from
 a disposable, network-disabled container; it is not part of `make verify`
 because it needs the pinned image present.
 
-`make smoke` uses a disposable, network-disabled container from the pinned image and proves Hermes 0.20.6 discovers exactly the five Scotty tools. It does not use credentials or providers. `make package` writes ignored deterministic artifacts below `dist/`.
+`make smoke` uses a disposable, network-disabled container from the pinned image and proves Hermes 0.20.6 discovers exactly the five Scotty tools, and that the generated configuration parses into three native profile routes with the served allowlist and per-profile toolsets it expects. It does not use credentials or providers. `make package` writes ignored deterministic artifacts below `dist/`.
 
 ## Install without activation
 
@@ -107,8 +110,10 @@ The command:
 3. verifies the Discord bot identity and guild membership;
 4. offers to create the main-operator and employee private channels, previewing each one and waiting for an explicit local confirmation, or accepts existing channel IDs;
 5. verifies every configured Discord channel belongs to the exact guild and denies `View Channel` to `@everyone`, directly or through its category;
-6. writes `config.yaml`, `.env`, `scotty/private.json`, and any profile-routing overlay atomically with mode `0600` and UID/GID 10000;
-7. leaves the container stopped.
+6. reads the private route back from Discord and rejects a nonexistent, public, cross-guild, inaccessible, or permission-drifted route;
+7. creates or idempotently verifies one home per served profile and fails closed rather than falling back to the default profile;
+8. writes `config.yaml`, `.env`, `scotty/private.json`, and one `profiles/<profile>/config.yaml` atomically with mode `0600` and UID/GID 10000;
+9. leaves the container stopped.
 
 The application needs `Manage Channels` plus normal messaging permissions.
 Discord `Administrator` is never required.

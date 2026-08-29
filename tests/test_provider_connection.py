@@ -8,40 +8,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import synthetic
+
 from assistant.scotty_business.guidance import NOT_CONNECTED, PROVIDERS
 from assistant.scotty_business.policy import Principal, Role
 from assistant.scotty_business.runtime import ProviderNotConnected, Runtime
-
-PRIVATE = {
-    "version": 1,
-    "addons": ["discord", "trello", "ghl", "rentcast"],
-    "principals": {
-        "maintainer": {
-            "guild_id": "100000000000000001",
-            "channel_id": "200000000000000001",
-            "user_id": "300000000000000001",
-        },
-        "main_operator": {
-            "guild_id": "100000000000000001",
-            "channel_id": "201000000000000001",
-            "user_id": "301000000000000001",
-        },
-        "employee": {
-            "guild_id": "100000000000000001",
-            "channel_id": "202000000000000001",
-            "user_id": "302000000000000001",
-        },
-    },
-    "discord": {"announcement_channel_ids": ["210000000000000001"]},
-    "trello": {
-        "board_id": "board-1",
-        "list_ids": ["list-1"],
-        "label_ids": [],
-        "custom_field_ids": [],
-    },
-    "ghl": {"location_id": "location-1"},
-    "rentcast": {"endpoints": ["/v1/properties"]},
-}
 
 _ALL_SECRETS = {
     "DISCORD_BOT_TOKEN": "synthetic-discord",
@@ -53,11 +24,14 @@ _ALL_SECRETS = {
 
 
 @contextmanager
-def runtime(**secrets: str) -> Iterator[Runtime]:
+def runtime(private: dict[str, object] | None = None, **secrets: str) -> Iterator[Runtime]:
+    private = private or {}
     with tempfile.TemporaryDirectory(prefix="scotty-connection-test-") as directory:
         home = Path(directory)
         (home / "scotty").mkdir()
-        (home / "scotty" / "private.json").write_text(json.dumps(PRIVATE), encoding="utf-8")
+        (home / "scotty" / "private.json").write_text(
+            json.dumps(synthetic.private_mapping(**private)), encoding="utf-8"
+        )
         saved = {name: os.environ.get(name) for name in _ALL_SECRETS}
         try:
             for name in _ALL_SECRETS:
@@ -75,9 +49,9 @@ def runtime(**secrets: str) -> Iterator[Runtime]:
 
 def operator() -> Principal:
     return Principal(
-        guild_id="100000000000000001",
-        channel_id="201000000000000001",
-        user_id="301000000000000001",
+        guild_id=synthetic.CLIENT_GUILD,
+        channel_id=synthetic.OPERATOR_CHANNEL,
+        user_id=synthetic.OPERATOR_USER,
         role=Role.MAIN_OPERATOR,
     )
 
@@ -127,6 +101,31 @@ class ProviderConnectionTests(unittest.TestCase):
             self.assertRaises(ProviderNotConnected),
         ):
             instance.handle_read(operator(), {"operation": "trello_cards"})
+
+    def test_a_provider_with_a_credential_but_no_scope_is_not_connected(self) -> None:
+        """A credential without its configured resource scope is not a connection."""
+
+        with runtime({"trello": None, "ghl": None, "rentcast": None}, **_ALL_SECRETS) as instance:
+            status = instance.provider_connection_status()
+            for name in ("trello", "ghl", "rentcast"):
+                with self.subTest(provider=name):
+                    self.assertFalse(status[name])
+
+    def test_a_discord_only_deployment_starts_and_reports_every_provider(self) -> None:
+        with runtime(
+            {"trello": None, "ghl": None, "rentcast": None},
+            DISCORD_BOT_TOKEN="synthetic-discord",
+        ) as instance:
+            result = instance.handle_read(operator(), {"operation": "provider_setup"})
+            assert isinstance(result, dict)
+            providers = result["providers"]
+            assert isinstance(providers, dict)
+            self.assertEqual(set(providers), set(PROVIDERS))
+            for name in ("trello", "ghl", "rentcast", "google_workspace"):
+                with self.subTest(provider=name):
+                    entry = providers[name]
+                    assert isinstance(entry, dict)
+                    self.assertEqual(entry["status"], NOT_CONNECTED)
 
     def test_a_configured_provider_reports_connected(self) -> None:
         with runtime(**_ALL_SECRETS) as instance:

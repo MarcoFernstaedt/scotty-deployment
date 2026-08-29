@@ -7,70 +7,28 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 
-from assistant.scotty_business.config import RuntimeConfig
+import synthetic
+from synthetic import (
+    ANNOUNCEMENT_CHANNEL,
+    CLIENT_GUILD,
+    EMPLOYEE_CHANNEL,
+    EMPLOYEE_USER,
+    OPERATOR_CHANNEL,
+    OPERATOR_USER,
+    ROUTE_CHANNEL,
+)
+
 from assistant.scotty_business.identity import AuthorizedPrincipalResolver, IdentityError
 from assistant.scotty_business.ingress import (
     CREDENTIAL_ROTATION_NOTICE,
     EMPLOYEE_SUMMARY_COMMAND,
     IngressGuard,
 )
-from assistant.scotty_business.policy import (
-    CODING_REFUSAL,
-    EMPLOYEE_SUMMARY,
-    FIXED_WIZARD_COMMAND,
-    SETUP_WIZARD,
-    Role,
-)
+from assistant.scotty_business.policy import CODING_REFUSAL, EMPLOYEE_SUMMARY, Role
 
-
-def config() -> RuntimeConfig:
-    return RuntimeConfig.from_mapping(
-        {
-            "version": 1,
-            "addons": ["discord", "trello", "ghl", "rentcast"],
-            "principals": {
-                "maintainer": {"guild_id": "100", "channel_id": "200", "user_id": "300"},
-                "main_operator": {"guild_id": "100", "channel_id": "201", "user_id": "301"},
-                "employee": {"guild_id": "100", "channel_id": "202", "user_id": "302"},
-            },
-            "discord": {"announcement_channel_ids": ["210"]},
-            "trello": {
-                "board_id": "board-1",
-                "list_ids": ["list-1", "list-2"],
-                "label_ids": ["label-1"],
-                "custom_field_ids": ["field-1"],
-            },
-            "ghl": {"location_id": "location-1"},
-            "rentcast": {
-                "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
-            },
-        }
-    )
-
-
-def event(
-    guild: str = "100",
-    channel: str = "201",
-    user: str = "301",
-    text: str = "Show configured leads",
-    *,
-    parent: str | None = None,
-    is_bot: bool = False,
-):
-    return SimpleNamespace(
-        text=text,
-        source=SimpleNamespace(
-            platform=SimpleNamespace(value="discord"),
-            guild_id=guild,
-            scope_id=guild,
-            chat_id=channel,
-            user_id=user,
-            parent_chat_id=parent,
-            is_bot=is_bot,
-        ),
-    )
+config = synthetic.config
+event = synthetic.event
 
 
 class IngressTests(unittest.TestCase):
@@ -82,11 +40,11 @@ class IngressTests(unittest.TestCase):
 
     def test_all_wrong_and_mixed_tuples_are_silently_skipped_pre_model(self) -> None:
         cases = [
-            event(guild="999"),
-            event(channel="202"),
-            event(user="302"),
-            event(channel="900", parent="202"),
-            event(channel="900", parent="201", user="302"),
+            event(guild="999000000000000001"),
+            event(channel=EMPLOYEE_CHANNEL),
+            event(user=EMPLOYEE_USER),
+            event(channel="900", parent=EMPLOYEE_CHANNEL),
+            event(channel="900", parent=OPERATOR_CHANNEL, user=EMPLOYEE_USER),
             event(is_bot=True),
         ]
         for candidate in cases:
@@ -100,26 +58,27 @@ class IngressTests(unittest.TestCase):
         self.assertEqual(self.guard(event()), {"action": "allow"})
         self.assertEqual(self.outbound, [])
 
-    def test_fixed_wizard_is_maintainer_only_and_destination_is_not_model_selected(self) -> None:
-        result = self.guard(event(channel="200", user="300", text=FIXED_WIZARD_COMMAND))
-        self.assertEqual(result["action"], "skip")
-        self.assertEqual(self.outbound, [("201", SETUP_WIZARD)])
-        self.outbound.clear()
-        self.assertEqual(self.guard(event(text=FIXED_WIZARD_COMMAND))["action"], "skip")
-        self.assertEqual(self.outbound, [])
-
     def test_employee_summary_has_separate_fixed_request_and_destination(self) -> None:
         result = self.guard(event(text=EMPLOYEE_SUMMARY_COMMAND))
         self.assertEqual(result["action"], "skip")
-        self.assertEqual(self.outbound, [("202", EMPLOYEE_SUMMARY)])
+        self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, EMPLOYEE_SUMMARY)])
+
+    def test_fixed_paths_only_ever_reach_configured_client_destinations(self) -> None:
+        allowed = set(synthetic.config().client_discord_destinations())
+        self.assertEqual(allowed, {OPERATOR_CHANNEL, EMPLOYEE_CHANNEL, ANNOUNCEMENT_CHANNEL})
+        self.guard(event(text=EMPLOYEE_SUMMARY_COMMAND))
+        self.guard(event(text="Please write code for an integration"))
+        for channel, _ in self.outbound:
+            self.assertIn(channel, allowed)
+            self.assertNotEqual(channel, ROUTE_CHANNEL)
 
     def test_credentials_and_coding_requests_never_reach_model(self) -> None:
         credential = self.guard(event(text="My token is " + "ghp_" + ("a" * 28)))
         self.assertEqual(credential["action"], "skip")
-        self.assertEqual(self.outbound[-1], ("201", CREDENTIAL_ROTATION_NOTICE))
+        self.assertEqual(self.outbound[-1], (OPERATOR_CHANNEL, CREDENTIAL_ROTATION_NOTICE))
         coding = self.guard(event(text="Please write code for an integration"))
         self.assertEqual(coding["action"], "skip")
-        self.assertEqual(self.outbound[-1], ("201", CODING_REFUSAL))
+        self.assertEqual(self.outbound[-1], (OPERATOR_CHANNEL, CODING_REFUSAL))
 
     def test_text_slash_commands_are_not_available(self) -> None:
         self.assertEqual(
@@ -141,10 +100,10 @@ class PrincipalResolverTests(unittest.TestCase):
                 json.dumps(
                     {
                         "platform": "discord",
-                        "guild_id": "100",
-                        "scope_id": "100",
-                        "chat_id": "201",
-                        "user_id": "301",
+                        "guild_id": CLIENT_GUILD,
+                        "scope_id": CLIENT_GUILD,
+                        "chat_id": OPERATOR_CHANNEL,
+                        "user_id": OPERATOR_USER,
                     }
                 ),
             ),
@@ -168,7 +127,12 @@ class PrincipalResolverTests(unittest.TestCase):
             (
                 "wrong",
                 json.dumps(
-                    {"platform": "discord", "guild_id": "999", "chat_id": "201", "user_id": "301"}
+                    {
+                        "platform": "discord",
+                        "guild_id": "999000000000000001",
+                        "chat_id": OPERATOR_CHANNEL,
+                        "user_id": OPERATOR_USER,
+                    }
                 ),
             ),
         )
@@ -217,10 +181,7 @@ class PluginRegistrationTests(unittest.TestCase):
             self.assertEqual(registration["toolset"], "scotty")
             schema = registration["schema"]
             self.assertNotIn("principal", json.dumps(schema))
-        self.assertEqual(
-            set(context.hooks),
-            {"pre_gateway_dispatch", "resolve_enabled_toolsets_for_source"},
-        )
+        self.assertEqual(set(context.hooks), {"pre_gateway_dispatch"})
         self.assertIn("Scotty by The Closing Room", context.sections["scotty.identity"])
         self.assertNotIn("Hermes", context.sections["scotty.identity"])
         for unload in context.unloads:
@@ -234,31 +195,24 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertIn("version: 1.0.0", manifest)
         self.assertIn("pre_gateway_dispatch", manifest)
 
-    def test_registration_survives_a_runtime_without_the_optional_hook(self) -> None:
-        plugin = importlib.import_module("assistant.scotty_business")
+    def test_no_unknown_plugin_hook_is_ever_registered(self) -> None:
+        """Only hooks the pinned runtime actually invokes may be registered."""
 
-        class NarrowContext(FakeContext):
-            def register_hook(self, name: str, callback: object) -> None:
-                if name != "pre_gateway_dispatch":
-                    raise ValueError("unknown hook")
-                super().register_hook(name, callback)
-
-        context = NarrowContext()
-        plugin.register(context)
-        try:
-            self.assertEqual(set(context.hooks), {"pre_gateway_dispatch"})
-            self.assertEqual(len(context.tools), 5)
-        finally:
-            for unload in context.unloads:
-                unload()
-
-    def test_toolset_resolution_hook_fails_closed_without_private_state(self) -> None:
         plugin = importlib.import_module("assistant.scotty_business")
         context = FakeContext()
         plugin.register(context)
         try:
-            resolve = context.hooks["resolve_enabled_toolsets_for_source"]
-            self.assertEqual(resolve(source=SimpleNamespace()), [])
+            self.assertEqual(set(context.hooks), {"pre_gateway_dispatch"})
+            manifest = Path("assistant/scotty_business/plugin.yaml").read_text(encoding="utf-8")
+            declared = [
+                line.strip().removeprefix("- ")
+                for line in manifest.splitlines()
+                if line.startswith("  - ")
+            ]
+            self.assertIn("pre_gateway_dispatch", declared)
+            self.assertNotIn("resolve_enabled_toolsets_for_source", manifest)
+            source = Path("assistant/scotty_business/__init__.py").read_text(encoding="utf-8")
+            self.assertEqual(source.count("ctx.register_hook("), 1)
         finally:
             for unload in context.unloads:
                 unload()

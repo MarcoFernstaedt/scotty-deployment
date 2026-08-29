@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from typing import Protocol
 
@@ -10,8 +9,6 @@ from .runtime import Controller
 
 __all__ = ["__version__", "register"]
 __version__ = "1.0.0"
-
-logger = logging.getLogger(__name__)
 
 
 class PluginContext(Protocol):
@@ -179,13 +176,6 @@ def register(ctx: PluginContext) -> None:
             description=schema["description"],
         )
     ctx.register_hook("pre_gateway_dispatch", controller.ingress)
-    # Toolset resolution is an optional refinement. Authorization is already
-    # enforced in pre_gateway_dispatch, so an unknown hook name must never
-    # break registration, and its absence only keeps every source bounded.
-    try:
-        ctx.register_hook("resolve_enabled_toolsets_for_source", controller.toolsets_for_source)
-    except Exception:  # noqa: BLE001 - the pinned runtime may not offer this hook
-        logger.info("Toolset resolution hook is unavailable; sources stay bounded.")
     ctx.register_system_prompt_section(
         id="scotty.identity",
         content=_IDENTITY_PROMPT,

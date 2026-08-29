@@ -26,7 +26,6 @@ from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
 from .policy import Principal
 from .reminders import Reminder, ReminderStore, ReminderWorker
-from .routing import resolve_route, toolsets_for_route
 from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
 
 logger = logging.getLogger(__name__)
@@ -235,25 +234,30 @@ class Runtime:
         trello_token = os.environ.get("SCOTTY_TRELLO_TOKEN")
         ghl_token = os.environ.get("SCOTTY_GHL_PRIVATE_TOKEN")
         rentcast_key = os.environ.get("SCOTTY_RENTCAST_API_KEY")
+        # A provider is connected only when both its credential and its
+        # configured resource scope are present. No placeholder ever counts.
         self.connected = {
             "discord": True,
-            "trello": bool(trello_key and trello_token),
-            "ghl": bool(ghl_token),
-            "rentcast": bool(rentcast_key),
+            "trello": bool(trello_key and trello_token and self.config.trello is not None),
+            "ghl": bool(ghl_token and self.config.ghl_location_id is not None),
+            "rentcast": bool(rentcast_key and self.config.rentcast_endpoints),
         }
+        trello_scope = self.config.trello
+        location_id = self.config.ghl_location_id
+        endpoints = self.config.rentcast_endpoints
         self.trello: TrelloReadPort = (
-            TrelloAdapter(transport, trello_key or "", trello_token or "", self.config.trello)
-            if self.connected["trello"]
+            TrelloAdapter(transport, trello_key or "", trello_token or "", trello_scope)
+            if self.connected["trello"] and trello_scope is not None
             else UnconnectedProvider("Trello")
         )
         self.ghl: GHLReadPort = (
-            GHLAdapter(transport, ghl_token or "", self.config.ghl_location_id)
-            if self.connected["ghl"]
+            GHLAdapter(transport, ghl_token or "", location_id)
+            if self.connected["ghl"] and location_id is not None
             else UnconnectedProvider("GoHighLevel")
         )
         self.rentcast: RentCastPort = (
-            RentCastAdapter(transport, rentcast_key or "", self.config.rentcast_endpoints)
-            if self.connected["rentcast"]
+            RentCastAdapter(transport, rentcast_key or "", endpoints)
+            if self.connected["rentcast"] and endpoints
             else UnconnectedProvider("RentCast")
         )
         state_dir = home / "scotty"
@@ -449,21 +453,6 @@ class Controller:
         except Exception:
             return {"action": "skip", "reason": "unavailable"}
         return IngressGuard(runtime.config, self.enqueue)(event)
-
-    def toolsets_for_source(self, source: object = None, **kwargs: object) -> list[str]:
-        """Resolve the model toolset for one gateway source before dispatch.
-
-        The resolution fails closed: an unresolved source, or an unavailable
-        private configuration, yields no model toolset at all.
-        """
-
-        if source is None:
-            source = kwargs.get("session_source")
-        try:
-            runtime = self.runtime()
-        except Exception:
-            return []
-        return list(toolsets_for_route(resolve_route(runtime.config, source)))
 
     def tool(self, kind: str, args: object, **kwargs: object) -> str:
         try:

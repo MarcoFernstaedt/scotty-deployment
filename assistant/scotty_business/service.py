@@ -10,7 +10,7 @@ from typing import Protocol
 from .adapters import AmbiguousEffectError, ProviderError, ProviderRecord
 from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
 from .calculations import preliminary_analysis
-from .config import RuntimeConfig
+from .config import RuntimeConfig, TrelloScope
 from .policy import Principal, Role
 
 
@@ -104,6 +104,18 @@ class ScottyService:
                 return principal
         raise ApprovalError("main-operator approver is not configured")
 
+    def _trello_scope(self) -> TrelloScope:
+        scope = self.config.trello
+        if scope is None:
+            raise ProviderError("Trello is not connected")
+        return scope
+
+    def _ghl_location(self) -> str:
+        location = self.config.ghl_location_id
+        if location is None:
+            raise ProviderError("GoHighLevel is not connected")
+        return location
+
     def approve(self, principal: Principal, proposal_id: str, expected_version: int) -> Proposal:
         return self.approvals.approve(proposal_id, principal, expected_version)
 
@@ -173,7 +185,7 @@ class ScottyService:
             approver=self._approver_for(requester),
             action_class="trello_write",
             target_ids=(
-                self.config.trello.board_id,
+                self._trello_scope().board_id,
                 source.source_id,
                 destination.source_id,
             ),
@@ -201,7 +213,7 @@ class ScottyService:
             "fields": dict(fields or {}),
             "destination_list_id": destination_list_id,
         }
-        targets = [self.config.trello.board_id, current.source_id]
+        targets = [self._trello_scope().board_id, current.source_id]
         if destination_list_id:
             targets.append(destination_list_id)
         return self.approvals.propose(
@@ -224,7 +236,7 @@ class ScottyService:
             requester=requester,
             approver=self._approver_for(requester),
             action_class="trello_write",
-            target_ids=(self.config.trello.board_id, list_id),
+            target_ids=(self._trello_scope().board_id, list_id),
             payload={"operation": "create", "list_id": list_id, "fields": dict(fields)},
             source_revision="configured-board-v1",
             expires_at=self._now() + timedelta(minutes=10),
@@ -254,7 +266,7 @@ class ScottyService:
             approver=self._approver_for(requester),
             action_class="ghl_sms",
             target_ids=(
-                self.config.ghl_location_id,
+                self._ghl_location(),
                 contact.source_id,
                 normalized_destination,
             ),

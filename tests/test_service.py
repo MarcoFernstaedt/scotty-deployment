@@ -5,9 +5,10 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 
+import synthetic
+
 from assistant.scotty_business.adapters import AmbiguousEffectError, ProviderError, ProviderRecord
 from assistant.scotty_business.approvals import ApprovalError, ApprovalStore, ProposalStatus
-from assistant.scotty_business.config import RuntimeConfig
 from assistant.scotty_business.policy import Role
 from assistant.scotty_business.service import ScottyService, normalize_address
 
@@ -122,28 +123,7 @@ class ServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="scotty-service-test-")
         self.now = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
-        self.config = RuntimeConfig.from_mapping(
-            {
-                "version": 1,
-                "addons": ["discord", "trello", "ghl", "rentcast"],
-                "principals": {
-                    "maintainer": {"guild_id": "100", "channel_id": "200", "user_id": "300"},
-                    "main_operator": {"guild_id": "100", "channel_id": "201", "user_id": "301"},
-                    "employee": {"guild_id": "100", "channel_id": "202", "user_id": "302"},
-                },
-                "discord": {"announcement_channel_ids": ["210"]},
-                "trello": {
-                    "board_id": "board-1",
-                    "list_ids": ["list-1", "list-2"],
-                    "label_ids": ["label-1"],
-                    "custom_field_ids": ["field-1"],
-                },
-                "ghl": {"location_id": "location-1"},
-                "rentcast": {
-                    "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
-                },
-            }
-        )
+        self.config = synthetic.config()
         self.operator = next(p for p in self.config.principals if p.role == Role.MAIN_OPERATOR)
         self.employee = next(p for p in self.config.principals if p.role == Role.EMPLOYEE)
         self.store = ApprovalStore(

@@ -45,12 +45,15 @@ starts the container.
    existing channel IDs;
 4. previews each channel it would create and waits for an explicit `yes`;
 5. reads each created channel back and stops if privacy or membership differs;
-6. optionally records the private full-profile route;
+6. records the private full-profile route and reads it back from Discord;
 7. verifies the bot identity, guild membership, and channel privacy;
-8. writes `config.yaml`, `.env`, `scotty/private.json`, and (when a route is
-   configured) `scotty/profile-routing.overlay.yaml` atomically with mode `0600`
-   and UID/GID 10000;
-9. leaves the container stopped.
+8. creates or idempotently verifies one home per served profile, and refuses to
+   continue if a routed profile has no home, if a client profile home is missing
+   its staged bounded plugin, or if the full profile home carries that plugin;
+9. writes `config.yaml`, `.env`, `scotty/private.json`, and one
+   `profiles/<profile>/config.yaml` atomically with mode `0600` and UID/GID
+   10000;
+10. leaves the container stopped.
 
 To supply the bot token from the environment instead of a hidden prompt:
 
@@ -122,12 +125,12 @@ started through the approved operator path.
 
 Send from the configured private route channel, as the configured route user:
 
-> Confirm which tools you have in this session and summarise the current
-> approval receipts without repeating any identifier.
+> List the tools available in this session.
 
-Expected: the reply reflects the full profile's inventory, not the five bounded
-Scotty tools. Then send the same message from any other account in that channel
-and confirm there is no reply at all.
+Expected: the normal full runtime inventory, not the five bounded Scotty tools,
+and no Scotty client identity or bounded refusal behaviour. The channel is
+private to that user and the assistant, and no client principal belongs to that
+guild, so no other account can post there at all.
 
 ### 5.2 Main-operator prompt, bounded profile
 
@@ -150,17 +153,26 @@ Expected: the proposal is not approved and nothing is executed. The employee may
 propose; approval belongs to the main operator or the maintainer, bound to the
 exact proposal and requester.
 
-### 5.4 Exact maintainer-triggered wizard command
+### 5.4 Fixed employee summary
 
-Send from the configured maintainer principal channel, exactly:
+Send from the main-operator or employee private channel, exactly:
 
-> Scotty, send Trent the setup wizard.
+> Scotty, send the employee summary.
 
-Expected: the fixed onboarding wizard is delivered only to the main-operator
-channel, chosen by code rather than by the model. The same text from any other
-principal sends nothing. Nothing is ever sent automatically after installation.
+Expected: the fixed summary is delivered only to the employee channel, chosen by
+code rather than by the model. Nothing is ever sent automatically after
+installation.
+
+The former `Scotty, send Trent the setup wizard.` command no longer exists. The
+maintainer now works from a separately served full profile that deliberately does
+not load the bounded Scotty plugin, so no deterministic pre-model path can run
+there. That trigger was retired rather than moved into the model's hands.
 
 ### 5.5 `not connected` provider behaviour
+
+Initial setup requires only the Discord bot token, the Discord identifiers, and
+the native Codex OAuth step. Trello, GoHighLevel, RentCast and Google Workspace
+are optional and connect later; no placeholder is ever recorded as a connection.
 
 From any client channel:
 
