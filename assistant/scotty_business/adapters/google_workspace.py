@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from ..config import GoogleWorkspaceScope
+from ..google_oauth import GoogleOAuthError
 from ..google_policy import GoogleActionClass, classify_google_action
 from .http import ProviderError, RedactedMapping, Transport, require_success
 from .records import ProviderRecord, utc_now
@@ -28,6 +29,33 @@ def _path(value: object, field: str) -> str:
     return urllib.parse.quote(_id(value, field), safe="")
 
 
+#: Exactly the person fields Scotty may name in a contacts update.
+_PERSON_FIELDS = frozenset(
+    {
+        "addresses",
+        "biographies",
+        "birthdays",
+        "emailAddresses",
+        "events",
+        "memberships",
+        "names",
+        "nicknames",
+        "occupations",
+        "organizations",
+        "phoneNumbers",
+        "relations",
+        "urls",
+        "userDefined",
+    }
+)
+
+
+def _label_ids(value: object, field: str) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > 50:
+        raise ProviderError(f"{field} must be a bounded list of label ids")
+    return [_id(item, f"{field} entry") for item in value]
+
+
 def _bounded_count(value: int) -> int:
     if type(value) is not int or not 1 <= value <= 100:
         raise ProviderError("max_results must be an integer from 1 to 100")
@@ -37,12 +65,30 @@ def _bounded_count(value: int) -> int:
 class GoogleWorkspaceAdapter:
     """Broad account-owned Workspace REST surface with code-enforced consequences."""
 
-    def __init__(self, transport: Transport, access_token: str, scope: GoogleWorkspaceScope):
-        if not access_token:
+    def __init__(
+        self,
+        transport: Transport,
+        access_token: str | Callable[[], str],
+        scope: GoogleWorkspaceScope,
+    ):
+        if not callable(access_token) and not access_token:
             raise ProviderError("Google OAuth is not configured")
         self.transport = transport
         self.scope = scope
-        self.headers = RedactedMapping(Authorization=f"Bearer {access_token}")
+        self._access_token = access_token
+
+    @property
+    def headers(self) -> RedactedMapping:
+        """Build the bearer header per request so a refreshed token is used."""
+
+        provider = self._access_token
+        try:
+            token = provider() if callable(provider) else provider
+        except GoogleOAuthError as exc:
+            raise ProviderError("Google OAuth is not available") from exc
+        if type(token) is not str or not token:
+            raise ProviderError("Google OAuth is not available")
+        return RedactedMapping(Authorization=f"Bearer {token}")
 
     def _record(self, provider: str, source_id: str, body: object) -> ProviderRecord:
         if not isinstance(body, dict):
@@ -244,6 +290,11 @@ class GoogleWorkspaceAdapter:
         source = resource_id
 
         if operation == "gmail_modify_labels":
+            # Only the two label fields Gmail's modify endpoint applies, so no
+            # unrelated key is ever posted against the caller's message.
+            if not payload or set(payload) - {"addLabelIds", "removeLabelIds"}:
+                raise ProviderError("Gmail label modification is malformed")
+            body = {field: _label_ids(value, field) for field, value in payload.items()}
             url = f"{_GMAIL}/messages/{_path(resource_id, 'Gmail message id')}/modify"
         elif operation == "gmail_create_draft":
             raw = payload.get("raw")
@@ -313,8 +364,8 @@ class GoogleWorkspaceAdapter:
                 "PATCH",
             )
             fields = tuple(key for key in payload if key != "etag")
-            if not fields:
-                raise ProviderError("contact update has no fields")
+            if not fields or any(field not in _PERSON_FIELDS for field in fields):
+                raise ProviderError("contact update names no known person field")
             query = {"updatePersonFields": ",".join(fields)}
         elif operation == "contacts_delete":
             if not resource_id.startswith("people/"):

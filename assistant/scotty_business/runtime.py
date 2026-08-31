@@ -22,7 +22,7 @@ from .adapters import (
 )
 from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
-from .google_oauth import GoogleOAuthError, GoogleTokenStore
+from .google_oauth import GoogleOAuthError, GoogleTokenStore, ensure_access_token
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
@@ -317,19 +317,16 @@ class Runtime:
         )
         state_dir = home / "scotty"
         google_scope = self.config.google_workspace
-        google_store = GoogleTokenStore(state_dir / "google-oauth.json")
-        google_token = None
-        if google_scope is not None and google_store.ready(
-            google_scope.oauth_scopes, google_scope.account_email
-        ):
-            try:
-                google_token = google_store.read()
-            except GoogleOAuthError:
-                google_token = None
-        self.connected["google_workspace"] = bool(google_scope is not None and google_token)
+        self.google_store = GoogleTokenStore(state_dir / "google-oauth.json")
+        # Connected means consent exists for this exact account and scope set. An
+        # hour-old access token refreshes in place; it never means "not connected".
+        self.connected["google_workspace"] = bool(
+            google_scope is not None
+            and self.google_store.ready(google_scope.oauth_scopes, google_scope.account_email)
+        )
         self.google_workspace = (
-            GoogleWorkspaceAdapter(transport, google_token.access_token, google_scope)
-            if google_scope is not None and google_token is not None
+            GoogleWorkspaceAdapter(transport, self._google_access_token, google_scope)
+            if google_scope is not None and self.connected["google_workspace"]
             else UnconnectedProvider("Google Workspace")
         )
         self.state_dir = state_dir
@@ -358,6 +355,14 @@ class Runtime:
             ),
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
+
+    def _google_access_token(self) -> str:
+        """Return a valid Workspace access token, refreshing it when it expires."""
+
+        scope = self.config.google_workspace
+        if scope is None:
+            raise GoogleOAuthError("Google Workspace is not configured")
+        return ensure_access_token(self.google_store, scope.oauth_scopes, scope.account_email)
 
     def principal(self, session_id: object) -> Principal:
         return self.resolver.resolve(session_id)
