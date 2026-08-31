@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from .http import (
     AmbiguousEffectError,
@@ -230,8 +230,10 @@ class DiscordAdapter:
             )
         return thread_id
 
-    def _thread_parent(self, thread_id: str) -> tuple[str, Mapping[str, object]]:
-        """A thread is reachable only through its configured parent channel."""
+    def _thread_parent(
+        self, thread_id: str, allowed_parents: Iterable[str] | None
+    ) -> tuple[str, Mapping[str, object]]:
+        """A thread is reachable only through a parent the caller may act in."""
 
         thread = fixed_id(thread_id, "thread id")
         body = require_success(
@@ -243,10 +245,15 @@ class DiscordAdapter:
         if type(parent) is not str:
             raise ProviderError("Discord thread has no configured parent")
         self._destination(parent)
+        if allowed_parents is not None and parent not in frozenset(allowed_parents):
+            # A thread never widens a caller past their own channel.
+            raise ProviderError("Discord destination is not configured")
         return thread, body
 
-    def send_thread_message(self, thread_id: str, content: str) -> dict[str, str]:
-        thread, _ = self._thread_parent(thread_id)
+    def send_thread_message(
+        self, thread_id: str, content: str, *, allowed_parents: Iterable[str] | None = None
+    ) -> dict[str, str]:
+        thread, _ = self._thread_parent(thread_id, allowed_parents)
         body = require_success(
             self.transport.request(
                 "POST",
@@ -258,10 +265,12 @@ class DiscordAdapter:
         )
         return self._acknowledged(body, thread)
 
-    def archive_own_thread(self, thread_id: str) -> bool:
+    def archive_own_thread(
+        self, thread_id: str, *, allowed_parents: Iterable[str] | None = None
+    ) -> bool:
         """Archive a task thread Scotty opened. Never one it does not own."""
 
-        thread, body = self._thread_parent(thread_id)
+        thread, body = self._thread_parent(thread_id, allowed_parents)
         if body.get("owner_id") != self.identity():
             raise ProviderError("Scotty may only archive its own threads")
         response = self.transport.request(

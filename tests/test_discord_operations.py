@@ -13,6 +13,7 @@ from assistant.scotty_business.discord_policy import (
     announcement_is_safe,
     classify_discord_action,
     permitted_destinations,
+    shared_destinations,
 )
 from assistant.scotty_business.policy import Role
 
@@ -28,13 +29,35 @@ def employee():
 
 
 class DestinationScopeTests(unittest.TestCase):
-    def test_each_client_reaches_only_their_own_channel_and_shared_destinations(self) -> None:
+    def test_each_client_acts_routinely_only_in_their_own_channel(self) -> None:
         config = synthetic.config()
         for principal in (operator(), employee()):
             with self.subTest(role=principal.role):
                 allowed = permitted_destinations(config, principal)
-                self.assertIn(principal.channel_id, allowed)
-                self.assertIn(synthetic.ANNOUNCEMENT_CHANNEL, allowed)
+                self.assertEqual(allowed, {principal.channel_id})
+                # A shared destination is publishing, not ordinary work, so it is
+                # reachable only through the approval path.
+                self.assertNotIn(synthetic.ANNOUNCEMENT_CHANNEL, allowed)
+        self.assertEqual(shared_destinations(config), {synthetic.ANNOUNCEMENT_CHANNEL})
+
+    def test_ordinary_sends_can_never_reach_a_shared_destination(self) -> None:
+        config = synthetic.config()
+        for operation in ("send_message", "attach_file", "edit_own_message", "update_progress"):
+            with self.subTest(operation=operation):
+                self.assertEqual(
+                    classify_discord_action(
+                        operation,
+                        {
+                            "channel_id": synthetic.ANNOUNCEMENT_CHANNEL,
+                            "content": "Weekly summary.",
+                            "filename": "summary.md",
+                            "size_bytes": 10,
+                        },
+                        destinations=permitted_destinations(config, operator()),
+                        shared=shared_destinations(config),
+                    ),
+                    DiscordActionClass.FORBIDDEN,
+                )
 
     def test_neither_client_can_reach_the_other_private_channel(self) -> None:
         config = synthetic.config()
@@ -57,6 +80,7 @@ class ActionClassificationTests(unittest.TestCase):
             operation,
             payload,
             destinations=permitted_destinations(config, principal or operator()),
+            shared=shared_destinations(config),
         )
 
     def test_ordinary_assistant_work_in_the_caller_channel_is_routine(self) -> None:
@@ -907,6 +931,190 @@ class DiscordThroughTheReadToolTests(unittest.TestCase):
             self.assertEqual(first["progress"], "posted")
             self.assertEqual(second["progress"], "coalesced")
             self.assertEqual([name for name, _ in recorder.calls], ["send_message"])
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """Cases an independent review found the first implementation missed."""
+
+    def runtime(self):
+        from test_provider_connection import runtime
+
+        return runtime(DISCORD_BOT_TOKEN="synthetic-discord")
+
+    def recorder(self, runtime):
+        class Recorder:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+            def __getattr__(self, name):
+                def call(*args, **kwargs):
+                    self.calls.append((name, args, kwargs))
+                    if name == "send_thread_message":
+                        return {"message_id": OPERATOR_MESSAGE, "channel_id": args[0]}
+                    if name in {"archive_own_thread", "delete_own_message"}:
+                        return True
+                    return {"message_id": OPERATOR_MESSAGE, "channel_id": args[0]}
+
+                return call
+
+        recorder = Recorder()
+        runtime.discord = recorder
+        return recorder
+
+    def read(self, runtime, principal, operation, **payload):
+        return runtime.handle_read(
+            principal,
+            {"operation": "discord", "discord_operation": operation, "payload": payload},
+        )
+
+    def test_a_routine_send_can_never_publish_to_a_shared_destination(self) -> None:
+        with self.runtime() as runtime:
+            recorder = self.recorder(runtime)
+            for operation in ("send_message", "attach_file", "update_progress"):
+                with self.subTest(operation=operation), self.assertRaises(PermissionError):
+                    self.read(
+                        runtime,
+                        operator(),
+                        operation,
+                        channel_id=synthetic.ANNOUNCEMENT_CHANNEL,
+                        content="api key is synthetic-value-000000000000",
+                        filename="summary.md",
+                        size_bytes=10,
+                        task_id="task-1",
+                    )
+            self.assertEqual(recorder.calls, [])
+
+    def test_a_thread_never_widens_a_caller_past_their_own_channel(self) -> None:
+        with self.runtime() as runtime:
+            recorder = self.recorder(runtime)
+            self.read(
+                runtime,
+                employee(),
+                "send_thread_message",
+                thread_id="950000000000000001",
+                content="status",
+            )
+            self.assertEqual(recorder.calls[-1][2]["allowed_parents"], {synthetic.EMPLOYEE_CHANNEL})
+            self.read(runtime, employee(), "archive_own_thread", thread_id="950000000000000001")
+            self.assertEqual(recorder.calls[-1][2]["allowed_parents"], {synthetic.EMPLOYEE_CHANNEL})
+
+    def test_the_adapter_refuses_a_thread_whose_parent_is_another_channel(self) -> None:
+        from assistant.scotty_business.adapters.discord import DiscordAdapter
+        from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
+
+        thread = "950000000000000004"
+
+        class Transport:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def request(
+                self, method, url, *, headers=None, query=None, json_body=None, attachment=None
+            ):
+                self.calls.append(method)
+                if url.endswith("/users/@me"):
+                    return HttpResponse(200, {}, {"id": BOT})
+                return HttpResponse(
+                    200, {}, {"id": thread, "parent_id": synthetic.OPERATOR_CHANNEL}
+                )
+
+        transport = Transport()
+        adapter = DiscordAdapter(
+            transport,
+            "synthetic-bot-token",
+            (synthetic.OPERATOR_CHANNEL, synthetic.EMPLOYEE_CHANNEL),
+        )
+        with self.assertRaises(ProviderError):
+            adapter.send_thread_message(
+                thread, "status", allowed_parents={synthetic.EMPLOYEE_CHANNEL}
+            )
+        self.assertNotIn("POST", transport.calls)
+
+    def test_a_finished_task_writes_its_final_state_immediately(self) -> None:
+        with self.runtime() as runtime:
+            recorder = self.recorder(runtime)
+            self.read(runtime, operator(), "update_progress", content="Starting", task_id="task-1")
+            coalesced = self.read(
+                runtime, operator(), "update_progress", content="Halfway", task_id="task-1"
+            )
+            final = self.read(
+                runtime,
+                operator(),
+                "update_progress",
+                content="Done.",
+                task_id="task-1",
+                final=True,
+            )
+            self.assertEqual(coalesced["progress"], "coalesced")
+            self.assertEqual(final["progress"], "edited")
+            self.assertEqual(recorder.calls[-1][1][2], "Done.")
+
+    def test_volume_is_counted_from_what_scotty_actually_sent(self) -> None:
+        with self.runtime() as runtime:
+            self.recorder(runtime)
+            for index in range(BULK_MESSAGE_THRESHOLD):
+                self.read(runtime, operator(), "send_message", content=f"update {index}")
+            with self.assertRaises(PermissionError) as caught:
+                self.read(runtime, operator(), "send_message", content="one too many")
+            self.assertIn("approved proposal", str(caught.exception))
+
+    def test_a_caller_supplied_count_cannot_lower_the_real_volume(self) -> None:
+        with self.runtime() as runtime:
+            self.recorder(runtime)
+            for index in range(BULK_MESSAGE_THRESHOLD):
+                self.read(
+                    runtime,
+                    operator(),
+                    "send_message",
+                    content=f"update {index}",
+                    message_count=0,
+                )
+            with self.assertRaises(PermissionError):
+                self.read(
+                    runtime, operator(), "send_message", content="one too many", message_count=0
+                )
+
+    def test_an_attachment_name_the_upload_would_reject_is_refused_early(self) -> None:
+        from assistant.scotty_business.discord_policy import ATTACHMENT_FILENAME
+
+        config = synthetic.config()
+        for filename in ("weekly report.csv", "_notes.txt", "r\u00e9sum\u00e9.pdf", "-lead.md"):
+            with self.subTest(filename=filename):
+                self.assertIsNone(ATTACHMENT_FILENAME.fullmatch(filename))
+                self.assertEqual(
+                    classify_discord_action(
+                        "attach_file",
+                        {
+                            "channel_id": synthetic.OPERATOR_CHANNEL,
+                            "content": "Here it is.",
+                            "filename": filename,
+                            "size_bytes": 10,
+                        },
+                        destinations=permitted_destinations(config, operator()),
+                        shared=shared_destinations(config),
+                    ),
+                    DiscordActionClass.FORBIDDEN,
+                )
+
+    def test_a_live_task_reporter_is_not_evicted_by_newer_tasks(self) -> None:
+        with self.runtime() as runtime:
+            recorder = self.recorder(runtime)
+            self.read(runtime, operator(), "update_progress", content="Start", task_id="task-1")
+            for index in range(80):
+                self.read(
+                    runtime,
+                    operator(),
+                    "update_progress",
+                    content="other",
+                    task_id=f"filler-{index}",
+                )
+                self.read(
+                    runtime, operator(), "update_progress", content="keep alive", task_id="task-1"
+                )
+            posts = [name for name, _, _ in recorder.calls if name == "send_message"]
+            edits = [name for name, _, _ in recorder.calls if name == "edit_own_message"]
+            self.assertEqual(len([call for call in posts]), 81)
+            self.assertEqual(edits, [])
 
 
 if __name__ == "__main__":

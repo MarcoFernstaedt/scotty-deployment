@@ -23,7 +23,7 @@ other's private channel by any route, including an approval.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from enum import StrEnum
 
 from .config import RuntimeConfig
@@ -66,22 +66,32 @@ MAX_MESSAGE_CHARS = 2000
 #: More individual mentions than this is a new audience, not a reply.
 MAX_MENTIONS = 10
 
-#: More queued messages than this is bulk messaging.
+#: More messages than this from one caller inside the window below is bulk
+#: messaging, whatever the caller claims.
 BULK_MESSAGE_THRESHOLD = 5
+BULK_WINDOW_SECONDS = 60.0
 
 _MASS_MENTION = re.compile(r"@(?:everyone|here)\b")
 _USER_MENTION = re.compile(r"<@[!&]?[0-9]{17,20}>")
 
 
 def permitted_destinations(config: RuntimeConfig, principal: Principal) -> frozenset[str]:
-    """Exactly the channels this caller may reach.
+    """The channels this caller may act in routinely: their own, and only theirs.
 
-    A client user reaches their own private channel and the configured shared
-    destinations. The other client user's private channel is never included, so
+    A shared destination is deliberately absent. Reaching one is publishing, and
+    publishing goes through the approval path so it cannot skip the leak check
+    that guards it. The other client user's private channel is never included, so
     neither can view, post into, or cross-route into the other's session.
     """
 
-    return frozenset({principal.channel_id, *config.announcement_channel_ids})
+    del config
+    return frozenset({principal.channel_id})
+
+
+def shared_destinations(config: RuntimeConfig) -> frozenset[str]:
+    """The configured shared destinations, reachable only by an approved publish."""
+
+    return frozenset(config.announcement_channel_ids)
 
 
 def _text(payload: Mapping[str, object], field: str) -> str:
@@ -89,10 +99,15 @@ def _text(payload: Mapping[str, object], field: str) -> str:
     return value if type(value) is str else ""
 
 
+#: Exactly the filenames the multipart transport will accept, so an attachment
+#: is refused during classification instead of failing opaquely at upload.
+ATTACHMENT_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
 def _attachment_ok(payload: Mapping[str, object]) -> bool:
     name = _text(payload, "filename")
     size = payload.get("size_bytes")
-    if not name or "/" in name or "\\" in name or name.startswith("."):
+    if not ATTACHMENT_FILENAME.fullmatch(name):
         return False
     if not any(name.lower().endswith(suffix) for suffix in APPROVED_ATTACHMENT_SUFFIXES):
         return False
@@ -104,6 +119,7 @@ def classify_discord_action(
     payload: object,
     *,
     destinations: Iterable[str],
+    shared: Iterable[str] = (),
 ) -> DiscordActionClass:
     """Classify one exact Discord action before any provider call."""
 
@@ -114,9 +130,14 @@ def classify_discord_action(
         return DiscordActionClass.FORBIDDEN
 
     allowed = frozenset(destinations)
+    publishable = frozenset(shared)
     channel_id = _text(payload, "channel_id")
-    if not channel_id or channel_id not in allowed:
-        # Includes every channel in another guild and the other client's channel.
+    if not channel_id:
+        return DiscordActionClass.FORBIDDEN
+    # A shared destination is reachable only by publishing to it, never by an
+    # ordinary send that would skip the announcement leak check.
+    publishing = channel_id in publishable and operation in CONSEQUENCE_DISCORD_OPERATIONS
+    if channel_id not in allowed and not publishing:
         return DiscordActionClass.FORBIDDEN
 
     content = _text(payload, "content")
@@ -178,15 +199,15 @@ def announcement_is_safe(content: object, config: RuntimeConfig) -> bool:
     return all(identifier not in content for identifier in private_identifiers(config))
 
 
-def redacted_refusal(operation: str) -> str:
-    """A fixed refusal that never repeats the payload it refused."""
+def redacted_refusal(operation: object, classified: DiscordActionClass) -> str:
+    """A fixed refusal that never repeats the payload it refused.
 
-    if operation in CONSEQUENCE_DISCORD_OPERATIONS:
+    The class decides the wording, not the operation name: an ordinary send that
+    became bulk still needs an approval, and saying so is more useful than
+    claiming Scotty cannot send at all.
+    """
+
+    del operation
+    if classified is DiscordActionClass.CONSEQUENCE:
         return "that Discord action needs an approved proposal"
     return "that Discord action is not one Scotty performs"
-
-
-def bulk_message_count(messages: object) -> int:
-    if isinstance(messages, Sequence) and not isinstance(messages, str | bytes):
-        return len(messages)
-    return 0

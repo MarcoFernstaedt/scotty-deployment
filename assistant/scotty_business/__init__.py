@@ -109,6 +109,7 @@ _READ_SCHEMA = _schema(
                 "update_progress",
             ],
         },
+        "final": {"type": "boolean"},
         "query": {"type": "object", "additionalProperties": True},
         "raw": {"type": "string", "maxLength": 65000},
         "calendar_id": {"type": "string"},

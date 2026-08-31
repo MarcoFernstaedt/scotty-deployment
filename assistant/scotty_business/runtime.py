@@ -27,10 +27,12 @@ from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
 from .discord_policy import (
+    BULK_WINDOW_SECONDS,
     DiscordActionClass,
     classify_discord_action,
     permitted_destinations,
     redacted_refusal,
+    shared_destinations,
 )
 from .google_oauth import GoogleOAuthError, GoogleTokenStore, ensure_access_token
 from .google_policy import ROUTINE_GOOGLE_OPERATIONS
@@ -63,6 +65,12 @@ _ATTACHMENT_TYPES: Mapping[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
 }
+
+
+#: Operations that put a new message in a channel, and so count toward volume.
+_SENDING_OPERATIONS = frozenset(
+    {"send_message", "reply_message", "attach_file", "send_thread_message"}
+)
 
 
 def _required(value: str | None, field: str) -> str:
@@ -411,6 +419,7 @@ class Runtime:
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
         self._reporters: dict[tuple[str, str], ProgressReporter] = {}
+        self._sends: dict[tuple[str, str], list[float]] = {}
 
     def _google_access_token(self) -> str:
         """Return a valid Workspace access token, refreshing it when it expires."""
@@ -611,10 +620,10 @@ class Runtime:
         raise ValueError("read operation is not permitted")
 
     def _reporter(self, channel_id: str, task_id: str) -> ProgressReporter:
-        """One coalescing reporter per task, kept for the life of the runtime."""
+        """One coalescing reporter per task, evicted by least recent use."""
 
         key = (channel_id, task_id)
-        reporter = self._reporters.get(key)
+        reporter = self._reporters.pop(key, None)
         if reporter is None:
             reporter = ProgressReporter(
                 channel_id,
@@ -622,10 +631,21 @@ class Runtime:
                 self.discord.edit_own_message,
                 clock=time.monotonic,
             )
-            if len(self._reporters) >= 64:
-                self._reporters.pop(next(iter(self._reporters)))
-            self._reporters[key] = reporter
+        while len(self._reporters) >= 64:
+            # Drop the least recently used task, never the one being written to.
+            self._reporters.pop(next(iter(self._reporters)))
+        self._reporters[key] = reporter
         return reporter
+
+    def _record_send(self, principal: Principal, channel_id: str) -> int:
+        """Count what Scotty actually sent for this caller inside the window."""
+
+        now = time.monotonic()
+        key = (principal.user_id, channel_id)
+        recent = [stamp for stamp in self._sends.get(key, ()) if now - stamp < BULK_WINDOW_SECONDS]
+        recent.append(now)
+        self._sends[key] = recent
+        return len(recent)
 
     def handle_discord(self, principal: Principal, args: Mapping[str, object]) -> object:
         """Perform one typed, classified Discord action for this exact caller."""
@@ -635,14 +655,23 @@ class Runtime:
         destinations = permitted_destinations(self.config, principal)
         channel_id = _text(payload, "channel_id", optional=True) or principal.channel_id
         content = _text(payload, "content", optional=True) or ""
+        sending = discord_operation in _SENDING_OPERATIONS
         classified = classify_discord_action(
             discord_operation,
-            {**payload, "channel_id": channel_id, "content": content},
+            {
+                **payload,
+                "channel_id": channel_id,
+                "content": content,
+                # Volume is measured from what Scotty actually sent, never from
+                # a count the caller supplies.
+                "message_count": self._record_send(principal, channel_id) if sending else 0,
+            },
             destinations=destinations,
+            shared=shared_destinations(self.config),
         )
         if classified is not DiscordActionClass.ROUTINE:
             # Consequence work goes through a proposal; everything else is absent.
-            raise PermissionError(redacted_refusal(discord_operation))
+            raise PermissionError(redacted_refusal(discord_operation, classified))
 
         message_id = _text(payload, "message_id", optional=True)
         if discord_operation == "read_channel":
@@ -687,10 +716,23 @@ class Runtime:
                 )
             }
         if discord_operation == "send_thread_message":
-            return dict(self.discord.send_thread_message(_text(payload, "thread_id"), content))
+            return dict(
+                self.discord.send_thread_message(
+                    _text(payload, "thread_id"), content, allowed_parents=destinations
+                )
+            )
         if discord_operation == "archive_own_thread":
-            return {"archived": self.discord.archive_own_thread(_text(payload, "thread_id"))}
-        outcome = self._reporter(channel_id, _text(payload, "task_id")).update(content)
+            return {
+                "archived": self.discord.archive_own_thread(
+                    _text(payload, "thread_id"), allowed_parents=destinations
+                )
+            }
+        reporter = self._reporter(channel_id, _text(payload, "task_id"))
+        # A finished task always writes its final state, whatever the rate limit
+        # and the edit budget would otherwise have deferred.
+        outcome = (
+            reporter.finish(content) if payload.get("final") is True else reporter.update(content)
+        )
         return {"progress": outcome.state.value, "message_id": outcome.message_id}
 
     def _attachment(self, payload: Mapping[str, object]) -> Attachment:
