@@ -75,6 +75,7 @@ readonly -a PLUGIN_FILES=(
   "self_repair.py"
   "service.py"
   "setup.py"
+  "setup_flow.py"
   "wizard.py"
   "adapters/__init__.py"
   "adapters/discord.py"

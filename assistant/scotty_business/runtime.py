@@ -32,6 +32,14 @@ from .policy import Principal
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
 from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
+from .setup_flow import (
+    ProviderProgress,
+    SetupFlowError,
+    SetupStagingStore,
+    diagnose,
+    first_unfinished,
+    setup_progress,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +233,20 @@ def _guidance_json(provider: str, connected: bool) -> dict[str, object]:
         "required_ids": list(item.required_ids),
         "required_scopes": list(item.required_scopes),
         "steps": list(item.steps),
+        "apis": list(item.apis),
+        "callback": item.callback,
         "guidance": item.as_text(),
+    }
+
+
+def _progress_json(item: ProviderProgress) -> dict[str, object]:
+    return {
+        "provider": item.provider,
+        "name": item.display_name,
+        "status": item.status,
+        "identifiers_complete": item.configured,
+        "missing_identifiers": list(item.missing),
+        "next_action": item.next_action,
     }
 
 
@@ -337,6 +358,7 @@ class Runtime:
         self.approvals.recover_interrupted()
         self.reminders = ReminderStore(state_dir / "reminders.db")
         self.reminders.initialize()
+        self.setup_staging = SetupStagingStore(state_dir / "setup-staging.json")
         self.self_repair = SelfRepairManager(
             state_dir,
             state_dir / "private.json",
@@ -373,17 +395,54 @@ class Runtime:
         return provider_status(self.connected)
 
     def _provider_setup(self, args: Mapping[str, object]) -> dict[str, object]:
+        """Answer one guided setup turn: explain, validate, diagnose, or resume."""
+
         status = self.provider_connection_status()
+        staged = self.setup_staging.read()
+        progress = setup_progress(self.config, status, staged)
         name = _text(args, "provider", optional=True)
         if name is None:
+            resume = first_unfinished(progress)
             return {
                 "providers": {
                     provider: _guidance_json(provider, status[provider]) for provider in PROVIDERS
-                }
+                },
+                "progress": [_progress_json(item) for item in progress],
+                "resume_at": resume.provider if resume is not None else None,
+                "next_action": (
+                    resume.next_action
+                    if resume is not None
+                    else "Every integration is connected. Nothing further is required."
+                ),
             }
         if name not in PROVIDERS:
             raise ValueError("provider is not part of this deployment")
-        return _guidance_json(name, status[name])
+        current = next(item for item in progress if item.provider == name)
+        failure = _text(args, "setup_failure", optional=True)
+        if failure is not None:
+            return {
+                "provider": name,
+                "diagnosis": diagnose(name, failure),
+                "next_action": current.next_action,
+            }
+        field = _text(args, "setup_field", optional=True)
+        raw = _text(args, "raw", optional=True)
+        if field is not None and raw is not None:
+            # Only non-secret identifiers are ever collected here, and they are
+            # staged for local setup rather than applied to live configuration.
+            try:
+                staged = self.setup_staging.stage(name, field, raw)
+            except SetupFlowError as exc:
+                return {"provider": name, "accepted": False, "correction": str(exc)}
+            refreshed = setup_progress(self.config, status, staged)
+            resume = first_unfinished(refreshed)
+            return {
+                "provider": name,
+                "field": field,
+                "accepted": True,
+                "next_action": resume.next_action if resume is not None else current.next_action,
+            }
+        return {**_guidance_json(name, status[name]), **_progress_json(current)}
 
     def handle_read(self, principal: Principal, args: Mapping[str, object]) -> object:
         operation = _text(args, "operation")

@@ -37,6 +37,7 @@ from .routing import (
     ProfileRouteError,
     parse_profile_routes,
 )
+from .setup_flow import SetupStagingStore
 
 _DATA_DIR = Path("/srv/Scotty/data")
 _PROFILES_DIRNAME = "profiles"
@@ -306,6 +307,30 @@ def _environment_secret(environ: Mapping[str, str], name: str) -> str:
     if value and not _SAFE_SECRET.fullmatch(value):
         raise SetupError("an environment credential contains unsupported characters")
     return value
+
+
+def apply_staged_identifiers(
+    inputs: SetupInputs, staged: Mapping[str, Mapping[str, str]]
+) -> SetupInputs:
+    """Apply only the non-secret identifiers Scotty collected conversationally.
+
+    A staged value is used only where the interactive answer was left blank, so
+    a value the operator typed at the terminal is never overwritten.
+    """
+
+    changes: dict[str, object] = {}
+    google = staged.get("google_workspace", {}).get("account_email")
+    if google and not inputs.google_account_email:
+        changes["google_account_email"] = _google_account_email(google)
+    location = staged.get("ghl", {}).get("location_id")
+    if location and not inputs.ghl_location_id:
+        changes["ghl_location_id"] = location
+    board = staged.get("trello", {}).get("board_id")
+    if board and not inputs.trello_board_id:
+        changes["trello_board_id"] = board
+    if not changes:
+        return inputs
+    return replace(inputs, **cast(Any, changes))
 
 
 def collect_inputs(
@@ -1132,6 +1157,11 @@ def main() -> int:
         raise SetupError("run the local setup command as root")
     _require_stopped_container()
     inputs = collect_inputs()
+    # Identifiers Trent supplied conversationally are applied first, so the
+    # operator's own prefill still wins on any field they both name.
+    inputs = apply_staged_identifiers(
+        inputs, SetupStagingStore(_DATA_DIR / "scotty" / "setup-staging.json").read()
+    )
     prefill_path = Path("/srv/Scotty/operator/setup-prefill.json")
     if prefill_path.exists():
         inputs = apply_prefill(inputs, load_prefill(prefill_path))

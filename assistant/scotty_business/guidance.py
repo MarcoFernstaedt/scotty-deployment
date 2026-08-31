@@ -30,15 +30,22 @@ class ProviderGuidance:
     required_ids: tuple[str, ...]
     required_scopes: tuple[str, ...]
     steps: tuple[str, ...]
+    apis: tuple[str, ...] = ()
+    callback: str = ""
 
     def as_text(self) -> str:
         lines = [f"{self.display_name}: {self.status}", self.summary]
         if self.required_ids:
             lines.append("Identifiers to collect:")
             lines.extend(f"  - {item}" for item in self.required_ids)
+        if self.apis:
+            lines.append("APIs or products to enable:")
+            lines.extend(f"  - {item}" for item in self.apis)
         if self.required_scopes:
             lines.append("Permissions or scopes to grant:")
             lines.extend(f"  - {item}" for item in self.required_scopes)
+        if self.callback:
+            lines.append(f"Callback or redirect: {self.callback}")
         lines.append("Provider-side steps:")
         lines.extend(f"  {index}. {item}" for index, item in enumerate(self.steps, start=1))
         lines.append(LOCAL_SETUP_DIRECTIVE)
@@ -62,6 +69,11 @@ _DEFINITIONS: Mapping[str, Mapping[str, object]] = {
             "Manage Channels in the server, so setup can create the private channels",
             "View Channel, Send Messages, Read Message History, and Embed Links in each channel",
             "Message Content Intent enabled on the application",
+        ),
+        "apis": ("the Discord bot application, with no OAuth2 redirect flow",),
+        "callback": (
+            "None. Scotty connects out to Discord as a bot and exposes no public port, "
+            "webhook, or redirect URI."
         ),
         "steps": (
             "Create the application and its bot user in the Discord developer portal.",
@@ -87,6 +99,8 @@ _DEFINITIONS: Mapping[str, Mapping[str, object]] = {
             "read and write on the configured board only",
             "no workspace, member, or board administration",
         ),
+        "apis": ("the Trello REST API, through a Power-Up API key and a matching token",),
+        "callback": "None. The token is issued in the browser and entered only through setup.",
         "steps": (
             "Open the Power-Up admin page and create an API key for the workspace.",
             "Generate a token for that key from the account that owns the board.",
@@ -110,6 +124,11 @@ _DEFINITIONS: Mapping[str, Mapping[str, object]] = {
             "contacts read, conversations read, and conversations message write",
             "no marketplace OAuth application and no public webhook endpoint",
         ),
+        "apis": ("the GoHighLevel v2 contacts and conversations APIs for one sub-account",),
+        "callback": (
+            "None. A Private Integration Token needs no redirect URI, and Scotty registers "
+            "no inbound webhook."
+        ),
         "steps": (
             "Open the sub-account settings and create a Private Integration.",
             "Grant only the contacts and conversations scopes listed above.",
@@ -128,6 +147,8 @@ _DEFINITIONS: Mapping[str, Mapping[str, object]] = {
             "a read-only API key",
             "property records, value estimates, rent estimates, and comparables only",
         ),
+        "apis": ("the RentCast v1 property, value, and rent endpoints only",),
+        "callback": "None. RentCast is a read-only key on outbound calls.",
         "steps": (
             "Create an account and issue an API key in the RentCast dashboard.",
             "Confirm the plan covers property data and the valuation endpoints.",
@@ -138,23 +159,44 @@ _DEFINITIONS: Mapping[str, Mapping[str, object]] = {
     "google_workspace": {
         "display_name": "Google Workspace",
         "summary": (
-            "Google Workspace is a bounded release capability for one configured account and "
-            "exact Gmail labels, calendars, Drive files, Docs, Sheets, and Contacts. Reads and "
-            "drafts are routine; every external send or write requires exact approval."
+            "Google Workspace is a bounded release capability over one configured account. "
+            "Day-to-day Gmail, Calendar, Drive, Docs, Sheets, and Contacts work is ordinary "
+            "and reversible, so it does not stop for approval. Exact sends, new audiences, "
+            "permanent deletion, sharing or permission changes, admin, account-security and "
+            "billing actions, and bulk mutation are each approval-bound."
         ),
         "required_ids": (
-            "the configured Workspace account email",
-            "exact Gmail label and Calendar IDs",
-            "exact Drive file, Docs document, Sheets spreadsheet, and Contact resource IDs",
+            "the Workspace account email Scotty is authorized to act in",
+            "no per-file, per-label, or per-calendar list: consent covers the account, and "
+            "code decides what is routine and what needs approval",
+        ),
+        "apis": (
+            "Gmail API",
+            "Google Calendar API",
+            "Google Drive API",
+            "Google Docs API",
+            "Google Sheets API",
+            "People API",
         ),
         "required_scopes": (
-            "the fixed Gmail modify, Calendar events, Drive file, Docs, Sheets, and Contacts scopes",
-            "no Admin SDK, broad Drive traversal, deletion, trash, sharing, or permission changes",
+            "openid and email, to bind consent to the exact account",
+            "the Gmail modify, Calendar, Drive, Docs, Sheets, and Contacts product scopes",
+            "no Admin SDK, no directory, no billing, and no https://mail.google.com/ "
+            "permanent-delete scope",
+        ),
+        "callback": (
+            "Google's installed-app loopback. Consent opens in a browser on the server and "
+            "returns to http://127.0.0.1:<port>/oauth2/callback, a port chosen at run time. "
+            "Add no public redirect URI, and never copy an authorization code into Discord."
         ),
         "steps": (
-            "Create an OAuth client of type Desktop app in the Google Cloud console.",
-            "Place the downloaded client material only in the documented owner-only local path.",
-            "Run local setup and complete Google's installed-app browser consent.",
+            "Create or select a Google Cloud project for this deployment.",
+            "Enable the six APIs listed above on that project.",
+            "Configure the OAuth consent screen and add the Workspace account as a user.",
+            "Create an OAuth client of type Desktop app and download its client material.",
+            "Place that client material only in the documented owner-only local path.",
+            "Run local setup and complete Google's browser consent as the exact account; "
+            "Scotty refuses the result if the account or granted scopes differ.",
             "Keep authorization codes and token state out of Discord, logs, and model context.",
         ),
     },
@@ -173,6 +215,8 @@ def provider_guidance(provider: str, *, connected: bool = False) -> ProviderGuid
         required_ids=tuple(definition["required_ids"]),  # type: ignore[arg-type]
         required_scopes=tuple(definition["required_scopes"]),  # type: ignore[arg-type]
         steps=tuple(definition["steps"]),  # type: ignore[arg-type]
+        apis=tuple(definition.get("apis", ())),  # type: ignore[arg-type]
+        callback=str(definition.get("callback", "")),
     )
 
 

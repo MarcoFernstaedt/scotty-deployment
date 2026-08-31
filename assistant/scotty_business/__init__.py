@@ -88,6 +88,8 @@ _READ_SCHEMA = _schema(
             "enum": ["discord", "trello", "ghl", "rentcast", "google_workspace"],
         },
         "endpoint": {"type": "string"},
+        "setup_field": {"type": "string"},
+        "setup_failure": {"type": "string"},
         "query": {"type": "object", "additionalProperties": True},
         "raw": {"type": "string", "maxLength": 65000},
         "calendar_id": {"type": "string"},
