@@ -8,6 +8,21 @@ readonly GOOGLE_TOKEN=/srv/Scotty/data/scotty/google-oauth.json
 STARTED=0
 COMPLETED=0
 
+# Runs inside the prepared container against the installed plugin only.
+readonly GOOGLE_CONSENT_CHECK='
+import json, pathlib, sys
+sys.path.insert(0, "/srv/Scotty/data/plugins")
+from scotty_business.config import RuntimeConfig
+from scotty_business.google_oauth import GoogleTokenStore
+private = pathlib.Path("/srv/Scotty/data/scotty/private.json")
+config = RuntimeConfig.from_mapping(json.loads(private.read_text(encoding="utf-8")))
+scope = config.google_workspace
+if scope is None:
+    sys.exit(0)
+store = GoogleTokenStore(pathlib.Path("/srv/Scotty/data/scotty/google-oauth.json"))
+sys.exit(0 if store.ready(scope.oauth_scopes, scope.account_email) else 1)
+'
+
 fail() {
   printf 'scotty-start: %s\n' "$*" >&2
   exit 1
@@ -30,7 +45,9 @@ actual_euid=${SCOTTY_TEST_EUID:-$EUID}
 command -v docker >/dev/null 2>&1 || fail 'Docker is unavailable'
 [[ -x $SETUP_COMMAND ]] || fail 'private setup command is unavailable'
 
-state="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
+# An absent container makes `docker inspect` fail; keep the diagnosis rather
+# than exiting on the command substitution with only the recovery line.
+state="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)"
 [[ $state == false ]] || fail 'Scotty must exist and be stopped before startup'
 
 # Setup accepts non-secret prefill only from its fixed owner-only local path. All
@@ -43,8 +60,10 @@ docker start "$CONTAINER" >/dev/null
 STARTED=1
 docker exec -it "$CONTAINER" hermes auth add openai-codex
 
+GOOGLE_SELECTED=0
 if [[ -e /srv/Scotty/data/scotty/private.json ]] \
   && grep -q '"google_workspace"' /srv/Scotty/data/scotty/private.json; then
+  GOOGLE_SELECTED=1
   [[ -f $GOOGLE_TOKEN && ! -L $GOOGLE_TOKEN ]] || fail 'Google OAuth is selected but incomplete'
   [[ $(stat -c '%a' "$GOOGLE_TOKEN") == 600 ]] || fail 'Google OAuth token state is not owner-only'
 fi
@@ -53,6 +72,14 @@ fi
 [[ $(docker inspect --format '{{.State.Running}}' "$CONTAINER") == true ]] \
   || fail 'Scotty did not remain running'
 docker exec "$CONTAINER" hermes --help >/dev/null
+
+# Confirm inside the prepared container that consent is bound to the configured
+# account and scope set. This reads owner-only state and prints only a redacted
+# verdict; it performs no Google call and sends nothing.
+if (( GOOGLE_SELECTED == 1 )); then
+  docker exec "$CONTAINER" python -c "$GOOGLE_CONSENT_CHECK" >/dev/null \
+    || fail 'Google consent does not match the configured account and scopes'
+fi
 
 COMPLETED=1
 trap - EXIT
