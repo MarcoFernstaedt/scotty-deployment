@@ -185,14 +185,55 @@ From any client channel:
 
 > Is GoHighLevel connected?
 
-Expected: Scotty states `not connected`, lists the provider-side steps and the
-identifiers and scopes to gather, and directs the operator to the local setup
-command. It never asks for a credential in Discord and never accepts one from
-chat. Google Workspace additionally reports that it is not installed and holds
-no add-on slot.
+Expected: Scotty states `not connected`, lists the provider-side steps, the APIs
+to enable, the identifiers and scopes to gather, and the callback behaviour, and
+names the single next action. It never asks for a credential in Discord and
+never accepts one from ordinary chat.
 
-If a credential is ever posted in a channel, Scotty does not use or repeat it.
-Rotate it, then enter the replacement through the local setup command.
+If a credential is ever posted in a channel outside the protected intake below,
+Scotty does not use or repeat it. Rotate it, then enter the replacement through
+the local setup command or a fresh intake window.
+
+### 5.7 Guided setup, resume, and failure diagnosis
+
+From the main-operator channel:
+
+> Where are we with setup?
+
+Expected: Scotty reports every provider's state, what identifiers are still
+missing, and the first unfinished step to resume at. Offering a non-secret
+identifier is accepted when it is well formed and answered with a specific
+correction when it is not; the value is staged for local setup rather than
+written to live configuration. Reporting a provider failure returns a named
+diagnosis and the next correction, never a generic refusal or a bare pointer to
+operator documentation.
+
+### 5.8 Protected credential intake
+
+From the main-operator channel:
+
+> Scotty, accept my Trello API key.
+
+Expected: Scotty opens one single-use window bound to that exact tuple and asks
+for the credential as the very next message. That message is intercepted before
+anything else sees it, deleted from Discord, and stored through the root-owned
+broker; Scotty reports only `credential present` and the next setup step.
+Unconfirmed deletion, failed validation, expiry, replay, or a failed commit
+stores nothing and directs the operator to local hidden input. The employee
+cannot open a window, and Google Workspace has no intake phrase because it uses
+provider-owned browser consent.
+
+### 5.9 Bounded self-repair
+
+From the main-operator channel:
+
+> Check your own health.
+
+Expected: a redacted report of configuration validity, owned-database integrity,
+interrupted workflows, and provider states, with no path or identifier. A
+repair request is honoured only for `recover_workflows`, `rebuild_cache`, and
+`repair_state_permissions`. Anything privileged stops at a redacted diagnosis
+naming `sudo /usr/local/sbin/scotty-start`, and the employee cannot repair.
 
 ## 6. Add-on cap
 

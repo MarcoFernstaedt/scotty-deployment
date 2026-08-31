@@ -30,7 +30,12 @@ The assistant adds these enforced boundaries:
 - Credentials are accepted only by the local hidden-input setup command or an exported environment variable, are stored in `/srv/Scotty/data/.env`, and never reach `argv`, stdout, logs, or public configuration. The model authenticates through the runtime's own `openai-codex` OAuth flow, which Scotty never sees, stores, or logs.
 - Only the Discord bot token is required on day one. Trello, GoHighLevel and RentCast connect later; no placeholder is ever recorded as a connection.
 - Private channels are created only after a local preview and confirmation, deny `View Channel` to `@everyone`, and are read back before they are recorded. An unconfirmable create is recorded as unknown and never resolved by creating a second channel.
-- An unconfigured provider reports `not connected` with fixed guidance instead of taking the assistant down, and never asks for a credential in Discord.
+- An unconfigured provider reports `not connected` with fixed guidance instead of taking the assistant down, and never asks for a credential in ordinary chat.
+- Google Workspace is authorized for one configured account through Google's own browser consent. Ordinary reversible Gmail, Calendar, Drive, Docs, Sheets, and Contacts work runs without repeated approval; exact sends, new audiences, permanent deletion, sharing and permission changes, admin, account-security and billing actions, and bulk mutation are consequence-gated in code, and an unknown operation fails closed. The access token refreshes from owner-only state, so consent is completed once.
+- Setup is a guided conversation from the authorized private channel: what each integration enables, the provider-console steps, the APIs to enable, the scopes, the identifiers, the callback behaviour, what is still missing, a specific correction for a malformed identifier, a named diagnosis for a provider failure, and the first unfinished step to resume at.
+- A provider credential may be handed over through a purpose-built one-time intake opened by a fixed phrase from the exact authorized tuple. It is intercepted before any queue, session, log, or model, the source message is deleted and confirmed, and it is committed through a root-owned broker that never returns it. Any failure stores nothing. Without that installed privilege boundary, no window opens and the operator is directed to local hidden input.
+- Scotty can inspect its own health and perform exactly three bounded repairs on state it owns. It has no shell, package, Docker, systemd, firewall, host, or cross-client access, and a privileged need stops at a redacted diagnosis naming the one root-owned recovery command.
+- `sudo /usr/local/sbin/scotty-start` is the single root-only lifecycle command. It validates the prepared stopped container, runs owner-only setup, completes the runtime's own Codex OAuth, validates Google consent against the configured account and scopes, starts only the prepared container, runs non-sending checks, and on any partial failure leaves Scotty stopped with one recovery instruction. It never sends onboarding.
 
 A prompt, folder name, model, or persona is not a security boundary. The code, exact runtime configuration, container restrictions, network guard, and provider credential scopes collectively form the boundary.
 
@@ -43,6 +48,11 @@ A prompt, folder name, model, or persona is not a security boundary. The code, e
 - `assistant/scotty_guard/`: self-contained pre-dispatch authorization for the full profile. No tools, no prompt, no client identity.
 - `assistant/scotty_business/provisioning.py`: idempotent private-channel creation or reuse with preview, confirmation, and readback.
 - `assistant/scotty_business/guidance.py`: fixed, credential-free provider setup guidance.
+- `assistant/scotty_business/setup_flow.py`: guided setup progress, identifier validation, failure diagnosis, resume, and owner-only staging of non-secret identifiers.
+- `assistant/scotty_business/credential_intake.py`: one-time protected credential intake ahead of every model-visible path, with confirmed source deletion and a privilege-separated broker.
+- `assistant/scotty_business/google_policy.py`: code-enforced routine, consequence, and forbidden classification for every Workspace action.
+- `assistant/scotty_business/google_oauth.py`: installed-app browser consent, account binding, and owner-only token refresh.
+- `assistant/scotty_business/self_repair.py`: bounded health inspection and three narrow repairs over Scotty-owned state only.
 - `assistant/scotty_business/approvals.py`: SQLite proposal state machine with `BEGIN IMMEDIATE`, version compare-and-set, immutable fields, nonce claims, crash recovery, and reconciliation states.
 - `assistant/scotty_business/reminders.py`: tuple-scoped private reminders with atomic claims and no ambiguous retry.
 - `assistant/scotty_business/adapters/`: typed, versioned Discord, Trello, GoHighLevel v3, and RentCast v1 adapters over a bounded standard-library HTTP transport.
@@ -57,6 +67,7 @@ Provider reference authorities:
 - GoHighLevel conversations v3: https://marketplace.gohighlevel.com/docs/ghl/conversations/send-a-new-message and https://marketplace.gohighlevel.com/docs/ghl/conversations/get-messages
 - RentCast property data and AVMs: https://developers.rentcast.io/reference/property-data and https://developers.rentcast.io/reference/property-valuation
 - Discord channels/messages: https://discord.com/developers/docs/resources/channel
+- Google Workspace APIs: https://developers.google.com/workspace and https://developers.google.com/identity/protocols/oauth2/native-app
 
 ## Verify
 
