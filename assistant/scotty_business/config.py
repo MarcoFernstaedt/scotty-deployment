@@ -57,6 +57,24 @@ class TrelloScope:
     custom_field_ids: tuple[str, ...]
 
 
+GOOGLE_OAUTH_SCOPES: tuple[str, ...] = (
+    "openid",
+    "email",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/contacts",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleWorkspaceScope:
+    account_email: str
+    oauth_scopes: tuple[str, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     version: int
@@ -67,6 +85,7 @@ class RuntimeConfig:
     trello: TrelloScope | None = None
     ghl_location_id: str | None = None
     rentcast_endpoints: tuple[str, ...] = ()
+    google_workspace: GoogleWorkspaceScope | None = None
 
     def client_discord_destinations(self) -> tuple[str, ...]:
         """Every Discord destination a client-visible tool may ever reach."""
@@ -133,6 +152,7 @@ class RuntimeConfig:
             trello=_trello(raw.get("trello")),
             ghl_location_id=_ghl(raw.get("ghl")),
             rentcast_endpoints=_rentcast(raw.get("rentcast")),
+            google_workspace=_google_workspace(raw.get("google_workspace")),
         )
 
 
@@ -165,6 +185,24 @@ def _rentcast(value: object) -> tuple[str, ...]:
     if any(not endpoint.startswith("/v1/") or ".." in endpoint for endpoint in endpoints):
         raise ConfigError("RentCast endpoints must be fixed /v1 paths")
     return endpoints
+
+
+def _google_workspace(value: object) -> GoogleWorkspaceScope | None:
+    if value is None:
+        return None
+    raw = _mapping(value, "google_workspace")
+    if set(raw) != {"account_email", "oauth_scopes"}:
+        raise ConfigError("Google Workspace must contain exactly account_email and oauth_scopes")
+    scopes = _texts(raw.get("oauth_scopes"), "google_workspace.oauth_scopes")
+    if set(scopes) != set(GOOGLE_OAUTH_SCOPES) or len(scopes) != len(GOOGLE_OAUTH_SCOPES):
+        raise ConfigError("Google OAuth scopes must equal the full Workspace product scope set")
+    account = _text(raw.get("account_email"), "google_workspace.account_email")
+    if "@" not in account or account.startswith("@") or account.endswith("@"):
+        raise ConfigError("Google Workspace account must be an email address")
+    return GoogleWorkspaceScope(
+        account_email=account,
+        oauth_scopes=scopes,
+    )
 
 
 def _maintainer_route(value: object, principals: Sequence[Principal]) -> MaintainerRoute:

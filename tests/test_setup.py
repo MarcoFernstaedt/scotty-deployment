@@ -301,7 +301,10 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
             private = json.loads(private_path.read_text(encoding="utf-8"))
-            self.assertEqual(private["addons"], ["discord", "trello", "ghl", "rentcast"])
+            self.assertEqual(
+                private["addons"],
+                ["discord", "trello", "ghl", "rentcast", "google_workspace"],
+            )
             self.assertNotIn("secret", private_path.read_text(encoding="utf-8"))
             self.assertIn(
                 "SCOTTY_GHL_PRIVATE_TOKEN=ghl-secret", env_path.read_text(encoding="utf-8")

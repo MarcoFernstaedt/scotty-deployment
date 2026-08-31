@@ -26,7 +26,7 @@ ROUTE_PROFILE = "scotty-maintainer"
 def private_mapping(**overrides: object) -> dict[str, object]:
     mapping: dict[str, object] = {
         "version": 1,
-        "addons": ["discord", "trello", "ghl", "rentcast"],
+        "addons": ["discord", "trello", "ghl", "rentcast", "google_workspace"],
         "principals": {
             "main_operator": {
                 "guild_id": CLIENT_GUILD,

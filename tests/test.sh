@@ -20,8 +20,8 @@ set -e
 [[ $nonroot_rc == 1 && $nonroot_output == *'must run as root'* ]] || fail 'non-root preflight did not fail closed'
 [[ ! -e /srv/Scotty ]] || fail 'non-root preflight mutated /srv/Scotty'
 
-bash -n install.sh firewall/scotty-egress-guard tests/test.sh tests/test_firewall_cleanup.sh tests/test_err_traps.sh tests/test_symlink_preflight.sh
-shellcheck -x install.sh firewall/scotty-egress-guard tests/test.sh tests/test_firewall_cleanup.sh tests/test_err_traps.sh tests/test_symlink_preflight.sh
+bash -n install.sh scotty-start firewall/scotty-egress-guard tests/test.sh tests/test_firewall_cleanup.sh tests/test_err_traps.sh tests/test_symlink_preflight.sh
+shellcheck -x install.sh scotty-start firewall/scotty-egress-guard tests/test.sh tests/test_firewall_cleanup.sh tests/test_err_traps.sh tests/test_symlink_preflight.sh
 python3 -m compileall -q assistant tests tools
 python3 -m py_compile setup-scotty
 python3 -m unittest discover -s tests -p 'test_*.py' -v

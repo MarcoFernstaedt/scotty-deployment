@@ -66,7 +66,7 @@ class HttpTransport:
         json_body: Mapping[str, object] | None = None,
     ) -> HttpResponse:
         upper = method.upper()
-        if upper not in {"GET", "POST", "PUT"}:
+        if upper not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise ProviderError("HTTP method is not permitted")
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -108,7 +108,7 @@ class HttpTransport:
                 ) from None
             return HttpResponse(int(exc.code), {}, _parse_json(raw))
         except (TimeoutError, urllib.error.URLError):
-            if upper in {"POST", "PUT"}:
+            if upper in {"POST", "PUT", "PATCH", "DELETE"}:
                 raise AmbiguousEffectError(
                     "provider mutation outcome is unknown; reconcile before any retry"
                 ) from None

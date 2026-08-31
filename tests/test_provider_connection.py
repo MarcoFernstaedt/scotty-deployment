@@ -83,7 +83,7 @@ class ProviderConnectionTests(unittest.TestCase):
             self.assertEqual(set(result["providers"]), set(PROVIDERS))
             self.assertEqual(result["providers"]["ghl"]["status"], NOT_CONNECTED)
 
-    def test_google_workspace_is_reported_without_consuming_an_add_on_slot(self) -> None:
+    def test_google_workspace_is_reported_as_a_release_add_on(self) -> None:
         with runtime(**_ALL_SECRETS) as instance:
             result = instance.handle_read(
                 operator(), {"operation": "provider_setup", "provider": "google_workspace"}
@@ -92,8 +92,8 @@ class ProviderConnectionTests(unittest.TestCase):
             self.assertEqual(result["status"], NOT_CONNECTED)
             status = instance.handle_read(operator(), {"operation": "status"})
             assert isinstance(status, dict)
-            self.assertNotIn("google_workspace", status["addons"])
-            self.assertEqual(status["addon_slots_remaining"], 2)
+            self.assertIn("google_workspace", status["addons"])
+            self.assertEqual(status["addon_slots_remaining"], 1)
 
     def test_reading_an_unconnected_provider_is_denied_rather_than_attempted(self) -> None:
         with (

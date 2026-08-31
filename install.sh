@@ -9,6 +9,7 @@ readonly OPERATOR_DIR=${TARGET_ROOT}/operator
 readonly DATA_DIR=${TARGET_ROOT}/data
 readonly COMPOSE_FILE=${OPERATOR_DIR}/compose.yaml
 readonly SETUP_BIN=/srv/Scotty/operator/setup-scotty
+readonly START_BIN=/usr/local/sbin/scotty-start
 readonly PLUGINS_DIR=/srv/Scotty/data/plugins
 readonly PLUGIN_DIR=/srv/Scotty/data/plugins/scotty_business
 readonly PLUGIN_ADAPTERS_DIR=/srv/Scotty/data/plugins/scotty_business/adapters
@@ -44,6 +45,7 @@ CREATED_PLUGIN=0
 CREATED_PLUGIN_ADAPTERS=0
 INSTALLED_COMPOSE=0
 INSTALLED_SETUP=0
+INSTALLED_START=0
 INSTALLED_GUARD=0
 INSTALLED_UNIT=0
 RELOADED_SYSTEMD=0
@@ -60,6 +62,7 @@ readonly -a PLUGIN_FILES=(
   "calculations.py"
   "config.py"
   "guidance.py"
+  "google_oauth.py"
   "identity.py"
   "ingress.py"
   "policy.py"
@@ -73,6 +76,7 @@ readonly -a PLUGIN_FILES=(
   "adapters/__init__.py"
   "adapters/discord.py"
   "adapters/ghl.py"
+  "adapters/google_workspace.py"
   "adapters/http.py"
   "adapters/records.py"
   "adapters/rentcast.py"
@@ -329,6 +333,16 @@ cleanup() {
       (( remove_rc == 0 )) || rc=1
     fi
   fi
+  if (( INSTALLED_START )); then
+    if [[ -L $START_BIN ]]; then
+      printf 'install: refusing to remove replacement symlink: %s\n' "$START_BIN" >&2
+      rc=1
+    else
+      rm -f -- "$START_BIN"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
   for (( index=${#INSTALLED_PLUGIN_FILES[@]}-1; index>=0; index-- )); do
     installed_file=${INSTALLED_PLUGIN_FILES[index]}
     if [[ $installed_file != "$DATA_DIR/"* || -L $installed_file ]]; then
@@ -475,6 +489,7 @@ preflight() {
     "$DATA_DIR"
     "$COMPOSE_FILE"
     "$SETUP_BIN"
+    "$START_BIN"
     "$GUARD_BIN"
     "$GUARD_UNIT"
   )
@@ -484,6 +499,7 @@ preflight() {
   done
   require_safe_ancestors "$TARGET_ROOT"
   require_safe_ancestors "$GUARD_BIN"
+  require_safe_ancestors "$START_BIN"
   require_safe_ancestors "$GUARD_UNIT"
 
   command_output containers docker container ls -a --format '{{.Names}}'
@@ -537,8 +553,8 @@ verify_install() {
 
   command_output actual stat -c '%u:%g:%a' "$TARGET_ROOT" "$OPERATOR_DIR" "$DATA_DIR" "$COMPOSE_FILE" "$GUARD_BIN" "$GUARD_UNIT"
   [[ $actual == $'0:0:700\n0:0:700\n10000:10000:700\n0:0:600\n0:0:755\n0:0:644' ]] || die "ownership/mode mismatch: ${actual}"
-  command_output actual stat -c '%u:%g:%a' "$SETUP_BIN" "$PLUGIN_DIR/plugin.yaml" "$PLUGIN_DIR/runtime.py"
-  [[ $actual == $'0:0:700\n10000:10000:600\n10000:10000:600' ]] || die "assistant package ownership/mode mismatch: ${actual}"
+  command_output actual stat -c '%u:%g:%a' "$SETUP_BIN" "$START_BIN" "$PLUGIN_DIR/plugin.yaml" "$PLUGIN_DIR/runtime.py"
+  [[ $actual == $'0:0:700\n0:0:755\n10000:10000:600\n10000:10000:600' ]] || die "assistant package ownership/mode mismatch: ${actual}"
 
   for served_profile in "${SERVED_PROFILES[@]}"; do
     command_output actual stat -c '%u:%g:%a' "${PROFILES_DIR}/${served_profile}"
@@ -573,6 +589,7 @@ install_owned CREATED_PLUGIN "$PLUGIN_DIR" -d -o 10000 -g 10000 -m 0700 "$PLUGIN
 install_owned CREATED_PLUGIN_ADAPTERS "$PLUGIN_ADAPTERS_DIR" -d -o 10000 -g 10000 -m 0700 "$PLUGIN_ADAPTERS_DIR"
 install_owned INSTALLED_COMPOSE "$COMPOSE_FILE" -o root -g root -m 0600 "$SOURCE_DIR/compose.yaml" "$COMPOSE_FILE"
 install_owned INSTALLED_SETUP "$SETUP_BIN" -o root -g root -m 0700 "$SOURCE_DIR/setup-scotty" "$SETUP_BIN"
+install_owned INSTALLED_START "$START_BIN" -o root -g root -m 0755 "$SOURCE_DIR/scotty-start" "$START_BIN"
 for plugin_file in "${PLUGIN_FILES[@]}"; do
   install_plugin_file "$plugin_file"
 done

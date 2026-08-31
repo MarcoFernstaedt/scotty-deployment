@@ -33,6 +33,7 @@ class InstallerPackageTests(unittest.TestCase):
                 self.assertIn(f'"{relative}"', installer)
         self.assertIn("/srv/Scotty/data/plugins/scotty_business", installer)
         self.assertIn("/srv/Scotty/operator/setup-scotty", installer)
+        self.assertIn("/usr/local/sbin/scotty-start", installer)
         self.assertNotRegex(installer, r"docker compose .*\b(?:up|start|run)\b")
 
     def test_installer_creates_one_home_per_served_profile(self) -> None:

@@ -14,6 +14,7 @@ from typing import Literal, Protocol, overload
 from .adapters import (
     DiscordAdapter,
     GHLAdapter,
+    GoogleWorkspaceAdapter,
     HttpTransport,
     ProviderRecord,
     RentCastAdapter,
@@ -21,6 +22,7 @@ from .adapters import (
 )
 from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
+from .google_oauth import GoogleOAuthError, GoogleTokenStore
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
@@ -127,6 +129,57 @@ class UnconnectedProvider:
         raise self._deny()
 
     def fetch(self, endpoint: str, query: Mapping[str, object]) -> ProviderRecord:
+        raise self._deny()
+
+    def get_gmail_message(self, message_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def search_gmail(self, query: str, *, max_results: int = 50) -> Sequence[ProviderRecord]:
+        raise self._deny()
+
+    def create_gmail_draft(self, raw_base64url: str) -> ProviderRecord:
+        raise self._deny()
+
+    def get_calendar_event(self, calendar_id: str, event_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def list_calendar_events(
+        self,
+        calendar_id: str,
+        *,
+        query: str = "",
+        time_min: str | None = None,
+        time_max: str | None = None,
+        max_results: int = 50,
+    ) -> Sequence[ProviderRecord]:
+        raise self._deny()
+
+    def get_drive_file(self, file_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def search_drive(self, query: str, *, max_results: int = 50) -> Sequence[ProviderRecord]:
+        raise self._deny()
+
+    def get_document(self, document_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def get_spreadsheet(self, spreadsheet_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def get_google_contact(self, resource_name: str) -> ProviderRecord:
+        raise self._deny()
+
+    def list_contacts(self, *, page_size: int = 100) -> Sequence[ProviderRecord]:
+        raise self._deny()
+
+    def mutate(
+        self, operation: str, resource_id: str, payload: Mapping[str, object]
+    ) -> ProviderRecord:
+        raise self._deny()
+
+    def execute_routine(
+        self, operation: str, resource_id: str, payload: Mapping[str, object]
+    ) -> ProviderRecord:
         raise self._deny()
 
 
@@ -241,6 +294,7 @@ class Runtime:
             "trello": bool(trello_key and trello_token and self.config.trello is not None),
             "ghl": bool(ghl_token and self.config.ghl_location_id is not None),
             "rentcast": bool(rentcast_key and self.config.rentcast_endpoints),
+            "google_workspace": False,
         }
         trello_scope = self.config.trello
         location_id = self.config.ghl_location_id
@@ -261,6 +315,22 @@ class Runtime:
             else UnconnectedProvider("RentCast")
         )
         state_dir = home / "scotty"
+        google_scope = self.config.google_workspace
+        google_store = GoogleTokenStore(state_dir / "google-oauth.json")
+        google_token = None
+        if google_scope is not None and google_store.ready(
+            google_scope.oauth_scopes, google_scope.account_email
+        ):
+            try:
+                google_token = google_store.read()
+            except GoogleOAuthError:
+                google_token = None
+        self.connected["google_workspace"] = bool(google_scope is not None and google_token)
+        self.google_workspace = (
+            GoogleWorkspaceAdapter(transport, google_token.access_token, google_scope)
+            if google_scope is not None and google_token is not None
+            else UnconnectedProvider("Google Workspace")
+        )
         self.state_dir = state_dir
         self.approvals = ApprovalStore(state_dir / "approvals.db")
         self.approvals.initialize()
@@ -275,6 +345,9 @@ class Runtime:
             ghl=self.ghl,
             rentcast=self.rentcast,
             discord=self.discord,
+            google_workspace=(
+                self.google_workspace if self.connected["google_workspace"] else None
+            ),
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
 
@@ -308,6 +381,64 @@ class Runtime:
             }
         if operation == "provider_setup":
             return self._provider_setup(args)
+        if operation == "google_workspace":
+            google_operation = _text(args, "google_operation")
+            payload = _object(args, "payload", optional=True)
+            resource_id = _text(args, "resource_id", optional=True) or "new"
+            if google_operation in {"search_gmail", "search_drive"}:
+                query = payload.get("query", "")
+                maximum = payload.get("max_results", 50)
+                if type(query) is not str or type(maximum) is not int:
+                    raise ValueError("Google search query or max_results is malformed")
+                records = (
+                    self.google_workspace.search_gmail(query, max_results=maximum)
+                    if google_operation == "search_gmail"
+                    else self.google_workspace.search_drive(query, max_results=maximum)
+                )
+                return [_record_json(item) for item in records]
+            if google_operation == "list_calendar_events":
+                calendar_id = payload.get("calendar_id", "primary")
+                maximum = payload.get("max_results", 50)
+                if type(calendar_id) is not str or type(maximum) is not int:
+                    raise ValueError("Google Calendar list request is malformed")
+                return [
+                    _record_json(item)
+                    for item in self.google_workspace.list_calendar_events(
+                        calendar_id,
+                        query=str(payload.get("query", "")),
+                        time_min=(str(payload["time_min"]) if "time_min" in payload else None),
+                        time_max=(str(payload["time_max"]) if "time_max" in payload else None),
+                        max_results=maximum,
+                    )
+                ]
+            if google_operation == "get_calendar_event":
+                if "/" not in resource_id:
+                    raise ValueError("calendar event resource must be calendar/event")
+                calendar_id, event_id = resource_id.split("/", 1)
+                return _record_json(
+                    self.google_workspace.get_calendar_event(calendar_id, event_id)
+                )
+            if google_operation == "list_contacts":
+                maximum = payload.get("max_results", 100)
+                if type(maximum) is not int:
+                    raise ValueError("Google Contacts max_results is malformed")
+                return [
+                    _record_json(item)
+                    for item in self.google_workspace.list_contacts(page_size=maximum)
+                ]
+            getters = {
+                "get_gmail_message": self.google_workspace.get_gmail_message,
+                "get_drive_file": self.google_workspace.get_drive_file,
+                "get_document": self.google_workspace.get_document,
+                "get_spreadsheet": self.google_workspace.get_spreadsheet,
+                "get_contact": self.google_workspace.get_contact,
+            }
+            getter = getters.get(google_operation)
+            if getter is not None:
+                return _record_json(getter(resource_id))
+            return _record_json(
+                self.google_workspace.execute_routine(google_operation, resource_id, payload)
+            )
         if operation == "trello_card":
             return _record_json(self.trello.get_card(_text(args, "card_id")))
         if operation == "trello_cards":
@@ -330,6 +461,26 @@ class Runtime:
         if operation == "rentcast":
             endpoint = _text(args, "endpoint")
             return _record_json(self.rentcast.fetch(endpoint, _object(args, "query")))
+        if operation == "google_gmail_message":
+            return _record_json(self.google_workspace.get_gmail_message(_text(args, "message_id")))
+        if operation == "google_gmail_draft":
+            return _record_json(self.google_workspace.create_gmail_draft(_text(args, "raw")))
+        if operation == "google_calendar_event":
+            return _record_json(
+                self.google_workspace.get_calendar_event(
+                    _text(args, "calendar_id"), _text(args, "event_id")
+                )
+            )
+        if operation == "google_drive_file":
+            return _record_json(self.google_workspace.get_drive_file(_text(args, "file_id")))
+        if operation == "google_document":
+            return _record_json(self.google_workspace.get_document(_text(args, "document_id")))
+        if operation == "google_spreadsheet":
+            return _record_json(
+                self.google_workspace.get_spreadsheet(_text(args, "spreadsheet_id"))
+            )
+        if operation == "google_contact":
+            return _record_json(self.google_workspace.get_contact(_text(args, "resource_name")))
         raise ValueError("read operation is not permitted")
 
     def handle_propose(self, principal: Principal, args: Mapping[str, object]) -> object:
@@ -362,6 +513,13 @@ class Runtime:
         elif operation == "discord_announcement":
             proposal = self.service.propose_discord_announcement(
                 principal, _text(args, "channel_id"), _text(args, "content")
+            )
+        elif operation == "google_workspace_write":
+            proposal = self.service.propose_google_workspace_write(
+                principal,
+                _text(args, "google_operation"),
+                _text(args, "resource_id"),
+                _object(args, "payload"),
             )
         else:
             raise ValueError("proposal operation is not permitted")

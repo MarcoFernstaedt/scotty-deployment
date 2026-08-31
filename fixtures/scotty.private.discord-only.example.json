@@ -1,10 +1,11 @@
 {
-  "_comment": "Synthetic Discord-only private runtime configuration. Trello, GoHighLevel and RentCast are absent, so Scotty starts with each reported as not connected.",
+  "_comment": "Synthetic Discord-only private runtime configuration. Trello, GoHighLevel, RentCast and Google Workspace are absent, so Scotty starts with each reported as not connected.",
   "addons": [
     "discord",
     "trello",
     "ghl",
-    "rentcast"
+    "rentcast",
+    "google_workspace"
   ],
   "discord": {
     "announcement_channel_ids": [

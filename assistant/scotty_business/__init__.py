@@ -54,7 +54,7 @@ def _schema(
 
 _READ_SCHEMA = _schema(
     "scotty_read",
-    "Read only configured Scotty business resources or bounded status.",
+    "Read resources, perform routine reversible Workspace work, or inspect and repair Scotty-owned state.",
     {
         "operation": {
             "type": "string",
@@ -67,6 +67,16 @@ _READ_SCHEMA = _schema(
                 "ghl_conversations",
                 "ghl_message",
                 "rentcast",
+                "google_gmail_message",
+                "google_gmail_draft",
+                "google_calendar_event",
+                "google_drive_file",
+                "google_document",
+                "google_spreadsheet",
+                "google_contact",
+                "google_workspace",
+                "self_health",
+                "self_repair",
             ],
         },
         "card_id": {"type": "string"},
@@ -79,6 +89,33 @@ _READ_SCHEMA = _schema(
         },
         "endpoint": {"type": "string"},
         "query": {"type": "object", "additionalProperties": True},
+        "raw": {"type": "string", "maxLength": 65000},
+        "calendar_id": {"type": "string"},
+        "event_id": {"type": "string"},
+        "file_id": {"type": "string"},
+        "document_id": {"type": "string"},
+        "spreadsheet_id": {"type": "string"},
+        "resource_name": {"type": "string"},
+        "google_operation": {
+            "type": "string",
+            "enum": [
+                "search_gmail", "get_gmail_message", "search_drive", "get_drive_file",
+                "get_document", "get_spreadsheet", "list_calendar_events",
+                "get_calendar_event", "list_contacts", "get_contact",
+                "gmail_modify_labels", "gmail_create_draft", "gmail_update_draft",
+                "calendar_create_event", "calendar_update_event", "calendar_cancel_event",
+                "drive_create_file", "drive_update_file", "drive_move_file",
+                "drive_trash_file", "docs_create", "docs_batch_update", "sheets_create",
+                "sheets_batch_update", "sheets_update_values", "contacts_create",
+                "contacts_update"
+            ],
+        },
+        "resource_id": {"type": "string"},
+        "payload": {"type": "object", "additionalProperties": True},
+        "repair_action": {
+            "type": "string",
+            "enum": ["recover_workflows", "rebuild_cache", "repair_state_permissions"],
+        },
     },
     ["operation"],
 )
@@ -97,6 +134,7 @@ _PROPOSE_SCHEMA = _schema(
                 "trello_merge",
                 "ghl_sms",
                 "discord_announcement",
+                "google_workspace_write",
             ],
         },
         "card_id": {"type": "string"},
@@ -110,6 +148,19 @@ _PROPOSE_SCHEMA = _schema(
         "body": {"type": "string", "maxLength": 1600},
         "channel_id": {"type": "string"},
         "content": {"type": "string", "maxLength": 2000},
+        "google_operation": {
+            "type": "string",
+            "enum": [
+                "gmail_send_draft",
+                "calendar_create_event",
+                "calendar_update_event",
+                "drive_delete_permanently",
+                "drive_change_permissions",
+                "contacts_delete",
+            ],
+        },
+        "resource_id": {"type": "string"},
+        "payload": {"type": "object", "additionalProperties": True},
     },
     ["operation"],
 )

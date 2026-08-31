@@ -76,7 +76,9 @@ class ConfigTests(unittest.TestCase):
             {principal.role for principal in config.principals},
             {Role.MAIN_OPERATOR, Role.EMPLOYEE},
         )
-        self.assertEqual(config.addons, ("discord", "trello", "ghl", "rentcast"))
+        self.assertEqual(
+            config.addons, ("discord", "trello", "ghl", "rentcast", "google_workspace")
+        )
 
     def test_a_client_guild_maintainer_principal_is_rejected(self) -> None:
         mapping = synthetic.private_mapping()

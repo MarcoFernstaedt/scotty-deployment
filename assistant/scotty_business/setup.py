@@ -11,9 +11,15 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 from .adapters.http import HttpTransport, ProviderError, RedactedMapping
+from .config import GOOGLE_OAUTH_SCOPES
+from .google_oauth import (
+    GoogleOAuthError,
+    GoogleTokenStore,
+    authorize_installed_app,
+)
 from .policy import Role
 from .provisioning import (
     BOT_ALLOW,
@@ -66,10 +72,142 @@ OPTIONAL_SECRETS = (
 _SAFE_SECRET = re.compile(r"[A-Za-z0-9._:/+\-=]+")
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9._:/+\-]+")
 _SAFE_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/+,\-=]+")
+_PREFILL_FIELDS = frozenset(
+    {
+        "model_provider",
+        "model_name",
+        "guild_id",
+        "operator_channel_id",
+        "operator_user_id",
+        "employee_channel_id",
+        "employee_user_id",
+        "announcement_channel_ids",
+        "route_guild_id",
+        "route_channel_id",
+        "route_user_id",
+        "trello",
+        "ghl_location_id",
+        "rentcast_endpoints",
+        "google_workspace",
+    }
+)
+_SECRET_FIELD = re.compile(
+    r"(?:secret|token|password|credential|api[_-]?key|authorization|code)", re.I
+)
 
 
 class SetupError(RuntimeError):
     pass
+
+
+def load_prefill(path: Path, *, owner_uid: int = 0) -> Mapping[str, object]:
+    """Load an owner-only, non-secret setup prefill document."""
+
+    if path.is_symlink() or not path.is_file():
+        raise SetupError("setup prefill is absent or unsafe")
+    metadata = path.stat()
+    if metadata.st_uid != owner_uid or metadata.st_mode & 0o077:
+        raise SetupError("setup prefill must be owner-only")
+    try:
+        raw_bytes = path.read_bytes()
+        if len(raw_bytes) > 65_536:
+            raise ValueError
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SetupError("setup prefill is malformed") from exc
+    if not isinstance(raw, dict) or set(raw) - _PREFILL_FIELDS:
+        raise SetupError("setup prefill contains unsupported fields")
+
+    def reject_secrets(value: object) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if type(key) is not str or _SECRET_FIELD.search(key):
+                    raise SetupError("setup prefill must never contain credentials")
+                reject_secrets(item)
+        elif isinstance(value, list):
+            for item in value:
+                reject_secrets(item)
+        elif type(value) not in {str, bool, int} and value is not None:
+            raise SetupError("setup prefill contains an unsupported value")
+
+    reject_secrets(raw)
+    return raw
+
+
+def _prefill_text(value: object, field: str) -> str:
+    if type(value) is not str or not value.strip() or len(value) > 256:
+        raise SetupError(f"{field} must be a bounded non-empty string")
+    return value.strip()
+
+
+def _prefill_texts(value: object, field: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise SetupError(f"{field} must be a list")
+    result = tuple(_prefill_text(item, f"{field}[]") for item in value)
+    if (not result and not allow_empty) or len(result) != len(set(result)):
+        raise SetupError(f"{field} is empty or contains duplicates")
+    return result
+
+
+def _prefill_mapping(value: object, field: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise SetupError(f"{field} must be an object")
+    return value
+
+
+def apply_prefill(inputs: SetupInputs, prefill: Mapping[str, object]) -> SetupInputs:
+    """Apply only validated non-secret setup values to collected answers."""
+
+    scalar_fields = {
+        "model_provider",
+        "model_name",
+        "guild_id",
+        "operator_channel_id",
+        "operator_user_id",
+        "employee_channel_id",
+        "employee_user_id",
+        "route_guild_id",
+        "route_channel_id",
+        "route_user_id",
+        "ghl_location_id",
+    }
+    changes: dict[str, object] = {}
+    for field in scalar_fields:
+        if field in prefill:
+            changes[field] = _prefill_text(prefill[field], f"prefill.{field}")
+    list_fields = {
+        "announcement_channel_ids": "announcement_channel_ids",
+        "rentcast_endpoints": "rentcast_endpoints",
+    }
+    for source, target in list_fields.items():
+        if source in prefill:
+            changes[target] = _prefill_texts(prefill[source], f"prefill.{source}", allow_empty=True)
+    trello = prefill.get("trello")
+    if trello is not None:
+        raw = _prefill_mapping(trello, "prefill.trello")
+        if set(raw) != {"board_id", "list_ids", "label_ids", "custom_field_ids"}:
+            raise SetupError("setup prefill Trello scope is malformed")
+        changes.update(
+            trello_board_id=_prefill_text(raw["board_id"], "prefill.trello.board_id"),
+            trello_list_ids=_prefill_texts(raw["list_ids"], "prefill.trello.list_ids"),
+            trello_label_ids=_prefill_texts(
+                raw["label_ids"], "prefill.trello.label_ids", allow_empty=True
+            ),
+            trello_custom_field_ids=_prefill_texts(
+                raw["custom_field_ids"], "prefill.trello.custom_field_ids", allow_empty=True
+            ),
+        )
+    google = prefill.get("google_workspace")
+    if google is not None:
+        raw = _prefill_mapping(google, "prefill.google_workspace")
+        if set(raw) != {"account_email"}:
+            raise SetupError("setup prefill Google Workspace account is malformed")
+        changes.update(
+            google_account_email=_prefill_text(
+                raw["account_email"], "prefill.google.account_email"
+            ),
+        )
+    return replace(inputs, **cast(Any, changes))
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +229,7 @@ class SetupInputs:
     trello_label_ids: tuple[str, ...] = ()
     trello_custom_field_ids: tuple[str, ...] = ()
     ghl_location_id: str = ""
+    google_account_email: str = ""
     provision_channel_names: Mapping[str, str] | None = None
 
     @property
@@ -218,6 +357,9 @@ def collect_inputs(
         else ()
     )
     location_id = _optional(input_fn, "GoHighLevel location ID (blank to connect later): ")
+    google_account = _optional(
+        input_fn, "Google Workspace account email (blank to connect later): "
+    )
 
     secrets: dict[str, str] = {}
     if provider != CODEX_PROVIDER:
@@ -267,9 +409,78 @@ def collect_inputs(
         trello_label_ids=label_ids,
         trello_custom_field_ids=custom_fields,
         ghl_location_id=location_id,
+        google_account_email=google_account,
         secrets=secrets,
         provision_channel_names=provision_names,
     )
+
+
+def collect_inputs_from_prefill(
+    prefill: Mapping[str, object],
+    *,
+    hidden_fn: Callable[[str], str] = getpass.getpass,
+    environ: Mapping[str, str] | None = None,
+) -> SetupInputs:
+    """Collect only hidden credentials when a complete owner-only prefill exists."""
+
+    environ = os.environ if environ is None else environ
+    required = {
+        "model_provider", "model_name", "guild_id", "operator_channel_id",
+        "operator_user_id", "employee_channel_id", "employee_user_id",
+        "announcement_channel_ids", "route_guild_id", "route_channel_id", "route_user_id",
+    }
+    if not required.issubset(prefill):
+        raise SetupError("setup prefill is incomplete; add the missing non-secret fields")
+    provider = _prefill_text(prefill["model_provider"], "prefill.model_provider").lower()
+    if provider not in _MODEL_PROVIDERS:
+        raise SetupError("prefilled model provider is unsupported")
+    base = SetupInputs(
+        model_provider=provider,
+        model_name=_prefill_text(prefill["model_name"], "prefill.model_name"),
+        guild_id=_prefill_text(prefill["guild_id"], "prefill.guild_id"),
+        operator_channel_id=_prefill_text(
+            prefill["operator_channel_id"], "prefill.operator_channel_id"
+        ),
+        operator_user_id=_prefill_text(prefill["operator_user_id"], "prefill.operator_user_id"),
+        employee_channel_id=_prefill_text(
+            prefill["employee_channel_id"], "prefill.employee_channel_id"
+        ),
+        employee_user_id=_prefill_text(prefill["employee_user_id"], "prefill.employee_user_id"),
+        route_guild_id=_prefill_text(prefill["route_guild_id"], "prefill.route_guild_id"),
+        route_channel_id=_prefill_text(
+            prefill["route_channel_id"], "prefill.route_channel_id"
+        ),
+        route_user_id=_prefill_text(prefill["route_user_id"], "prefill.route_user_id"),
+        announcement_channel_ids=_prefill_texts(
+            prefill["announcement_channel_ids"],
+            "prefill.announcement_channel_ids",
+            allow_empty=True,
+        ),
+        secrets={},
+    )
+    configured = apply_prefill(base, prefill)
+    secrets_map: dict[str, str] = {}
+    if provider != CODEX_PROVIDER:
+        name = _MODEL_SECRET_ENV[provider]
+        secrets_map[name] = _environment_secret(environ, name) or _hidden(
+            hidden_fn, "Model API credential (hidden): "
+        )
+    prompts = (
+        ("DISCORD_BOT_TOKEN", "Discord bot token (hidden): "),
+        ("SCOTTY_TRELLO_API_KEY", "Trello API key (hidden, blank to connect later): "),
+        ("SCOTTY_TRELLO_TOKEN", "Trello token (hidden, blank to connect later): "),
+        ("SCOTTY_GHL_PRIVATE_TOKEN", "GoHighLevel token (hidden, blank to connect later): "),
+        ("SCOTTY_RENTCAST_API_KEY", "RentCast API key (hidden, blank to connect later): "),
+    )
+    for name, prompt in prompts:
+        value = _environment_secret(environ, name)
+        if not value:
+            value = _hidden(hidden_fn, prompt) if name in REQUIRED_SECRETS else _hidden_optional(hidden_fn, prompt)
+        if value:
+            secrets_map[name] = value
+    if not secrets_map.get("DISCORD_BOT_TOKEN"):
+        raise SetupError("the Discord bot token is required for initial setup")
+    return replace(configured, secrets=secrets_map)
 
 
 class DiscordSetupClient:
@@ -640,7 +851,7 @@ def private_mapping(inputs: SetupInputs) -> dict[str, object]:
     _require_provisioned(inputs)
     mapping: dict[str, object] = {
         "version": 1,
-        "addons": ["discord", "trello", "ghl", "rentcast"],
+        "addons": ["discord", "trello", "ghl", "rentcast", "google_workspace"],
         "principals": {
             "main_operator": {
                 "guild_id": inputs.guild_id,
@@ -674,6 +885,11 @@ def private_mapping(inputs: SetupInputs) -> dict[str, object]:
     if inputs.secrets.get("SCOTTY_RENTCAST_API_KEY"):
         mapping["rentcast"] = {
             "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
+        }
+    if inputs.google_account_email:
+        mapping["google_workspace"] = {
+            "account_email": inputs.google_account_email,
+            "oauth_scopes": list(GOOGLE_OAUTH_SCOPES),
         }
     return mapping
 
@@ -895,12 +1111,32 @@ def main() -> int:
         raise SetupError("run the local setup command as root")
     _require_stopped_container()
     inputs = collect_inputs()
+    prefill_path = Path("/srv/Scotty/operator/setup-prefill.json")
+    if prefill_path.exists():
+        inputs = apply_prefill(inputs, load_prefill(prefill_path))
     token = inputs.secrets["DISCORD_BOT_TOKEN"]
     inputs = provision_private_channels(inputs, token=token)
     reader = DiscordSetupClient(token)
     validate_discord_scope(inputs, reader)
     validate_maintainer_route(inputs, reader)
     write_private_state(inputs)
+    if inputs.google_account_email:
+        store = GoogleTokenStore(_DATA_DIR / "scotty" / "google-oauth.json")
+        if not store.ready(GOOGLE_OAUTH_SCOPES, inputs.google_account_email):
+            try:
+                authorize_installed_app(
+                    Path("/srv/Scotty/operator/google-oauth-client.json"),
+                    store,
+                    GOOGLE_OAUTH_SCOPES,
+                )
+            except GoogleOAuthError as exc:
+                raise SetupError(
+                    "Google OAuth is incomplete; Scotty remains stopped until local browser consent succeeds"
+                ) from exc
+        if not store.ready(GOOGLE_OAUTH_SCOPES, inputs.google_account_email):
+            raise SetupError(
+                "Google OAuth account does not match the configured Workspace account"
+            )
     for step in next_steps(inputs):
         print(step)
     return 0

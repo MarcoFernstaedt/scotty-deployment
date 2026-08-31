@@ -138,21 +138,24 @@ _DEFINITIONS: Mapping[str, Mapping[str, object]] = {
     "google_workspace": {
         "display_name": "Google Workspace",
         "summary": (
-            "Google Workspace is guidance only in this release. It is not installed, it "
-            "holds no add-on slot, and Scotty cannot read or write anything in it yet. "
-            "Adding it later is a deployment decision, not something Scotty can do."
+            "Google Workspace is a bounded release capability for one configured account and "
+            "exact Gmail labels, calendars, Drive files, Docs, Sheets, and Contacts. Reads and "
+            "drafts are routine; every external send or write requires exact approval."
         ),
         "required_ids": (
-            "the Workspace domain",
-            "the service account or OAuth client that would be used",
+            "the configured Workspace account email",
+            "exact Gmail label and Calendar IDs",
+            "exact Drive file, Docs document, Sheets spreadsheet, and Contact resource IDs",
         ),
-        "required_scopes": ("read-only scopes first, chosen per surface when this is decided",),
+        "required_scopes": (
+            "the fixed Gmail modify, Calendar events, Drive file, Docs, Sheets, and Contacts scopes",
+            "no Admin SDK, broad Drive traversal, deletion, trash, sharing, or permission changes",
+        ),
         "steps": (
-            "Decide which Workspace surface is actually needed before any credential exists.",
-            "Confirm an add-on slot is free under the six-add-on deployment cap.",
-            "Create the project and consent screen in the Google Cloud console.",
-            "Wait for a maintainer-controlled deployment change; nothing here connects "
-            "Google Workspace on its own.",
+            "Create an OAuth client of type Desktop app in the Google Cloud console.",
+            "Place the downloaded client material only in the documented owner-only local path.",
+            "Run local setup and complete Google's installed-app browser consent.",
+            "Keep authorization codes and token state out of Discord, logs, and model context.",
         ),
     },
 }

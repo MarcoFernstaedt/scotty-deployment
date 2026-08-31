@@ -34,11 +34,15 @@ SKIP_WIZARD: Mapping[str, str] = {"action": "skip", "reason": "fixed-wizard"}
 FIXED_WIZARD_COMMAND = "Scotty, send Trent the setup wizard."
 SETUP_WIZARD = (
     "Welcome to Scotty by The Closing Room.\n"
-    "1. Use this private channel for your own requests.\n"
-    "2. Ask for Trello, GoHighLevel, or RentCast reads before proposing changes.\n"
-    "3. Scotty shows consequential actions for approval before execution.\n"
-    "4. Never paste credentials here. If one appears, rotate it and use local setup.\n"
-    "5. Property and financial analysis is preliminary; verify it with the appropriate "
+    "1. Use this private channel for your own requests and non-secret preferences.\n"
+    "2. Confirm which configured Discord channels, Trello board, Google Workspace "
+    "resources, GoHighLevel location, and RentCast reads you expect to use.\n"
+    "3. Google Workspace access uses provider-owned browser consent; credentials and "
+    "OAuth codes are entered only through local setup, never here.\n"
+    "4. Scotty shows external sends and writes for approval before execution.\n"
+    "5. Never paste credentials here. Scotty cannot accept them in Discord. If one "
+    "appears, rotate it and use local setup.\n"
+    "6. Property and financial analysis is preliminary; verify it with the appropriate "
     "qualified professional."
 )
 

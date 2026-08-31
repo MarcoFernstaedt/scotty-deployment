@@ -5,7 +5,7 @@ format-check:
 
 lint:
 	uvx ruff@0.12.9 check assistant tests tools setup-scotty
-	shellcheck -x install.sh firewall/scotty-egress-guard tests/*.sh
+	shellcheck -x install.sh scotty-start firewall/scotty-egress-guard tests/*.sh
 
 typecheck:
 	uvx mypy@1.17.1 assistant/scotty_business assistant/scotty_guard tools

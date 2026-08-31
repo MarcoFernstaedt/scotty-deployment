@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly CONTAINER=scotty
+readonly SETUP_COMMAND=${SCOTTY_SETUP_COMMAND:-/srv/Scotty/operator/setup-scotty}
+readonly GOOGLE_TOKEN=/srv/Scotty/data/scotty/google-oauth.json
+STARTED=0
+COMPLETED=0
+
+fail() {
+  printf 'scotty-start: %s\n' "$*" >&2
+  exit 1
+}
+
+recover() {
+  local rc=$?
+  if (( COMPLETED == 0 && STARTED == 1 )); then
+    docker stop "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+  if (( rc != 0 )); then
+    printf 'Recovery: correct the reported local prerequisite, then rerun sudo /usr/local/sbin/scotty-start.\n' >&2
+  fi
+  exit "$rc"
+}
+trap recover EXIT
+
+actual_euid=${SCOTTY_TEST_EUID:-$EUID}
+(( actual_euid == 0 )) || fail 'must run as root'
+command -v docker >/dev/null 2>&1 || fail 'Docker is unavailable'
+[[ -x $SETUP_COMMAND ]] || fail 'private setup command is unavailable'
+
+state="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
+[[ $state == false ]] || fail 'Scotty must exist and be stopped before startup'
+
+# Setup accepts non-secret prefill only from its fixed owner-only local path. All
+# credentials stay in hidden input/provider consent and never enter argv.
+"$SETUP_COMMAND"
+
+# The pinned runtime owns the Codex OAuth flow. It must run in the prepared
+# container because no second container or broad mount is allowed.
+docker start "$CONTAINER" >/dev/null
+STARTED=1
+docker exec -it "$CONTAINER" hermes auth add openai-codex
+
+if [[ -e /srv/Scotty/data/scotty/private.json ]] \
+  && grep -q '"google_workspace"' /srv/Scotty/data/scotty/private.json; then
+  [[ -f $GOOGLE_TOKEN && ! -L $GOOGLE_TOKEN ]] || fail 'Google OAuth is selected but incomplete'
+  [[ $(stat -c '%a' "$GOOGLE_TOKEN") == 600 ]] || fail 'Google OAuth token state is not owner-only'
+fi
+
+# Credential-free, non-sending runtime checks only.
+[[ $(docker inspect --format '{{.State.Running}}' "$CONTAINER") == true ]] \
+  || fail 'Scotty did not remain running'
+docker exec "$CONTAINER" hermes --help >/dev/null
+
+COMPLETED=1
+trap - EXIT
+printf 'Scotty is configured, validated, and running. No onboarding message was sent.\n'

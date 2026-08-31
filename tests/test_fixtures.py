@@ -12,7 +12,9 @@ class FixtureTests(unittest.TestCase):
         root = Path("fixtures")
         raw = json.loads((root / "scotty.private.example.json").read_text(encoding="utf-8"))
         config = RuntimeConfig.from_mapping(raw)
-        self.assertEqual(config.addons, ("discord", "trello", "ghl", "rentcast"))
+        self.assertEqual(
+            config.addons, ("discord", "trello", "ghl", "rentcast", "google_workspace")
+        )
         all_text = "\n".join(
             path.read_text(encoding="utf-8") for path in sorted(root.glob("*.json"))
         )

@@ -69,12 +69,13 @@ class ProviderGuidanceTests(unittest.TestCase):
                 self.assertIsNone(_CREDENTIAL_REQUEST.search(text))
                 self.assertIn("Never", text)
 
-    def test_google_workspace_is_guidance_only_and_takes_no_add_on_slot(self) -> None:
+    def test_google_workspace_is_a_real_bounded_capability(self) -> None:
         google = provider_guidance("google_workspace")
         self.assertEqual(google.status, NOT_CONNECTED)
         text = google.as_text().lower()
-        self.assertIn("not installed", text)
-        self.assertIn("add-on", text)
+        self.assertIn("bounded release capability", text)
+        self.assertIn("browser consent", text)
+        self.assertIn("no admin sdk", text)
 
     def test_unknown_providers_are_refused_rather_than_invented(self) -> None:
         with self.assertRaises(KeyError):

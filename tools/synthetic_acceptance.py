@@ -484,7 +484,10 @@ def check_provider_guidance() -> None:
         and not any("Administrator" in item for item in discord.required_scopes),
     )
     google = provider_guidance("google_workspace")
-    check("Google Workspace stays guidance only", "not installed" in google.as_text().lower())
+    check(
+        "Google Workspace is a bounded installed capability",
+        "bounded release capability" in google.as_text().lower(),
+    )
 
 
 class SyntheticDiscord:

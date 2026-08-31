@@ -11,6 +11,7 @@ from .adapters import AmbiguousEffectError, ProviderError, ProviderRecord
 from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
 from .calculations import preliminary_analysis
 from .config import RuntimeConfig, TrelloScope
+from .google_policy import GoogleActionClass, classify_google_action
 from .policy import Principal, Role
 
 
@@ -68,6 +69,12 @@ class RentCastPort(Protocol):
     def fetch(self, endpoint: str, query: Mapping[str, object]) -> ProviderRecord: ...
 
 
+class GoogleWorkspacePort(Protocol):
+    def mutate(
+        self, operation: str, resource_id: str, payload: Mapping[str, object]
+    ) -> ProviderRecord: ...
+
+
 class ScottyService:
     """Bounded business orchestration over typed provider adapters."""
 
@@ -80,6 +87,7 @@ class ScottyService:
         ghl: GHLPort,
         rentcast: RentCastPort | None,
         discord: DiscordPort,
+        google_workspace: GoogleWorkspacePort | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
@@ -88,6 +96,7 @@ class ScottyService:
         self.ghl = ghl
         self.rentcast = rentcast
         self.discord = discord
+        self.google_workspace = google_workspace
         self.clock = clock
 
     def _now(self) -> datetime:
@@ -292,6 +301,35 @@ class ScottyService:
             expires_at=self._now() + timedelta(minutes=10),
         )
 
+    def propose_google_workspace_write(
+        self,
+        requester: Principal,
+        operation: str,
+        resource_id: str,
+        payload: Mapping[str, object],
+    ) -> Proposal:
+        scope = self.config.google_workspace
+        if scope is None or self.google_workspace is None:
+            raise ProviderError("Google Workspace is not connected")
+        if (
+            not resource_id
+            or classify_google_action(operation, payload) is not GoogleActionClass.CONSEQUENCE
+        ):
+            raise ProviderError("Google Workspace consequence is not permitted")
+        return self.approvals.propose(
+            requester=requester,
+            approver=self._approver_for(requester),
+            action_class="google_workspace_consequence",
+            target_ids=(scope.account_email, resource_id),
+            payload={
+                "operation": operation,
+                "resource_id": resource_id,
+                "payload": dict(payload),
+            },
+            source_revision="configured-google-resource-v1",
+            expires_at=self._now() + timedelta(minutes=10),
+        )
+
     def execute(
         self,
         principal: Principal,
@@ -309,7 +347,42 @@ class ScottyService:
             return self._execute_announcement(
                 principal, proposal, expected_version, execution_nonce
             )
+        if proposal.action_class == "google_workspace_consequence":
+            return self._execute_google(principal, proposal, expected_version, execution_nonce)
         raise ApprovalError("proposal action class is unsupported")
+
+    def _execute_google(
+        self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
+    ) -> Proposal:
+        if self.google_workspace is None:
+            raise ApprovalError("Google Workspace is no longer connected")
+        operation = _payload_text(proposal.payload, "operation")
+        resource_id = _payload_text(proposal.payload, "resource_id")
+        payload = proposal.payload.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ApprovalError("Google Workspace proposal payload is malformed")
+        executing = self._claim(
+            principal,
+            proposal,
+            expected_version,
+            nonce,
+            "configured-google-resource-v1",
+        )
+        try:
+            result = self.google_workspace.mutate(operation, resource_id, payload)
+        except AmbiguousEffectError:
+            return self._unknown(
+                executing,
+                {"verified": False, "reason": "ambiguous Google Workspace write"},
+            )
+        except ProviderError as exc:
+            return self._failed(executing, str(exc))
+        return self.approvals.complete_execution(
+            executing.proposal_id,
+            ProposalStatus.VERIFIED,
+            expected_version=executing.version,
+            receipt={"verified": True, "resource_id": result.source_id},
+        )
 
     def _claim(
         self,

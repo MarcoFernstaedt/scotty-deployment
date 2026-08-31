@@ -4,7 +4,8 @@
     "discord",
     "trello",
     "ghl",
-    "rentcast"
+    "rentcast",
+    "google_workspace"
   ],
   "discord": {
     "announcement_channel_ids": [
@@ -13,6 +14,23 @@
   },
   "ghl": {
     "location_id": "synthetic-location-1"
+  },
+  "google_workspace": {
+    "account_email": "scotty.synthetic@example.invalid",
+    "calendar_ids": ["calendar.synthetic@example.invalid"],
+    "contact_resource_names": ["people/synthetic-contact"],
+    "docs_document_ids": ["synthetic-doc"],
+    "drive_file_ids": ["synthetic-drive-file", "synthetic-doc", "synthetic-sheet"],
+    "gmail_label_ids": ["Label_synthetic"],
+    "oauth_scopes": [
+      "https://www.googleapis.com/auth/gmail.modify",
+      "https://www.googleapis.com/auth/calendar.events",
+      "https://www.googleapis.com/auth/drive.file",
+      "https://www.googleapis.com/auth/documents",
+      "https://www.googleapis.com/auth/spreadsheets",
+      "https://www.googleapis.com/auth/contacts"
+    ],
+    "sheets_spreadsheet_ids": ["synthetic-sheet"]
   },
   "maintainer_route": {
     "channel_id": "220000000000000001",
