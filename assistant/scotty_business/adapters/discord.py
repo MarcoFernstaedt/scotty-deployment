@@ -62,7 +62,9 @@ class DiscordAdapter:
         deleted = self.transport.request(
             "DELETE", f"{_BASE}/channels/{channel}/messages/{message}", headers=self._headers
         )
-        if deleted.status not in (204, 404):
+        # 404 means the platform never had that message under this id, which is
+        # not evidence that the operator's message was removed.
+        if deleted.status != 204:
             return False
         readback = self.transport.request(
             "GET", f"{_BASE}/channels/{channel}/messages/{message}", headers=self._headers

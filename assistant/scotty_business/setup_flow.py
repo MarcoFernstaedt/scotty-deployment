@@ -326,15 +326,22 @@ class SetupStagingStore:
     accepted, and only fields Scotty actually collects can be written.
     """
 
-    def __init__(self, path: str | os.PathLike[str], *, owner_uid: int = 10000):
+    def __init__(self, path: str | os.PathLike[str], *, owner_uid: int | None = None):
         self.path = Path(path)
-        self.owner_uid = owner_uid
+        # The runtime owns the file it writes; root setup, which reads it back as
+        # prefill, names the runtime account explicitly instead.
+        self.owner_uid = os.getuid() if owner_uid is None else owner_uid
 
     def __repr__(self) -> str:
         return f"SetupStagingStore(path={self.path!s})"
 
     def read(self) -> dict[str, dict[str, str]]:
         if self.path.is_symlink() or not self.path.is_file():
+            return {}
+        # Root setup consumes this file as prefill, so it is trusted only when it
+        # is owned by the runtime account and readable by nobody else.
+        metadata = self.path.stat()
+        if metadata.st_uid != self.owner_uid or metadata.st_mode & 0o077:
             return {}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))

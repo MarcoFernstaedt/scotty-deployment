@@ -25,10 +25,11 @@ from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
 from .google_oauth import GoogleOAuthError, GoogleTokenStore, ensure_access_token
+from .google_policy import ROUTINE_GOOGLE_OPERATIONS
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
-from .policy import Principal
+from .policy import Principal, Role
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
 from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
@@ -42,6 +43,9 @@ from .setup_flow import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Only these roles may change the configured Workspace account's own data.
+_WORKSPACE_WRITE_ROLES: frozenset[Role] = frozenset({Role.MAINTAINER, Role.MAIN_OPERATOR})
 
 
 class RuntimeUnavailable(RuntimeError):
@@ -394,7 +398,9 @@ class Runtime:
     def provider_connection_status(self) -> dict[str, bool]:
         return provider_status(self.connected)
 
-    def _provider_setup(self, args: Mapping[str, object]) -> dict[str, object]:
+    def _provider_setup(
+        self, principal: Principal, args: Mapping[str, object]
+    ) -> dict[str, object]:
         """Answer one guided setup turn: explain, validate, diagnose, or resume."""
 
         status = self.provider_connection_status()
@@ -428,6 +434,10 @@ class Runtime:
         field = _text(args, "setup_field", optional=True)
         raw = _text(args, "raw", optional=True)
         if field is not None and raw is not None:
+            if principal.role not in _WORKSPACE_WRITE_ROLES:
+                # Staged values become root setup's prefill, so only the operator
+                # may supply one. Everyone may still read guidance and status.
+                raise PermissionError("only the main operator may supply a setup identifier")
             # Only non-secret identifiers are ever collected here, and they are
             # staged for local setup rather than applied to live configuration.
             try:
@@ -462,11 +472,18 @@ class Runtime:
                 "addon_slots_remaining": 6 - len(self.config.addons),
             }
         if operation == "provider_setup":
-            return self._provider_setup(args)
+            return self._provider_setup(principal, args)
         if operation == "google_workspace":
             google_operation = _text(args, "google_operation")
             payload = _object(args, "payload", optional=True)
             resource_id = _text(args, "resource_id", optional=True) or "new"
+            if (
+                google_operation in ROUTINE_GOOGLE_OPERATIONS
+                and principal.role not in _WORKSPACE_WRITE_ROLES
+            ):
+                # Reading the Workspace is shared; changing it belongs to its
+                # owner. An employee proposes instead of writing.
+                raise PermissionError("Google Workspace changes require the main operator")
             if google_operation in {"search_gmail", "search_drive"}:
                 query = payload.get("query", "")
                 maximum = payload.get("max_results", 50)

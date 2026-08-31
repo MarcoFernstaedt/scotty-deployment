@@ -336,6 +336,117 @@ class GoogleTokenSafetyTests(unittest.TestCase):
             self.assertNotIn("authorization-code", rendered)
 
 
+class GoogleRequestShapeTests(AdapterHarness):
+    """The REST calls must be ones Google actually accepts."""
+
+    def test_an_empty_search_result_is_empty_not_an_error(self) -> None:
+        from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        class EmptyTransport:
+            def request(self, method, url, *, headers=None, query=None, json_body=None):
+                # Gmail and People omit the collection entirely on zero results.
+                return HttpResponse(200, {}, {"resultSizeEstimate": 0})
+
+        config = RuntimeConfig.from_mapping(
+            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+        )
+        assert config.google_workspace is not None
+        adapter = GoogleWorkspaceAdapter(
+            EmptyTransport(), "synthetic-access-token", config.google_workspace
+        )
+        self.assertEqual(adapter.search_gmail("from:nobody"), ())
+        self.assertEqual(adapter.list_contacts(), ())
+
+    def test_a_malformed_collection_is_still_refused(self) -> None:
+        from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        class MalformedTransport:
+            def request(self, method, url, *, headers=None, query=None, json_body=None):
+                return HttpResponse(200, {}, {"messages": "not a list"})
+
+        config = RuntimeConfig.from_mapping(
+            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+        )
+        assert config.google_workspace is not None
+        adapter = GoogleWorkspaceAdapter(
+            MalformedTransport(), "synthetic-access-token", config.google_workspace
+        )
+        with self.assertRaises(ProviderError):
+            adapter.search_gmail("from:nobody")
+
+    def test_a_multi_word_calendar_search_is_sent_not_rejected(self) -> None:
+        adapter, transport = self.adapter()
+        adapter.list_calendar_events("primary", query="closing walkthrough Tuesday")
+        query = transport.calls[-1][2]
+        assert query is not None
+        self.assertEqual(query["q"], "closing walkthrough Tuesday")
+
+    def test_boolean_parameters_are_sent_in_the_form_google_accepts(self) -> None:
+        adapter, transport = self.adapter()
+        adapter.list_calendar_events("primary")
+        adapter.get_spreadsheet("sheet-1")
+        for call in transport.calls:
+            query = call[2] or {}
+            for key, value in query.items():
+                with self.subTest(key=key):
+                    self.assertNotIsInstance(value, bool)
+        self.assertEqual(transport.calls[0][2]["singleEvents"], "true")
+        self.assertEqual(transport.calls[-1][2]["includeGridData"], "false")
+
+
+class GoogleScopeNormalizationTests(unittest.TestCase):
+    """Google expands the openid shorthand scopes in what it returns."""
+
+    def test_the_expanded_scope_form_google_returns_is_accepted(self) -> None:
+        from assistant.scotty_business.google_oauth import canonical_scopes
+
+        configured = canonical_scopes(GOOGLE_OAUTH_SCOPES)
+        granted = canonical_scopes(
+            (
+                "openid",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/documents",
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/contacts",
+            )
+        )
+        self.assertEqual(configured, granted)
+
+    def test_a_genuinely_narrower_grant_is_still_refused(self) -> None:
+        from assistant.scotty_business.google_oauth import canonical_scopes
+
+        narrowed = canonical_scopes(("openid", "https://www.googleapis.com/auth/userinfo.email"))
+        self.assertNotEqual(canonical_scopes(GOOGLE_OAUTH_SCOPES), narrowed)
+
+    def test_a_stored_token_in_the_expanded_form_still_reads_as_ready(self) -> None:
+        from assistant.scotty_business.google_oauth import GoogleTokenStore, OAuthToken
+
+        expanded = tuple(
+            "https://www.googleapis.com/auth/userinfo.email" if scope == "email" else scope
+            for scope in GOOGLE_OAUTH_SCOPES
+        )
+        with tempfile.TemporaryDirectory(prefix="scotty-google-scope-") as directory:
+            path = Path(directory) / "google-oauth.json"
+            store = GoogleTokenStore(path, owner_uid=os.getuid(), owner_gid=os.getgid())
+            store.write(
+                OAuthToken(
+                    access_token="synthetic-access",
+                    refresh_token="synthetic-refresh",
+                    expires_at=4102444800,
+                    scopes=expanded,
+                    account_email=GOOGLE_SCOPE["account_email"],
+                    client_id="synthetic-client-id",
+                    client_secret="synthetic-client-secret",
+                )
+            )
+            self.assertTrue(store.ready(GOOGLE_OAUTH_SCOPES, GOOGLE_SCOPE["account_email"]))
+
+
 class GoogleTokenRefreshTests(unittest.TestCase):
     """A one-hour access token must refresh without a second browser consent."""
 
@@ -538,6 +649,116 @@ class GoogleConsentCallbackTests(unittest.TestCase):
         for path in ("/oauth2/callback?%%%", "/oauth2/callback?state", "?", ""):
             with self.subTest(path=path):
                 self.assertIsNone(self.parse(path, "s1"))
+
+
+class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
+    """An employee may read the Workspace but never mutate it."""
+
+    def runtime(self):
+        from test_provider_connection import runtime
+
+        return runtime(DISCORD_BOT_TOKEN="synthetic-discord")
+
+    def principal(self, role):
+        from assistant.scotty_business.policy import Principal, Role
+
+        if role is Role.EMPLOYEE:
+            return Principal(
+                synthetic.CLIENT_GUILD,
+                synthetic.EMPLOYEE_CHANNEL,
+                synthetic.EMPLOYEE_USER,
+                Role.EMPLOYEE,
+            )
+        return Principal(
+            synthetic.CLIENT_GUILD,
+            synthetic.OPERATOR_CHANNEL,
+            synthetic.OPERATOR_USER,
+            Role.MAIN_OPERATOR,
+        )
+
+    def connect(self, runtime):
+        """Replace the Workspace port with a recorder so authorization is visible."""
+
+        from assistant.scotty_business.adapters.records import ProviderRecord, utc_now
+
+        class Recorder:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def _record(self, source_id: str) -> ProviderRecord:
+                return ProviderRecord("google_workspace", source_id, utc_now(), "v1", {}, ())
+
+            def execute_routine(self, operation, resource_id, payload):
+                self.calls.append((operation, resource_id))
+                return self._record(resource_id)
+
+            def search_gmail(self, query, *, max_results=50):
+                self.calls.append(("search_gmail", query))
+                return (self._record("message-1"),)
+
+            def __getattr__(self, name):
+                def getter(resource_id):
+                    self.calls.append((name, resource_id))
+                    return self._record(resource_id)
+
+                return getter
+
+        recorder = Recorder()
+        runtime.google_workspace = recorder
+        runtime.connected["google_workspace"] = True
+        return recorder
+
+    def test_an_employee_cannot_reach_a_workspace_mutation_through_the_read_tool(self) -> None:
+        from assistant.scotty_business.google_policy import ROUTINE_GOOGLE_OPERATIONS
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as runtime:
+            recorder = self.connect(runtime)
+            employee = self.principal(Role.EMPLOYEE)
+            for operation in sorted(ROUTINE_GOOGLE_OPERATIONS):
+                with self.subTest(operation=operation), self.assertRaises(PermissionError):
+                    runtime.handle_read(
+                        employee,
+                        {
+                            "operation": "google_workspace",
+                            "google_operation": operation,
+                            "resource_id": "resource-1",
+                            "payload": {"name": "synthetic"},
+                        },
+                    )
+            self.assertEqual(recorder.calls, [])
+
+    def test_an_employee_may_still_read_the_workspace(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as runtime:
+            recorder = self.connect(runtime)
+            result = runtime.handle_read(
+                self.principal(Role.EMPLOYEE),
+                {
+                    "operation": "google_workspace",
+                    "google_operation": "search_gmail",
+                    "payload": {"query": "from:customer"},
+                },
+            )
+            self.assertTrue(result)
+            self.assertEqual(recorder.calls, [("search_gmail", "from:customer")])
+
+    def test_the_main_operator_may_perform_routine_workspace_work(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as runtime:
+            recorder = self.connect(runtime)
+            runtime.handle_read(
+                self.principal(Role.MAIN_OPERATOR),
+                {
+                    "operation": "google_workspace",
+                    "google_operation": "drive_update_file",
+                    "resource_id": "file-1",
+                    "payload": {"name": "Renamed"},
+                },
+            )
+            self.assertEqual(recorder.calls, [("drive_update_file", "file-1")])
 
 
 class GoogleApprovalPolicyTests(unittest.TestCase):

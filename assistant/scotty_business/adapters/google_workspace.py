@@ -56,6 +56,16 @@ def _label_ids(value: object, field: str) -> list[str]:
     return [_id(item, f"{field} entry") for item in value]
 
 
+def _text(value: object, field: str, *, limit: int = 1_000) -> str:
+    """Bounded free text for a provider search parameter, spaces included."""
+
+    if type(value) is not str or len(value) > limit:
+        raise ProviderError(f"{field} is malformed")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ProviderError(f"{field} contains forbidden characters")
+    return value
+
+
 def _bounded_count(value: int) -> int:
     if type(value) is not int or not 1 <= value <= 100:
         raise ProviderError("max_results must be an integer from 1 to 100")
@@ -105,7 +115,12 @@ class GoogleWorkspaceAdapter:
     def _records(
         self, provider: str, body: object, collection: str, id_field: str
     ) -> tuple[ProviderRecord, ...]:
-        if not isinstance(body, dict) or not isinstance(body.get(collection), list):
+        if not isinstance(body, dict):
+            raise ProviderError("Google list response is malformed")
+        if collection not in body:
+            # Gmail and People omit the collection entirely on zero results.
+            return ()
+        if not isinstance(body[collection], list):
             raise ProviderError("Google list response is malformed")
         result: list[ProviderRecord] = []
         for item in body[collection]:
@@ -116,8 +131,7 @@ class GoogleWorkspaceAdapter:
         return tuple(result)
 
     def search_gmail(self, query: str, *, max_results: int = 50) -> tuple[ProviderRecord, ...]:
-        if type(query) is not str or len(query) > 1_000:
-            raise ProviderError("Gmail query is malformed")
+        _text(query, "Gmail query")
         body = require_success(
             self.transport.request(
                 "GET",
@@ -154,11 +168,11 @@ class GoogleWorkspaceAdapter:
     ) -> tuple[ProviderRecord, ...]:
         params: dict[str, object] = {
             "maxResults": _bounded_count(max_results),
-            "singleEvents": True,
+            "singleEvents": "true",
             "orderBy": "startTime",
         }
         if query:
-            params["q"] = _id(query, "calendar query")
+            params["q"] = _text(query, "calendar query")
         if time_min:
             params["timeMin"] = _id(time_min, "calendar time_min")
         if time_max:
@@ -186,8 +200,7 @@ class GoogleWorkspaceAdapter:
         return self._record("google_calendar", event, body)
 
     def search_drive(self, query: str, *, max_results: int = 50) -> tuple[ProviderRecord, ...]:
-        if type(query) is not str or len(query) > 1_000:
-            raise ProviderError("Drive query is malformed")
+        _text(query, "Drive query")
         q = f"({query}) and trashed = false" if query else "trashed = false"
         body = require_success(
             self.transport.request(
@@ -233,7 +246,7 @@ class GoogleWorkspaceAdapter:
                 "GET",
                 f"{_SHEETS}/spreadsheets/{_path(source, 'spreadsheet id')}",
                 headers=self.headers,
-                query={"includeGridData": False},
+                query={"includeGridData": "false"},
             )
         )
         return self._record("google_sheets", source, body)

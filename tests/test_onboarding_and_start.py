@@ -171,6 +171,11 @@ class StartCommandContractTests(unittest.TestCase):
         # Consent is validated inside the prepared container against the exact
         # configured account and scope set, with no Google call and no send.
         self.assertIn("store.ready(scope.oauth_scopes, scope.account_email)", source)
+        # The consent check runs inside the container, so it must use the
+        # container's own mount path rather than the host path.
+        check = source.split("GOOGLE_CONSENT_CHECK='", 1)[1].split("'", 1)[0]
+        self.assertIn("/opt/data/plugins", check)
+        self.assertNotIn("/srv/Scotty", check)
         self.assertNotIn("send_message", source)
         self.assertNotIn("SETUP_WIZARD", source)
 

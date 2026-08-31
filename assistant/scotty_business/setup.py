@@ -40,6 +40,8 @@ from .routing import (
 from .setup_flow import SetupStagingStore
 
 _DATA_DIR = Path("/srv/Scotty/data")
+#: The unprivileged account the container runtime, and its state, belong to.
+_RUNTIME_UID = 10000
 _PROFILES_DIRNAME = "profiles"
 #: Registers only a pre-dispatch authorization hook. No tools, no prompt.
 GUARD_PLUGIN = "scotty-guard"
@@ -1160,7 +1162,10 @@ def main() -> int:
     # Identifiers Trent supplied conversationally are applied first, so the
     # operator's own prefill still wins on any field they both name.
     inputs = apply_staged_identifiers(
-        inputs, SetupStagingStore(_DATA_DIR / "scotty" / "setup-staging.json").read()
+        inputs,
+        SetupStagingStore(
+            _DATA_DIR / "scotty" / "setup-staging.json", owner_uid=_RUNTIME_UID
+        ).read(),
     )
     prefill_path = Path("/srv/Scotty/operator/setup-prefill.json")
     if prefill_path.exists():

@@ -11,15 +11,15 @@ COMPLETED=0
 # Runs inside the prepared container against the installed plugin only.
 readonly GOOGLE_CONSENT_CHECK='
 import json, pathlib, sys
-sys.path.insert(0, "/srv/Scotty/data/plugins")
+sys.path.insert(0, "/opt/data/plugins")
 from scotty_business.config import RuntimeConfig
 from scotty_business.google_oauth import GoogleTokenStore
-private = pathlib.Path("/srv/Scotty/data/scotty/private.json")
+private = pathlib.Path("/opt/data/scotty/private.json")
 config = RuntimeConfig.from_mapping(json.loads(private.read_text(encoding="utf-8")))
 scope = config.google_workspace
 if scope is None:
     sys.exit(0)
-store = GoogleTokenStore(pathlib.Path("/srv/Scotty/data/scotty/google-oauth.json"))
+store = GoogleTokenStore(pathlib.Path("/opt/data/scotty/google-oauth.json"))
 sys.exit(0 if store.ready(scope.oauth_scopes, scope.account_email) else 1)
 '
 

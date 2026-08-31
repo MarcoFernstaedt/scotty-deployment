@@ -210,12 +210,18 @@ class SourceMessageDeleter(Protocol):
 
 
 def _message_id(event: object) -> str | None:
+    """The exact source message id, or None.
+
+    Only an explicitly named message id counts. A generic `id` could be a
+    session or event identifier, and deleting by it would either fail or delete
+    the wrong thing while the credential stayed in the channel.
+    """
+
     source = getattr(event, "source", None)
     for holder in (event, source):
-        for attribute in ("message_id", "id"):
-            value = getattr(holder, attribute, None)
-            if type(value) is str and value:
-                return value
+        value = getattr(holder, "message_id", None)
+        if type(value) is str and value:
+            return value
     return None
 
 

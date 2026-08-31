@@ -247,10 +247,27 @@ class StagingStoreTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            store.path.chmod(0o600)
             self.assertEqual(
                 store.read(),
                 {"google_workspace": {"account_email": "scotty.synthetic@example.invalid"}},
             )
+
+    def test_a_group_or_world_readable_staging_file_is_never_trusted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-staging-") as directory:
+            store = self.store(directory)
+            store.stage("ghl", "location_id", "synthetic-location-1x")
+            self.assertTrue(store.read())
+            store.path.chmod(0o644)
+            self.assertEqual(store.read(), {})
+
+    def test_a_file_owned_by_another_account_is_never_trusted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-staging-") as directory:
+            store = self.store(directory)
+            store.stage("ghl", "location_id", "synthetic-location-1x")
+            self.assertTrue(store.read())
+            foreign = SetupStagingStore(store.path, owner_uid=os.getuid() + 1)
+            self.assertEqual(foreign.read(), {})
 
     def test_a_symlinked_or_unreadable_staging_path_is_never_followed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-staging-") as directory:
@@ -340,6 +357,32 @@ class GuidedSetupThroughTheReadToolTests(unittest.TestCase):
                         runtime, provider=provider, setup_field=field, raw="synthetic-secret-0001"
                     )
                     self.assertFalse(result["accepted"])
+            self.assertEqual(runtime.setup_staging.read(), {})
+
+    def test_only_the_operator_may_supply_an_identifier(self) -> None:
+        from assistant.scotty_business.policy import Principal, Role
+
+        employee = Principal(
+            synthetic.CLIENT_GUILD,
+            synthetic.EMPLOYEE_CHANNEL,
+            synthetic.EMPLOYEE_USER,
+            Role.EMPLOYEE,
+        )
+        with self.runtime(DISCORD_BOT_TOKEN="synthetic-discord") as runtime:
+            # The employee may still read guidance, status, and diagnoses.
+            self.assertTrue(
+                runtime.handle_read(employee, {"operation": "provider_setup"})["progress"]
+            )
+            with self.assertRaises(PermissionError):
+                runtime.handle_read(
+                    employee,
+                    {
+                        "operation": "provider_setup",
+                        "provider": "ghl",
+                        "setup_field": "location_id",
+                        "raw": "synthetic-location-1x",
+                    },
+                )
             self.assertEqual(runtime.setup_staging.read(), {})
 
     def test_a_reported_failure_is_diagnosed_with_the_next_correction(self) -> None:

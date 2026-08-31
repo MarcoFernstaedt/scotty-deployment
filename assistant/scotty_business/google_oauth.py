@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,6 +32,20 @@ TokenExchange = Callable[..., dict[str, object]]
 
 #: Refresh this many seconds before the access token actually expires.
 REFRESH_SKEW_SECONDS = 120
+
+#: Google returns the OpenID shorthand scopes in their expanded form, so the
+#: configured shorthand and the granted URL are the same authorization.
+_SCOPE_ALIASES: dict[str, str] = {
+    "email": "https://www.googleapis.com/auth/userinfo.email",
+    "profile": "https://www.googleapis.com/auth/userinfo.profile",
+}
+
+
+def canonical_scopes(scopes: Iterable[str]) -> frozenset[str]:
+    """Compare scope sets by authorization rather than by spelling."""
+
+    return frozenset(_SCOPE_ALIASES.get(scope, scope) for scope in scopes)
+
 
 _TOKEN_FIELDS = frozenset(
     {
@@ -152,9 +166,9 @@ class GoogleTokenStore:
             return False
         # Expiry alone never means "not connected": an hour-old access token is
         # refreshed from stored state instead of forcing a second browser consent.
-        return set(token.scopes) == set(exact_scopes) and secrets.compare_digest(
-            token.account_email.casefold(), account_email.casefold()
-        )
+        return canonical_scopes(token.scopes) == canonical_scopes(
+            exact_scopes
+        ) and secrets.compare_digest(token.account_email.casefold(), account_email.casefold())
 
     def status(self) -> dict[str, object]:
         try:
@@ -269,9 +283,9 @@ def ensure_access_token(
     """
 
     token = store.read()
-    if set(token.scopes) != set(exact_scopes) or not secrets.compare_digest(
-        token.account_email.casefold(), account_email.casefold()
-    ):
+    if canonical_scopes(token.scopes) != canonical_scopes(
+        exact_scopes
+    ) or not secrets.compare_digest(token.account_email.casefold(), account_email.casefold()):
         raise GoogleOAuthError("Google OAuth state is bound to another account or scope set")
     current = int(time.time()) if now is None else now
     if token.access_valid(now=current):
@@ -283,7 +297,7 @@ def ensure_access_token(
     if type(access) is not str or not access or type(expires) is not int or expires <= 0:
         raise GoogleOAuthError("Google OAuth refresh response is incomplete")
     granted = str(body.get("scope", "")).split()
-    if granted and set(granted) != set(exact_scopes):
+    if granted and canonical_scopes(granted) != canonical_scopes(exact_scopes):
         raise GoogleOAuthError("Google OAuth refresh returned a different scope set")
     rotated = body.get("refresh_token")
     store.write(
@@ -383,7 +397,7 @@ def authorize_installed_app(
         },
     )
     granted = tuple(str(token_body.get("scope", "")).split())
-    if set(granted) != set(exact_scopes):
+    if canonical_scopes(granted) != canonical_scopes(exact_scopes):
         raise GoogleOAuthError("Google OAuth granted scopes do not match configured scopes")
     access = token_body.get("access_token")
     refresh = token_body.get("refresh_token")

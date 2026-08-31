@@ -197,6 +197,9 @@ class ConfirmedDeletionTests(unittest.TestCase):
             {("DELETE", 1): 204, ("GET", 2): 200},
             {("DELETE", 1): 403},
             {("DELETE", 1): 500},
+            # An already-absent message is not evidence that the operator's
+            # message was the one removed.
+            {("DELETE", 1): 404},
         ):
             with self.subTest(statuses=statuses):
                 adapter, _ = self.adapter(statuses)
@@ -281,6 +284,20 @@ class IntakeInterceptTests(IntakeHarness):
         intake, config, _, broker, deleter = self.build()
         _, route = self.open_window(intake, config)
         outcome = intake.intercept(event(SECRET, message_id=None), route)
+        assert outcome is not None
+        self.assertEqual(outcome.status, IntakeStatus.DELETE_UNAVAILABLE)
+        self.assertEqual(deleter.deleted, [])
+        self.assertEqual(broker.committed, [])
+
+    def test_a_generic_event_id_is_never_mistaken_for_a_message_id(self) -> None:
+        intake, config, _, broker, deleter = self.build()
+        _, route = self.open_window(intake, config)
+        carrier = event(SECRET, message_id=None)
+        # A session or event identifier is not a message identifier; deleting by
+        # it would leave the credential in the channel.
+        carrier.id = "700000000000000009"
+        carrier.source.id = "700000000000000009"
+        outcome = intake.intercept(carrier, route)
         assert outcome is not None
         self.assertEqual(outcome.status, IntakeStatus.DELETE_UNAVAILABLE)
         self.assertEqual(deleter.deleted, [])
