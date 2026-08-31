@@ -47,6 +47,28 @@ class DiscordAdapter:
             )
         return {"message_id": message_id, "channel_id": channel}
 
+    def delete_message(self, channel_id: str, message_id: str) -> bool:
+        """Delete one exact message and confirm the platform really removed it.
+
+        Deletion is confirmed by reading the message back and requiring the
+        platform to report it absent. Any other outcome returns False so a
+        caller that depends on confirmed deletion fails closed.
+        """
+
+        channel = fixed_id(channel_id, "channel id")
+        message = fixed_id(message_id, "message id")
+        if channel not in self.channel_ids:
+            raise ProviderError("Discord destination is not configured")
+        deleted = self.transport.request(
+            "DELETE", f"{_BASE}/channels/{channel}/messages/{message}", headers=self._headers
+        )
+        if deleted.status not in (204, 404):
+            return False
+        readback = self.transport.request(
+            "GET", f"{_BASE}/channels/{channel}/messages/{message}", headers=self._headers
+        )
+        return readback.status == 404
+
     def get_message(self, channel_id: str, message_id: str) -> dict[str, object]:
         channel = fixed_id(channel_id, "channel id")
         message = fixed_id(message_id, "message id")

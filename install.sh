@@ -61,6 +61,7 @@ readonly -a PLUGIN_FILES=(
   "approvals.py"
   "calculations.py"
   "config.py"
+  "credential_intake.py"
   "guidance.py"
   "google_oauth.py"
   "google_policy.py"

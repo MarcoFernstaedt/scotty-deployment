@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from .config import RuntimeConfig
+from .credential_intake import INTAKE_COMMANDS, CredentialIntake
 from .policy import (
     CODING_REFUSAL,
     EMPLOYEE_SUMMARY,
@@ -45,10 +46,13 @@ class IngressGuard:
         config: RuntimeConfig,
         enqueue: Callable[[str, str], object],
         marker_root: Path | None = None,
+        *,
+        intake: CredentialIntake | None = None,
     ) -> None:
         self.config = config
         self.enqueue = enqueue
         self.marker_root = marker_root
+        self.intake = intake
 
     def __call__(self, event: object, **_: object) -> Mapping[str, str]:
         source = getattr(event, "source", None)
@@ -59,6 +63,14 @@ class IngressGuard:
         if type(text) is not str:
             return {"action": "skip", "reason": "malformed"}
         stripped = text.strip()
+        if self.intake is not None:
+            # The protected intake runs first: an expected credential is consumed
+            # here, before the leak scan, the queue, any session, and the model.
+            if self.intake.intercept(event, route) is not None:
+                return {"action": "skip", "reason": "credential-intake"}
+            if stripped in INTAKE_COMMANDS:
+                self.intake.open_window(route, stripped)
+                return {"action": "skip", "reason": "credential-intake-open"}
         if any(pattern.search(stripped) for pattern in _CREDENTIAL_PATTERNS):
             # Credential text never reaches a model on any route.
             if route.principal is not None:

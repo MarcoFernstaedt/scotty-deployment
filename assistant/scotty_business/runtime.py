@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -22,6 +23,7 @@ from .adapters import (
 )
 from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
+from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
 from .google_oauth import GoogleOAuthError, GoogleTokenStore, ensure_access_token
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
@@ -597,6 +599,7 @@ class Controller:
     def __init__(self) -> None:
         self.home = _home_path()
         self._runtime: Runtime | None = None
+        self._intake: CredentialIntake | None = None
         self._lock = threading.RLock()
         self._outbound: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=100)
         self._stop = threading.Event()
@@ -617,6 +620,20 @@ class Controller:
                 self._runtime = Runtime(self.home)
             return self._runtime
 
+    def intake(self, runtime: Runtime) -> CredentialIntake:
+        """One protected intake per runtime, so a window survives between events."""
+
+        with self._lock:
+            if self._intake is None:
+                self._intake = CredentialIntake(
+                    runtime.config,
+                    self.enqueue,
+                    broker=UnixSocketBroker(BROKER_SOCKET),
+                    deleter=runtime.discord,
+                    clock=lambda: int(time.time()),
+                )
+            return self._intake
+
     def enqueue(self, channel_id: str, text: str) -> bool:
         try:
             self._outbound.put_nowait((channel_id, text))
@@ -630,7 +647,9 @@ class Controller:
             runtime = self.runtime()
         except Exception:
             return {"action": "skip", "reason": "unavailable"}
-        return IngressGuard(runtime.config, self.enqueue, runtime.state_dir)(event)
+        return IngressGuard(
+            runtime.config, self.enqueue, runtime.state_dir, intake=self.intake(runtime)
+        )(event)
 
     def tool(self, kind: str, args: object, **kwargs: object) -> str:
         try:
