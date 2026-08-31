@@ -9,7 +9,7 @@ from pathlib import Path
 import synthetic
 
 from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
-from assistant.scotty_business.config import ConfigError, GOOGLE_OAUTH_SCOPES, RuntimeConfig
+from assistant.scotty_business.config import GOOGLE_OAUTH_SCOPES, ConfigError, RuntimeConfig
 from assistant.scotty_business.policy import Role
 
 GOOGLE_SCOPE = {
@@ -48,7 +48,9 @@ class FakeTransport:
 
 
 class GoogleConfigTests(unittest.TestCase):
-    def test_google_authorizes_one_account_with_broad_product_scopes_not_resource_allowlists(self) -> None:
+    def test_google_authorizes_one_account_with_broad_product_scopes_not_resource_allowlists(
+        self,
+    ) -> None:
         config = RuntimeConfig.from_mapping(
             synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
         )
@@ -61,16 +63,16 @@ class GoogleConfigTests(unittest.TestCase):
         self.assertIn("https://www.googleapis.com/auth/calendar", GOOGLE_OAUTH_SCOPES)
         self.assertNotIn("https://mail.google.com/", GOOGLE_OAUTH_SCOPES)
 
-    def test_google_rejects_scope_downgrade_or_unnecessary_permanent_mail_delete_scope(self) -> None:
+    def test_google_rejects_scope_downgrade_or_unnecessary_permanent_mail_delete_scope(
+        self,
+    ) -> None:
         for scopes in (
             list(GOOGLE_OAUTH_SCOPES[:-1]),
             [*GOOGLE_OAUTH_SCOPES, "https://mail.google.com/"],
         ):
             malformed = dict(GOOGLE_SCOPE, oauth_scopes=scopes)
             with self.subTest(scopes=scopes), self.assertRaises(ConfigError):
-                RuntimeConfig.from_mapping(
-                    synthetic.private_mapping(google_workspace=malformed)
-                )
+                RuntimeConfig.from_mapping(synthetic.private_mapping(google_workspace=malformed))
 
 
 class GoogleAdapterTests(unittest.TestCase):
@@ -90,10 +92,18 @@ class GoogleAdapterTests(unittest.TestCase):
 
     def test_broad_account_owned_search_and_reads_do_not_require_pre_enumerated_ids(self) -> None:
         adapter, transport = self.adapter()
-        self.assertEqual(adapter.search_gmail("from:customer", max_results=25)[0].source_id, "message-1")
-        self.assertEqual(adapter.search_drive("name contains 'closing'", max_results=25)[0].source_id, "file-1")
-        self.assertEqual(adapter.get_drive_file("previously-unknown-file").source_id, "previously-unknown-file")
-        self.assertEqual(adapter.get_document("previously-unknown-doc").source_id, "previously-unknown-doc")
+        self.assertEqual(
+            adapter.search_gmail("from:customer", max_results=25)[0].source_id, "message-1"
+        )
+        self.assertEqual(
+            adapter.search_drive("name contains 'closing'", max_results=25)[0].source_id, "file-1"
+        )
+        self.assertEqual(
+            adapter.get_drive_file("previously-unknown-file").source_id, "previously-unknown-file"
+        )
+        self.assertEqual(
+            adapter.get_document("previously-unknown-doc").source_id, "previously-unknown-doc"
+        )
         self.assertEqual(
             adapter.get_spreadsheet("previously-unknown-sheet").source_id,
             "previously-unknown-sheet",
@@ -137,8 +147,13 @@ class GoogleAdapterTests(unittest.TestCase):
             with self.subTest(operation=operation), self.assertRaises(ProviderError):
                 adapter.execute_routine(operation, "resource-1", {"value": True})
 
-    def test_new_calendar_audience_is_consequence_gated_but_internal_edits_are_routine(self) -> None:
-        from assistant.scotty_business.google_policy import GoogleActionClass, classify_google_action
+    def test_new_calendar_audience_is_consequence_gated_but_internal_edits_are_routine(
+        self,
+    ) -> None:
+        from assistant.scotty_business.google_policy import (
+            GoogleActionClass,
+            classify_google_action,
+        )
 
         self.assertEqual(
             classify_google_action("calendar_update_event", {"summary": "Moved"}),
@@ -192,7 +207,9 @@ class GoogleApprovalPolicyTests(unittest.TestCase):
         self.assertFalse(can_approve(employee, "google_workspace_consequence"))
         self.assertTrue(can_approve(operator, "google_workspace_consequence"))
 
-    def test_existing_five_tool_inventory_exposes_routine_and_consequence_google_paths(self) -> None:
+    def test_existing_five_tool_inventory_exposes_routine_and_consequence_google_paths(
+        self,
+    ) -> None:
         from assistant.scotty_business import _PROPOSE_SCHEMA, _READ_SCHEMA
 
         read_properties = _READ_SCHEMA["parameters"]["properties"]

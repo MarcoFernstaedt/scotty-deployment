@@ -28,6 +28,7 @@ from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
 from .policy import Principal
 from .reminders import Reminder, ReminderStore, ReminderWorker
+from .self_repair import SelfRepairError, SelfRepairManager
 from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
 
 logger = logging.getLogger(__name__)
@@ -337,6 +338,13 @@ class Runtime:
         self.approvals.recover_interrupted()
         self.reminders = ReminderStore(state_dir / "reminders.db")
         self.reminders.initialize()
+        self.self_repair = SelfRepairManager(
+            state_dir,
+            state_dir / "private.json",
+            self.approvals,
+            self.reminders,
+            provider_status=self.provider_connection_status,
+        )
         self.resolver = AuthorizedPrincipalResolver(home, self.config)
         self.service = ScottyService(
             self.config,
@@ -371,8 +379,16 @@ class Runtime:
         return _guidance_json(name, status[name])
 
     def handle_read(self, principal: Principal, args: Mapping[str, object]) -> object:
-        del principal
         operation = _text(args, "operation")
+        if operation == "self_health":
+            return self.self_repair.health()
+        if operation == "self_repair":
+            # A refused repair returns its fixed redacted diagnosis so Scotty can
+            # explain the next step instead of answering with a bare denial.
+            try:
+                return self.self_repair.repair(principal, _text(args, "repair_action"))
+            except SelfRepairError as exc:
+                return {"status": "refused", "reason": str(exc)}
         if operation == "status":
             return {
                 "identity": "Scotty by The Closing Room",
@@ -415,9 +431,7 @@ class Runtime:
                 if "/" not in resource_id:
                     raise ValueError("calendar event resource must be calendar/event")
                 calendar_id, event_id = resource_id.split("/", 1)
-                return _record_json(
-                    self.google_workspace.get_calendar_event(calendar_id, event_id)
-                )
+                return _record_json(self.google_workspace.get_calendar_event(calendar_id, event_id))
             if google_operation == "list_contacts":
                 maximum = payload.get("max_results", 100)
                 if type(maximum) is not int:

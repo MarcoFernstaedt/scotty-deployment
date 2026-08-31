@@ -43,6 +43,7 @@ MAINT_GUILD = "110000000000000001"
 MAINT_CHANNEL = "220000000000000001"
 MAINT_USER = "320000000000000001"
 BOT_ID = "600000000000000001"
+GOOGLE_ACCOUNT = "scotty.synthetic@example.invalid"
 
 VIEW_CHANNEL = 1 << 10
 SEND_MESSAGES = 1 << 11
@@ -210,6 +211,7 @@ class SetupTests(unittest.TestCase):
                 "label-1",
                 "field-1",
                 "location-1",
+                GOOGLE_ACCOUNT,
             ]
         )
         hidden_prompts: list[str] = []
@@ -225,6 +227,8 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(len(result.secrets), 6)
         self.assertTrue(all(value.startswith("secret-") for value in result.secrets.values()))
         self.assertIsNone(result.provision_channel_names)
+        self.assertEqual(result.google_account_email, GOOGLE_ACCOUNT)
+        self.assertTrue(all("Google" not in prompt for prompt in hidden_prompts))
 
     def test_provisioning_and_route_answers_never_travel_through_hidden_input(self) -> None:
         visible_answers = iter(
@@ -241,6 +245,7 @@ class SetupTests(unittest.TestCase):
                 MAINT_GUILD,
                 MAINT_CHANNEL,
                 MAINT_USER,
+                "",
                 "",
                 "",
             ]
@@ -263,6 +268,7 @@ class SetupTests(unittest.TestCase):
             (result.route_guild_id, result.route_channel_id, result.route_user_id),
             (MAINT_GUILD, MAINT_CHANNEL, MAINT_USER),
         )
+        self.assertEqual(result.google_account_email, "")
 
     def test_discord_validation_requires_bot_membership_exact_guild_and_private_channels(
         self,
@@ -496,6 +502,7 @@ class CodexAndOptionalProviderTests(unittest.TestCase):
                 MAINT_USER,
                 "",
                 "",
+                "",
             ]
         )
         hidden_prompts: list[str] = []
@@ -633,6 +640,7 @@ class CredentialSourceTests(unittest.TestCase):
                 MAINT_USER,
                 "",
                 "",
+                "",
             ]
         )
         hidden_prompts: list[str] = []
@@ -648,6 +656,35 @@ class CredentialSourceTests(unittest.TestCase):
         )
         self.assertEqual(result.secrets["DISCORD_BOT_TOKEN"], "exported-token")
         self.assertTrue(all("Discord bot token" not in item for item in hidden_prompts))
+
+    def test_a_malformed_google_account_answer_fails_setup_closed(self) -> None:
+        for answer in ("not-an-email", "@example.invalid", "scotty@", "a b@example.invalid"):
+            with self.subTest(answer=answer):
+                visible_answers = iter(
+                    [
+                        CODEX_PROVIDER,
+                        "synthetic/codex",
+                        CLIENT_GUILD,
+                        "no",
+                        OPERATOR_CHANNEL,
+                        EMPLOYEE_CHANNEL,
+                        OPERATOR_USER,
+                        EMPLOYEE_USER,
+                        "",
+                        MAINT_GUILD,
+                        MAINT_CHANNEL,
+                        MAINT_USER,
+                        "",
+                        "",
+                        answer,
+                    ]
+                )
+                with self.assertRaises(SetupError):
+                    collect_inputs(
+                        input_fn=lambda prompt, answers=visible_answers: next(answers),
+                        hidden_fn=lambda prompt: "discord-secret",
+                        environ={},
+                    )
 
     def test_setup_never_reads_command_line_arguments(self) -> None:
         source = Path("assistant/scotty_business/setup.py").read_text(encoding="utf-8")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 from ..config import GoogleWorkspaceScope
 from ..google_policy import GoogleActionClass, classify_google_action
@@ -284,7 +284,11 @@ class GoogleWorkspaceAdapter:
             elif operation == "drive_trash_file":
                 body = {"trashed": True}
         elif operation == "drive_delete_permanently":
-            url, method, body = f"{_DRIVE}/files/{_path(resource_id, 'Drive file id')}", "DELETE", {}
+            url, method, body = (
+                f"{_DRIVE}/files/{_path(resource_id, 'Drive file id')}",
+                "DELETE",
+                {},
+            )
         elif operation == "drive_change_permissions":
             url = f"{_DRIVE}/files/{_path(resource_id, 'Drive file id')}/permissions"
         elif operation == "docs_create":
@@ -296,7 +300,9 @@ class GoogleWorkspaceAdapter:
         elif operation == "sheets_batch_update":
             url = f"{_SHEETS}/spreadsheets/{_path(resource_id, 'spreadsheet id')}:batchUpdate"
         elif operation == "sheets_update_values":
-            url = f"{_SHEETS}/spreadsheets/{_path(resource_id, 'spreadsheet id')}/values:batchUpdate"
+            url = (
+                f"{_SHEETS}/spreadsheets/{_path(resource_id, 'spreadsheet id')}/values:batchUpdate"
+            )
         elif operation == "contacts_create":
             url, source = f"{_PEOPLE}/people:createContact", "new"
         elif operation == "contacts_update":

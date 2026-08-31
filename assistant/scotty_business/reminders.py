@@ -235,6 +235,26 @@ class ReminderStore:
             connection.close()
         return self.get(reminder_id)
 
+    def recover_interrupted(self) -> int:
+        """Move reminders interrupted mid-dispatch to `unknown`, never retried."""
+
+        now = self._now().isoformat()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """UPDATE reminders SET status='unknown', version=version+1, updated_at=?
+                   WHERE status='dispatching'""",
+                (now,),
+            ).rowcount
+            connection.commit()
+            return changed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def claim_due(self, *, limit: int = 20) -> tuple[Reminder, ...]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ReminderError("claim limit must be an integer from 1 to 100")

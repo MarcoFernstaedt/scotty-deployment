@@ -47,9 +47,8 @@ class PrivatePrefillTests(unittest.TestCase):
         prompts: list[str] = []
         result = collect_inputs_from_prefill(
             prefill,
-            hidden_fn=lambda prompt: prompts.append(prompt) or (
-                "synthetic-discord-secret" if "Discord" in prompt else ""
-            ),
+            hidden_fn=lambda prompt: prompts.append(prompt)
+            or ("synthetic-discord-secret" if "Discord" in prompt else ""),
             environ={},
         )
         self.assertEqual(result.guild_id, prefill["guild_id"])

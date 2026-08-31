@@ -71,6 +71,7 @@ OPTIONAL_SECRETS = (
 )
 _SAFE_SECRET = re.compile(r"[A-Za-z0-9._:/+\-=]+")
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9._:/+\-]+")
+_ACCOUNT_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
 _SAFE_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/+,\-=]+")
 _PREFILL_FIELDS = frozenset(
     {
@@ -203,8 +204,8 @@ def apply_prefill(inputs: SetupInputs, prefill: Mapping[str, object]) -> SetupIn
         if set(raw) != {"account_email"}:
             raise SetupError("setup prefill Google Workspace account is malformed")
         changes.update(
-            google_account_email=_prefill_text(
-                raw["account_email"], "prefill.google.account_email"
+            google_account_email=_google_account_email(
+                _prefill_text(raw["account_email"], "prefill.google.account_email")
             ),
         )
     return replace(inputs, **cast(Any, changes))
@@ -272,6 +273,16 @@ def _csv(
         if len(value) > 128 or not _SAFE_VALUE.fullmatch(value):
             raise SetupError("setup list contains a malformed value")
     return values
+
+
+def _google_account_email(value: str) -> str:
+    """A Workspace account is a bounded email address or an explicit blank."""
+
+    if not value:
+        return ""
+    if len(value) > 254 or not _ACCOUNT_EMAIL.fullmatch(value):
+        raise SetupError("Google Workspace account must be an email address")
+    return value
 
 
 def _hidden(hidden_fn: Callable[[str], str], prompt: str) -> str:
@@ -357,8 +368,8 @@ def collect_inputs(
         else ()
     )
     location_id = _optional(input_fn, "GoHighLevel location ID (blank to connect later): ")
-    google_account = _optional(
-        input_fn, "Google Workspace account email (blank to connect later): "
+    google_account = _google_account_email(
+        _optional(input_fn, "Google Workspace account email (blank to connect later): ")
     )
 
     secrets: dict[str, str] = {}
@@ -425,9 +436,17 @@ def collect_inputs_from_prefill(
 
     environ = os.environ if environ is None else environ
     required = {
-        "model_provider", "model_name", "guild_id", "operator_channel_id",
-        "operator_user_id", "employee_channel_id", "employee_user_id",
-        "announcement_channel_ids", "route_guild_id", "route_channel_id", "route_user_id",
+        "model_provider",
+        "model_name",
+        "guild_id",
+        "operator_channel_id",
+        "operator_user_id",
+        "employee_channel_id",
+        "employee_user_id",
+        "announcement_channel_ids",
+        "route_guild_id",
+        "route_channel_id",
+        "route_user_id",
     }
     if not required.issubset(prefill):
         raise SetupError("setup prefill is incomplete; add the missing non-secret fields")
@@ -447,9 +466,7 @@ def collect_inputs_from_prefill(
         ),
         employee_user_id=_prefill_text(prefill["employee_user_id"], "prefill.employee_user_id"),
         route_guild_id=_prefill_text(prefill["route_guild_id"], "prefill.route_guild_id"),
-        route_channel_id=_prefill_text(
-            prefill["route_channel_id"], "prefill.route_channel_id"
-        ),
+        route_channel_id=_prefill_text(prefill["route_channel_id"], "prefill.route_channel_id"),
         route_user_id=_prefill_text(prefill["route_user_id"], "prefill.route_user_id"),
         announcement_channel_ids=_prefill_texts(
             prefill["announcement_channel_ids"],
@@ -475,7 +492,11 @@ def collect_inputs_from_prefill(
     for name, prompt in prompts:
         value = _environment_secret(environ, name)
         if not value:
-            value = _hidden(hidden_fn, prompt) if name in REQUIRED_SECRETS else _hidden_optional(hidden_fn, prompt)
+            value = (
+                _hidden(hidden_fn, prompt)
+                if name in REQUIRED_SECRETS
+                else _hidden_optional(hidden_fn, prompt)
+            )
         if value:
             secrets_map[name] = value
     if not secrets_map.get("DISCORD_BOT_TOKEN"):
@@ -1134,9 +1155,7 @@ def main() -> int:
                     "Google OAuth is incomplete; Scotty remains stopped until local browser consent succeeds"
                 ) from exc
         if not store.ready(GOOGLE_OAUTH_SCOPES, inputs.google_account_email):
-            raise SetupError(
-                "Google OAuth account does not match the configured Workspace account"
-            )
+            raise SetupError("Google OAuth account does not match the configured Workspace account")
     for step in next_steps(inputs):
         print(step)
     return 0
