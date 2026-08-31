@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Literal, Protocol, overload
 
 from .adapters import (
+    MAX_ATTACHMENT_BYTES,
+    Attachment,
     DiscordAdapter,
     GHLAdapter,
     GoogleWorkspaceAdapter,
@@ -24,12 +26,19 @@ from .adapters import (
 from .approvals import ApprovalStore, Proposal
 from .config import ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
+from .discord_policy import (
+    DiscordActionClass,
+    classify_discord_action,
+    permitted_destinations,
+    redacted_refusal,
+)
 from .google_oauth import GoogleOAuthError, GoogleTokenStore, ensure_access_token
 from .google_policy import ROUTINE_GOOGLE_OPERATIONS
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
 from .policy import Principal, Role
+from .progress import ProgressReporter
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
 from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
@@ -43,6 +52,24 @@ from .setup_flow import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The content types Scotty may attach, keyed by the approved suffix.
+_ATTACHMENT_TYPES: Mapping[str, str] = {
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+}
+
+
+def _required(value: str | None, field: str) -> str:
+    if not value:
+        raise ValueError(f"{field} is required")
+    return value
+
 
 #: Only these roles may change the configured Workspace account's own data.
 _WORKSPACE_WRITE_ROLES: frozenset[Role] = frozenset({Role.MAINTAINER, Role.MAIN_OPERATOR})
@@ -383,6 +410,7 @@ class Runtime:
             ),
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
+        self._reporters: dict[tuple[str, str], ProgressReporter] = {}
 
     def _google_access_token(self) -> str:
         """Return a valid Workspace access token, refreshing it when it expires."""
@@ -473,6 +501,8 @@ class Runtime:
             }
         if operation == "provider_setup":
             return self._provider_setup(principal, args)
+        if operation == "discord":
+            return self.handle_discord(principal, args)
         if operation == "google_workspace":
             google_operation = _text(args, "google_operation")
             payload = _object(args, "payload", optional=True)
@@ -579,6 +609,103 @@ class Runtime:
         if operation == "google_contact":
             return _record_json(self.google_workspace.get_contact(_text(args, "resource_name")))
         raise ValueError("read operation is not permitted")
+
+    def _reporter(self, channel_id: str, task_id: str) -> ProgressReporter:
+        """One coalescing reporter per task, kept for the life of the runtime."""
+
+        key = (channel_id, task_id)
+        reporter = self._reporters.get(key)
+        if reporter is None:
+            reporter = ProgressReporter(
+                channel_id,
+                self.discord.send_message,
+                self.discord.edit_own_message,
+                clock=time.monotonic,
+            )
+            if len(self._reporters) >= 64:
+                self._reporters.pop(next(iter(self._reporters)))
+            self._reporters[key] = reporter
+        return reporter
+
+    def handle_discord(self, principal: Principal, args: Mapping[str, object]) -> object:
+        """Perform one typed, classified Discord action for this exact caller."""
+
+        discord_operation = _text(args, "discord_operation")
+        payload = _object(args, "payload", optional=True)
+        destinations = permitted_destinations(self.config, principal)
+        channel_id = _text(payload, "channel_id", optional=True) or principal.channel_id
+        content = _text(payload, "content", optional=True) or ""
+        classified = classify_discord_action(
+            discord_operation,
+            {**payload, "channel_id": channel_id, "content": content},
+            destinations=destinations,
+        )
+        if classified is not DiscordActionClass.ROUTINE:
+            # Consequence work goes through a proposal; everything else is absent.
+            raise PermissionError(redacted_refusal(discord_operation))
+
+        message_id = _text(payload, "message_id", optional=True)
+        if discord_operation == "read_channel":
+            limit = payload.get("limit", 20)
+            if type(limit) is not int:
+                raise ValueError("Discord read limit is malformed")
+            return [dict(item) for item in self.discord.read_channel(channel_id, limit=limit)]
+        if discord_operation == "read_message":
+            return dict(self.discord.get_message(channel_id, _required(message_id, "message id")))
+        if discord_operation == "send_message":
+            return dict(self.discord.send_message(channel_id, content))
+        if discord_operation == "reply_message":
+            return dict(
+                self.discord.reply_message(channel_id, _required(message_id, "message id"), content)
+            )
+        if discord_operation == "edit_own_message":
+            return dict(
+                self.discord.edit_own_message(
+                    channel_id, _required(message_id, "message id"), content
+                )
+            )
+        if discord_operation == "delete_own_message":
+            return {
+                "deleted": self.discord.delete_own_message(
+                    channel_id, _required(message_id, "message id")
+                )
+            }
+        if discord_operation in {"add_reaction", "remove_own_reaction"}:
+            emoji = _text(payload, "emoji")
+            reaction = (
+                self.discord.add_reaction
+                if discord_operation == "add_reaction"
+                else self.discord.remove_own_reaction
+            )
+            return {"reacted": reaction(channel_id, _required(message_id, "message id"), emoji)}
+        if discord_operation == "attach_file":
+            return dict(self.discord.attach_file(channel_id, content, self._attachment(payload)))
+        if discord_operation == "create_thread":
+            return {
+                "thread_id": self.discord.create_thread(
+                    channel_id, _text(payload, "name"), message_id or None
+                )
+            }
+        if discord_operation == "send_thread_message":
+            return dict(self.discord.send_thread_message(_text(payload, "thread_id"), content))
+        if discord_operation == "archive_own_thread":
+            return {"archived": self.discord.archive_own_thread(_text(payload, "thread_id"))}
+        outcome = self._reporter(channel_id, _text(payload, "task_id")).update(content)
+        return {"progress": outcome.state.value, "message_id": outcome.message_id}
+
+    def _attachment(self, payload: Mapping[str, object]) -> Attachment:
+        """Read one approved file from Scotty's own outbox, never anywhere else."""
+
+        name = _text(payload, "filename")
+        if name != Path(name).name or name.startswith("."):
+            raise ValueError("attachment filename is malformed")
+        path = self.state_dir / "outbox" / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("attachment is not present in Scotty's outbox")
+        data = path.read_bytes()
+        if not data or len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("attachment size is outside the permitted range")
+        return Attachment(name, _ATTACHMENT_TYPES.get(path.suffix.lower(), ""), data)
 
     def handle_propose(self, principal: Principal, args: Mapping[str, object]) -> object:
         operation = _text(args, "operation")

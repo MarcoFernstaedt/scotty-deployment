@@ -54,7 +54,7 @@ def _schema(
 
 _READ_SCHEMA = _schema(
     "scotty_read",
-    "Read resources, perform routine reversible Workspace work, or inspect and repair Scotty-owned state.",
+    "Read resources, do routine reversible Discord and Workspace work, or inspect and repair Scotty-owned state.",
     {
         "operation": {
             "type": "string",
@@ -77,6 +77,7 @@ _READ_SCHEMA = _schema(
                 "google_workspace",
                 "self_health",
                 "self_repair",
+                "discord",
             ],
         },
         "card_id": {"type": "string"},
@@ -90,6 +91,24 @@ _READ_SCHEMA = _schema(
         "endpoint": {"type": "string"},
         "setup_field": {"type": "string"},
         "setup_failure": {"type": "string"},
+        "discord_operation": {
+            "type": "string",
+            "enum": [
+                "read_channel",
+                "read_message",
+                "send_message",
+                "edit_own_message",
+                "delete_own_message",
+                "reply_message",
+                "add_reaction",
+                "remove_own_reaction",
+                "attach_file",
+                "create_thread",
+                "send_thread_message",
+                "archive_own_thread",
+                "update_progress",
+            ],
+        },
         "query": {"type": "object", "additionalProperties": True},
         "raw": {"type": "string", "maxLength": 65000},
         "calendar_id": {"type": "string"},

@@ -11,6 +11,11 @@ from .adapters import AmbiguousEffectError, ProviderError, ProviderRecord
 from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
 from .calculations import preliminary_analysis
 from .config import RuntimeConfig, TrelloScope
+from .discord_policy import (
+    DiscordActionClass,
+    announcement_is_safe,
+    classify_discord_action,
+)
 from .google_policy import GoogleActionClass, classify_google_action
 from .policy import Principal, Role
 
@@ -291,6 +296,21 @@ class ScottyService:
             raise ProviderError("Discord announcement destination is not configured")
         if type(content) is not str or not content.strip() or len(content) > 2000:
             raise ProviderError("Discord announcement must contain 1-2000 characters")
+        if (
+            classify_discord_action(
+                "announce",
+                {"channel_id": channel_id, "content": content},
+                destinations=(channel_id,),
+            )
+            is not DiscordActionClass.CONSEQUENCE
+        ):
+            raise ProviderError("that Discord announcement is not permitted")
+        if not announcement_is_safe(content, self.config):
+            # Refused without repeating the offending text anywhere.
+            raise ProviderError(
+                "an announcement may not carry private channel, user, maintainer, "
+                "or credential details"
+            )
         return self.approvals.propose(
             requester=requester,
             approver=self._approver_for(requester),

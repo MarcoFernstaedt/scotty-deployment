@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
@@ -29,6 +31,15 @@ class HttpResponse:
     body: object
 
 
+@dataclass(frozen=True, slots=True)
+class Attachment:
+    """One bounded file to upload alongside a JSON payload."""
+
+    filename: str
+    content_type: str
+    data: bytes
+
+
 class Transport(Protocol):
     def request(
         self,
@@ -38,6 +49,7 @@ class Transport(Protocol):
         headers: Mapping[str, str] | None = None,
         query: Mapping[str, object] | None = None,
         json_body: Mapping[str, object] | None = None,
+        attachment: Attachment | None = None,
     ) -> HttpResponse: ...
 
 
@@ -64,6 +76,7 @@ class HttpTransport:
         headers: Mapping[str, str] | None = None,
         query: Mapping[str, object] | None = None,
         json_body: Mapping[str, object] | None = None,
+        attachment: Attachment | None = None,
     ) -> HttpResponse:
         upper = method.upper()
         if upper not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
@@ -78,7 +91,10 @@ class HttpTransport:
             url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded, ""))
         body_bytes = None
         request_headers = dict(headers or {})
-        if json_body is not None:
+        if attachment is not None:
+            body_bytes, content_type = _multipart(json_body, attachment)
+            request_headers["Content-Type"] = content_type
+        elif json_body is not None:
             body_bytes = json.dumps(
                 json_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode("utf-8")
@@ -122,6 +138,43 @@ def _parse_json(raw: bytes) -> object:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProviderError("provider returned malformed JSON") from exc
+
+
+#: The upload ceiling for one attachment, matched by the Discord policy.
+MAX_ATTACHMENT_BYTES = 8_000_000
+
+_MULTIPART_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _multipart(json_body: Mapping[str, object] | None, attachment: Attachment) -> tuple[bytes, str]:
+    """Build one bounded multipart body: a JSON payload plus a single file."""
+
+    if not _MULTIPART_NAME.fullmatch(attachment.filename):
+        raise ProviderError("attachment filename is malformed")
+    if not _MULTIPART_NAME.fullmatch(attachment.content_type.replace("/", "-")):
+        raise ProviderError("attachment content type is malformed")
+    if not attachment.data or len(attachment.data) > MAX_ATTACHMENT_BYTES:
+        raise ProviderError("attachment size is outside the permitted range")
+    boundary = f"----scotty{uuid.uuid4().hex}"
+    payload = json.dumps(
+        json_body or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    if len(payload) > 65_536:
+        raise ProviderError("provider request body exceeds the limit")
+    parts = [
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="payload_json"\r\n',
+        b"Content-Type: application/json\r\n\r\n",
+        payload,
+        f"\r\n--{boundary}\r\n".encode(),
+        (
+            f'Content-Disposition: form-data; name="files[0]"; filename="{attachment.filename}"\r\n'
+        ).encode(),
+        f"Content-Type: {attachment.content_type}\r\n\r\n".encode(),
+        attachment.data,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 def require_success(response: HttpResponse, *, expected: tuple[int, ...] = (200,)) -> object:
