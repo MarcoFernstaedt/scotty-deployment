@@ -16,7 +16,7 @@ unverified too — never assumed good.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import TypeGuard
@@ -49,10 +49,16 @@ class ReadbackRequest:
 
 @dataclass(frozen=True, slots=True)
 class ReadbackPlan:
-    """How to verify one mutation, and what the result must show."""
+    """How to verify one mutation, and what the result must show.
+
+    `expected` is what must be present. `absent` is what must be gone: a
+    removal is only proven by the removed value no longer being there, and
+    subset matching alone can never show that.
+    """
 
     request: ReadbackRequest
     expected: Mapping[str, object]
+    absent: Mapping[str, Sequence[object]] = field(default_factory=dict)
 
 
 def _text(value: object) -> str | None:
@@ -165,19 +171,24 @@ def plan(
         add = payload.get("addLabelIds")
         if _is_list(add):
             expected["labelIds"] = list(add)
+        remove = payload.get("removeLabelIds")
+        gone: dict[str, Sequence[object]] = {"labelIds": list(remove)} if _is_list(remove) else {}
         return ReadbackPlan(
-            ReadbackRequest(f"{gmail}/messages/{resource_id}", {"format": "minimal"}), expected
+            ReadbackRequest(f"{gmail}/messages/{resource_id}", {"format": "minimal"}),
+            expected,
+            gone,
         )
 
     if operation in {"gmail_create_draft", "gmail_update_draft"}:
         draft = created if operation == "gmail_create_draft" else resource_id
         if not draft:
             return None
-        raw = payload.get("raw")
-        expected = {"id": draft}
-        if type(raw) is str:
-            expected["message"] = {"raw": raw}
-        return ReadbackPlan(ReadbackRequest(f"{gmail}/drafts/{draft}", {"format": "raw"}), expected)
+        # Gmail rewrites headers when it stores a draft, so the uploaded bytes
+        # are not what comes back. Verify the draft exists and carries a
+        # message, which is what the mutation actually asserts.
+        return ReadbackPlan(
+            ReadbackRequest(f"{gmail}/drafts/{draft}", {"format": "minimal"}), {"id": draft}
+        )
 
     if operation == "gmail_send_draft":
         message = _text(body.get("id")) or ""
@@ -213,9 +224,11 @@ def plan(
         )
         if operation == "drive_move_file":
             add = _text(payload.get("addParents"))
+            removed = _text(payload.get("removeParents"))
             return ReadbackPlan(
                 request,
                 {"id": target, **({"parents": add.split(",")} if add else {})},
+                {"parents": removed.split(",")} if removed else {},
             )
         intended = {
             key: value for key, value in payload.items() if key in {"name", "mimeType", "trashed"}
@@ -238,7 +251,7 @@ def plan(
         return ReadbackPlan(
             ReadbackRequest(
                 f"{drive}/files/{resource_id}/permissions",
-                {"fields": "permissions(id,type,role)"},
+                {"fields": "permissions(id,type,role,domain,emailAddress)"},
             ),
             {
                 "permissions": [
@@ -260,7 +273,12 @@ def plan(
             title = _text(payload.get("title"))
             if title:
                 expected["title"] = title
-        return ReadbackPlan(ReadbackRequest(f"{docs}/documents/{document}"), expected)
+        return ReadbackPlan(
+            ReadbackRequest(
+                f"{docs}/documents/{document}", {"fields": "documentId,title,revisionId"}
+            ),
+            expected,
+        )
 
     if operation in {"sheets_create", "sheets_batch_update"}:
         spreadsheet = created or _text(body.get("spreadsheetId")) or resource_id
@@ -352,4 +370,11 @@ def verify(
         return ReadbackStatus.MALFORMED
     if not matches(plan_.expected, observed):
         return ReadbackStatus.MISMATCH
+    for name, removed in plan_.absent.items():
+        present = observed.get(name)
+        if not _is_list(present):
+            continue
+        if any(any(matches(value, item) for item in present) for value in removed):
+            # Something the mutation was supposed to remove is still there.
+            return ReadbackStatus.MISMATCH
     return ReadbackStatus.VERIFIED

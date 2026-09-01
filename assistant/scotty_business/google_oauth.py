@@ -525,6 +525,19 @@ def publish_consent_prompt(path: Path, request: ConsentRequest, *, owner_uid: in
             temporary.unlink(missing_ok=True)
 
 
+def clear_consent_prompt(path: Path) -> None:
+    """Remove a published consent prompt once its attempt is over.
+
+    The PKCE verifier for an attempt lives only in the root-owned side of that
+    attempt, so once the attempt ends the published URL can no longer be
+    completed by anyone. Leaving it in place would show Trent a dead link that
+    looks live, so the prompt is removed whether consent succeeded or failed.
+    """
+
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
 def read_consent_prompt(path: Path) -> Mapping[str, object] | None:
     """Read the non-secret consent prompt, or None when there is none."""
 

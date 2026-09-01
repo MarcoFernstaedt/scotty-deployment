@@ -26,13 +26,17 @@ scope.
 
 ## Importing the client
 
-The client JSON is imported through local setup, as root, into
+Download the client JSON from the Cloud console onto the server. The first time
+an account is connected, local setup asks for its path — the path is not secret,
+so it is typed visibly — and imports the file, as root, into
 
     /srv/Scotty/operator/google-oauth-client.json    root:root 0600
 
 It is validated on import: it must be an installed/Desktop client, and its
 authorization and token endpoints must be Google's own. A `web` client, or a
 client pointing anywhere else, is refused at import rather than at consent time.
+Once the protected copy exists, setup never asks for the path again; delete that
+file to import a different client.
 
 ## Consent, without a browser on the server
 
@@ -44,6 +48,11 @@ non-secret URL for Scotty to show Trent in his own private channel:
 That file holds only the authorization URL, the redirect address, and the
 scopes. The client secret and the PKCE verifier stay in the root-owned files,
 so showing the URL in Discord exposes nothing that could complete the flow.
+
+It lives exactly as long as the attempt does. When the attempt ends — whether
+consent succeeded, failed, or was abandoned — the file is removed, because its
+verifier is gone and the URL can no longer be completed by anyone. Scotty
+therefore never shows a stale link that looks live.
 
 Trent opens the URL as the configured Workspace account and approves it. The
 browser then redirects to

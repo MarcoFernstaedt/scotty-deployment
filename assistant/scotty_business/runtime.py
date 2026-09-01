@@ -485,7 +485,10 @@ class Runtime:
                 "providers": {
                     provider: _guidance_json(provider, status[provider]) for provider in PROVIDERS
                 },
-                "credential_store": self.credential_store_status(),
+                # What the root-owned broker holds. A provider can be connected
+                # from the process environment without the broker holding
+                # anything, so this is reported separately rather than merged.
+                "broker_held_credentials": self.credential_store_status(),
                 "progress": [_progress_json(item) for item in progress],
                 "resume_at": resume.provider if resume is not None else None,
                 "next_action": (
@@ -497,22 +500,6 @@ class Runtime:
         if name not in PROVIDERS:
             raise ValueError("provider is not part of this deployment")
         current = next(item for item in progress if item.provider == name)
-        if name == "google_workspace" and not status[name]:
-            prompt = read_consent_prompt(self.state_dir / "google-consent.json")
-            if prompt is not None:
-                # Presenting the URL is safe: it carries the client id and the
-                # scopes, never the client secret, the verifier, or a token.
-                return {
-                    **_guidance_json(name, status[name]),
-                    **_progress_json(current),
-                    "consent": prompt,
-                    "next_action": (
-                        "Open the authorization URL as the configured Workspace account, "
-                        "approve it, then give the address you land on to the operator for "
-                        f"the local setup command. Scotty cannot accept it here. "
-                        f"Then run {LOCAL_SETUP_COMMAND}."
-                    ),
-                }
         failure = _text(args, "setup_failure", optional=True)
         if failure is not None:
             return {
@@ -541,7 +528,20 @@ class Runtime:
                 "accepted": True,
                 "next_action": resume.next_action if resume is not None else current.next_action,
             }
-        return {**_guidance_json(name, status[name]), **_progress_json(current)}
+        answer = {**_guidance_json(name, status[name]), **_progress_json(current)}
+        if name == "google_workspace" and not status[name]:
+            prompt = read_consent_prompt(self.state_dir / "google-consent.json")
+            if prompt is not None:
+                # Presenting the URL is safe: it carries the client id and the
+                # scopes, never the client secret, the verifier, or a token.
+                answer["consent"] = prompt
+                answer["next_action"] = (
+                    "Open the authorization URL as the configured Workspace account, "
+                    "approve it, then give the address you land on to the operator for "
+                    "the local setup command. Scotty cannot accept it here. Then run "
+                    f"{LOCAL_SETUP_COMMAND}."
+                )
+        return answer
 
     def handle_read(self, principal: Principal, args: Mapping[str, object]) -> object:
         operation = _text(args, "operation")

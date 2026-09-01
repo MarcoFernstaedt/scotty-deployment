@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -858,6 +859,120 @@ class AuthoritativeReadbackTests(unittest.TestCase):
         adapter.execute_routine("calendar_cancel_event", f"primary/{created.source_id}", {})
         self.assertEqual(google.events[("primary", created.source_id)]["status"], "cancelled")
 
+    def test_a_removal_is_verified_only_when_the_value_is_really_gone(self) -> None:
+        """Subset matching proves an addition. Only absence proves a removal."""
+
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+        adapter.execute_routine(
+            "gmail_modify_labels",
+            "message-1",
+            {"addLabelIds": ["Label_1"], "removeLabelIds": ["UNREAD"]},
+        )
+        self.assertNotIn("UNREAD", google.messages["message-1"]["labelIds"])
+
+        # A provider that acknowledges the removal but keeps the label is the
+        # exact case a present-only comparison would call verified.
+        stubborn, google = self.adapter()
+        google.readback_status = 200
+        google.readback_body = {"id": "message-1", "labelIds": ["INBOX", "UNREAD", "Label_1"]}
+        with self.assertRaises(AmbiguousEffectError):
+            stubborn.execute_routine(
+                "gmail_modify_labels",
+                "message-1",
+                {"addLabelIds": ["Label_1"], "removeLabelIds": ["UNREAD"]},
+            )
+
+    def test_a_move_is_verified_only_when_the_old_parent_is_gone(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+        google.files["file-1"]["parents"] = ["folder-old"]
+        adapter.execute_routine(
+            "drive_move_file",
+            "file-1",
+            {"addParents": "folder-new", "removeParents": "folder-old"},
+        )
+        self.assertEqual(google.files["file-1"]["parents"], ["folder-new"])
+
+        copied, google = self.adapter()
+        google.readback_status = 200
+        # A copy rather than a move: the file is in both places.
+        google.readback_body = {"id": "file-1", "parents": ["folder-old", "folder-new"]}
+        with self.assertRaises(AmbiguousEffectError):
+            copied.execute_routine(
+                "drive_move_file",
+                "file-1",
+                {"addParents": "folder-new", "removeParents": "folder-old"},
+            )
+
+    def test_a_draft_is_verified_by_identity_not_by_the_bytes_gmail_rewrote(self) -> None:
+        adapter, google = self.adapter()
+        record = adapter.execute_routine("gmail_create_draft", "", {"raw": "c3ludGhldGlj"})
+        self.assertTrue(record.source_id)
+        # Gmail normalizes headers when it stores a draft, so a byte comparison
+        # would report a false mismatch on a draft that was stored correctly.
+        self.assertEqual([method for method, _ in google.calls], ["POST", "GET"])
+
+    def test_every_readback_asks_for_the_fields_it_intends_to_compare(self) -> None:
+        """A field mask narrower than the comparison can never verify."""
+
+        from assistant.scotty_business.google_readback import plan
+
+        endpoints = {
+            "gmail": "https://gmail.example.invalid",
+            "calendar": "https://calendar.example.invalid",
+            "drive": "https://drive.example.invalid",
+            "docs": "https://docs.example.invalid",
+            "sheets": "https://sheets.example.invalid",
+            "people": "https://people.example.invalid",
+        }
+        cases = (
+            ("drive_update_file", "file-1", {"name": "Renamed"}, {}),
+            ("drive_move_file", "file-1", {"addParents": "folder-new"}, {}),
+            ("drive_trash_file", "file-1", {}, {}),
+            (
+                "drive_change_permissions",
+                "file-1",
+                {"type": "user", "role": "reader"},
+                {},
+            ),
+            ("docs_create", "", {"title": "Synthetic"}, {"documentId": "document-1"}),
+            (
+                "docs_batch_update",
+                "document-1",
+                {"requests": [{"insertText": {}}]},
+                {"documentId": "document-1"},
+            ),
+            (
+                "contacts_update",
+                "people/c1",
+                {"names": [{"givenName": "Synthetic"}]},
+                {},
+            ),
+        )
+        for operation, resource, payload, response in cases:
+            with self.subTest(operation=operation):
+                plan_ = plan(operation, resource, payload, response, endpoints)
+                assert plan_ is not None
+                query = plan_.request.query or {}
+                mask = str(query.get("fields") or query.get("personFields") or "")
+                if not mask:
+                    continue
+                requested = {
+                    part.split("(")[0] for part in mask.replace(" ", "").split(",") if part
+                }
+                if "personFields" in query:
+                    # People API returns the resource identity outside the mask.
+                    requested |= {"resourceName", "etag"}
+                compared = set(plan_.expected) | set(plan_.absent)
+                self.assertLessEqual(
+                    compared,
+                    requested,
+                    f"{operation} compares fields its readback never asks for",
+                )
+
 
 class UnverifiedConsequenceLedgerTests(unittest.TestCase):
     """An unverified consequence write lands in the ledger as unknown."""
@@ -1416,6 +1531,137 @@ class HeadlessConsentTests(unittest.TestCase):
         self.assertTrue(any("hidden" in prompt.lower() for prompt in prompts))
         self.assertTrue(any("accounts.google.com" in line for line in printed))
         self.assertFalse((root / "token.json").exists())
+
+    def test_local_setup_imports_the_desktop_client_before_consent(self) -> None:
+        """The documented import step is reachable from local setup itself."""
+
+        from assistant.scotty_business.setup import SetupError, connect_google_workspace
+
+        def attempt(root: Path, source: Path, protected: Path) -> None:
+            connect_google_workspace(
+                "scotty.synthetic@example.invalid",
+                client_path=protected,
+                token_path=root / "token.json",
+                prompt_path=root / "prompt.json",
+                input_fn=lambda _: str(source),
+                hidden_fn=lambda _: ("http://localhost:8765/oauth2/callback?state=x&code=y"),
+                output=lambda _: None,
+                owner_uid=os.getuid(),
+                runtime_uid=os.getuid(),
+            )
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            downloaded = self.client_file(root)
+            protected = root / "protected" / "google-oauth-client.json"
+            # The exchange still fails closed on the unknown state; what this
+            # proves is that the client arrived through local setup instead of
+            # having to be placed by hand for unreachable code.
+            with self.assertRaises(SetupError):
+                attempt(root, downloaded, protected)
+            self.assertTrue(protected.is_file())
+            self.assertEqual(protected.stat().st_mode & 0o777, 0o600)
+            self.assertFalse((root / "token.json").exists())
+
+            wrong = root / "web-client.json"
+            wrong.write_text(json.dumps({"web": self.CLIENT["installed"]}), encoding="utf-8")
+            wrong.chmod(0o600)
+            refused = root / "refused" / "client.json"
+            with self.assertRaises(SetupError):
+                attempt(root, wrong, refused)
+            self.assertFalse(refused.exists())
+
+    def test_an_already_imported_client_is_never_re_imported(self) -> None:
+        from assistant.scotty_business.setup import SetupError, connect_google_workspace
+
+        asked: list[str] = []
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            client = self.client_file(root)
+            with self.assertRaises(SetupError):
+                connect_google_workspace(
+                    "scotty.synthetic@example.invalid",
+                    client_path=client,
+                    token_path=root / "token.json",
+                    prompt_path=root / "prompt.json",
+                    input_fn=lambda prompt: asked.append(prompt) or "",
+                    hidden_fn=lambda _: ("http://localhost:8765/oauth2/callback?state=x&code=y"),
+                    output=lambda _: None,
+                    owner_uid=os.getuid(),
+                    runtime_uid=os.getuid(),
+                )
+        self.assertEqual(asked, [])
+
+    def test_the_consent_prompt_never_outlives_its_attempt(self) -> None:
+        """A published URL whose verifier is gone must not be shown as live."""
+
+        from assistant.scotty_business.google_oauth import read_consent_prompt
+        from assistant.scotty_business.setup import SetupError, connect_google_workspace
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            client = self.client_file(root)
+            prompt_path = root / "prompt.json"
+            published: list[str] = []
+
+            with self.assertRaises(SetupError):
+                connect_google_workspace(
+                    "scotty.synthetic@example.invalid",
+                    client_path=client,
+                    token_path=root / "token.json",
+                    prompt_path=prompt_path,
+                    hidden_fn=lambda _: (
+                        # While the attempt is live the URL is showable.
+                        published.append(str(read_consent_prompt(prompt_path)))
+                        or "http://localhost:8765/oauth2/callback?state=x&code=y"
+                    ),
+                    output=lambda _: None,
+                    owner_uid=os.getuid(),
+                    runtime_uid=os.getuid(),
+                )
+            self.assertTrue(any("accounts.google.com" in line for line in published))
+            # The attempt is over, so the PKCE verifier is gone with it.
+            self.assertFalse(prompt_path.exists())
+            self.assertIsNone(read_consent_prompt(prompt_path))
+
+    def test_a_stale_prompt_is_cleared_once_the_account_is_connected(self) -> None:
+        from assistant.scotty_business.google_oauth import (
+            GoogleTokenStore,
+            OAuthToken,
+            publish_consent_prompt,
+            read_consent_prompt,
+        )
+        from assistant.scotty_business.setup import connect_google_workspace
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            prompt_path = root / "prompt.json"
+            publish_consent_prompt(prompt_path, self.request(root), owner_uid=os.getuid())
+            token_path = root / "token.json"
+            GoogleTokenStore(token_path, owner_uid=os.getuid(), owner_gid=os.getgid()).write(
+                OAuthToken(
+                    access_token="synthetic-access",
+                    refresh_token="synthetic-refresh",
+                    expires_at=int(time.time()) + 3600,
+                    scopes=GOOGLE_OAUTH_SCOPES,
+                    account_email="scotty.synthetic@example.invalid",
+                    client_id="synthetic-client-id.apps.googleusercontent.com",
+                    client_secret="synthetic-client-secret-0001",
+                )
+            )
+            connect_google_workspace(
+                "scotty.synthetic@example.invalid",
+                client_path=self.client_file(root),
+                token_path=token_path,
+                prompt_path=prompt_path,
+                input_fn=lambda _: "",
+                hidden_fn=lambda _: "",
+                output=lambda _: None,
+                owner_uid=os.getuid(),
+                runtime_uid=os.getuid(),
+            )
+            self.assertFalse(prompt_path.exists())
+            self.assertIsNone(read_consent_prompt(prompt_path))
 
 
 class GoogleConsentCallbackTests(unittest.TestCase):

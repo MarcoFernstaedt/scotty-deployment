@@ -19,6 +19,7 @@ from .google_oauth import (
     GoogleOAuthError,
     GoogleTokenStore,
     begin_consent,
+    clear_consent_prompt,
     complete_consent,
     import_client,
     publish_consent_prompt,
@@ -1170,12 +1171,19 @@ def connect_google_workspace(
     client_path: Path = GOOGLE_CLIENT_PATH,
     token_path: Path | None = None,
     prompt_path: Path | None = None,
+    input_fn: Callable[[str], str] = input,
     hidden_fn: Callable[[str], str] = getpass.getpass,
     output: Callable[[str], None] = print,
     owner_uid: int = 0,
     runtime_uid: int = _RUNTIME_UID,
 ) -> None:
     """Complete Google consent on a headless server, without a local browser.
+
+    The Desktop OAuth client is imported here, through local setup, the first
+    time this account is connected: the operator downloads it from the Google
+    Cloud console and gives its path, which is not secret and so is read
+    visibly. Once imported it stays in the protected root-owned path and is
+    never asked for again.
 
     The server has no browser, so it never tries to open one. It prints the
     exact authorization URL for Trent to open wherever he already is, publishes
@@ -1184,12 +1192,27 @@ def connect_google_workspace(
     code, so it is read through hidden input and never echoed.
     """
 
+    prompt_file = prompt_path or GOOGLE_PROMPT_PATH
     store = GoogleTokenStore(token_path or GOOGLE_TOKEN_PATH)
     if store.ready(GOOGLE_OAUTH_SCOPES, account_email):
+        # A prompt left over from an earlier attempt names an authorization URL
+        # whose verifier is long gone. Clear it rather than show a dead link.
+        clear_consent_prompt(prompt_file)
         return
+    if not client_path.exists():
+        import_google_client(
+            Path(
+                _visible(
+                    input_fn,
+                    "Path to the downloaded Google Desktop OAuth client JSON: ",
+                )
+            ),
+            destination=client_path,
+            owner_uid=owner_uid,
+        )
     try:
         request = begin_consent(client_path, GOOGLE_OAUTH_SCOPES, owner_uid=owner_uid)
-        publish_consent_prompt(prompt_path or GOOGLE_PROMPT_PATH, request, owner_uid=runtime_uid)
+        publish_consent_prompt(prompt_file, request, owner_uid=runtime_uid)
         output("Open this URL as the configured Google Workspace account:")
         output(request.authorization_url)
         output(
@@ -1207,6 +1230,9 @@ def connect_google_workspace(
         raise SetupError(
             "Google OAuth is incomplete; Scotty remains stopped until consent succeeds"
         ) from exc
+    finally:
+        # The attempt is over either way, and its PKCE verifier died with it.
+        clear_consent_prompt(prompt_file)
     if verified.casefold() != account_email.casefold() or not store.ready(
         GOOGLE_OAUTH_SCOPES, account_email
     ):
@@ -1267,9 +1293,11 @@ __all__ = [
     "GUARD_PLUGIN",
     "channel_plans",
     "collect_inputs",
+    "connect_google_workspace",
     "discord_allowed_users",
     "ensure_profile_homes",
     "hermes_config_mapping",
+    "import_google_client",
     "main",
     "next_steps",
     "private_mapping",

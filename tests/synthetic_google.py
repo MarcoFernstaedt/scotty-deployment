@@ -318,9 +318,9 @@ class SyntheticGoogle:
         if path.endswith(":deleteContact") and method == "DELETE":
             self.people.pop(urllib.parse.unquote(path.removesuffix(":deleteContact")), None)
             return self._ok({}, status=204)
+        if method == "GET" and path.startswith("people/me/connections"):
+            return self._ok({"connections": []})
         if method == "GET" and path.startswith("people/"):
             record = self.people.get(urllib.parse.unquote(path))
             return self._ok(dict(record)) if record else self._missing()
-        if method == "GET" and path.startswith("people/me/connections"):
-            return self._ok({"connections": []})
         return None
