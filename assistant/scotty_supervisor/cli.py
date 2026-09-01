@@ -30,9 +30,17 @@ from .state import (
     restore_state,
     verify_backup,
 )
-from .supervise import DockerContainer, Supervisor
+from .supervise import (
+    BLOCKED,
+    DEGRADED,
+    HEALTHY,
+    UNKNOWN,
+    DockerContainer,
+    Supervisor,
+)
 
 CONTAINER = "scotty"
+NETWORK = "scotty-egress"
 DEPLOYMENT_DIR = Path("/srv/Scotty")
 START_COMMAND = "/usr/local/sbin/scotty-start"
 STATE_DIR = Path("/srv/Scotty/data/scotty")
@@ -40,6 +48,14 @@ SUPERVISOR_DIR = Path("/var/lib/scotty/supervisor")
 BACKUP_DIR = Path("/var/lib/scotty/backups")
 RELEASES_DIR = Path("/var/lib/scotty/releases")
 WATCH_INTERVAL_SECONDS = 15.0
+
+#: Written by the operator's own start path once setup is accepted. Its absence
+#: is what keeps supervision from putting a half-installed deployment live.
+ACTIVATION_MARKER = "activated"
+
+#: Below this much free disk, the deployment is reported degraded rather than
+#: left to fail on the next write.
+MIN_FREE_BYTES = 256 * 1024 * 1024
 
 
 def _run(command: Sequence[str]) -> tuple[int, str]:
@@ -76,12 +92,67 @@ def _integrity() -> bool:
         return False
 
 
+def _activated() -> bool:
+    """Whether anybody has accepted this deployment into service.
+
+    Written once by the operator's own start path, root-owned, outside every
+    mount. Without it a reboot that surfaces a stopped container would be
+    enough to put a half-installed deployment live, which is not a decision
+    supervision gets to make.
+    """
+
+    marker = SUPERVISOR_DIR / ACTIVATION_MARKER
+    return marker.is_file() and not marker.is_symlink()
+
+
+def activate() -> Path:
+    """Record that a person accepted this deployment. Root only, once."""
+
+    SUPERVISOR_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = SUPERVISOR_DIR / ACTIVATION_MARKER
+    if not marker.exists():
+        marker.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+        marker.chmod(0o600)
+    return marker
+
+
+def _health() -> tuple[str, str]:
+    """Whether the deployment is actually serving, not merely running.
+
+    Each of these is something that has been up while the assistant answered
+    nobody: a container whose process died inside it, a state directory that
+    disappeared under a bad mount, a disk with nowhere left to write, and a
+    consumer lease no live process holds.
+    """
+
+    status, output = _run(["docker", "inspect", "--format", "{{.State.Status}}", CONTAINER])
+    if status != 0:
+        return UNKNOWN, "the container's state could not be read"
+    observed = output.strip()
+    if observed != "running":
+        return DEGRADED, f"the container reports {observed or 'nothing'}"
+    if not STATE_DIR.is_dir():
+        return BLOCKED, "the deployment's state directory is not there"
+    try:
+        usage = shutil.disk_usage(STATE_DIR)
+    except OSError:
+        return UNKNOWN, "the deployment's disk could not be measured"
+    if usage.free < MIN_FREE_BYTES:
+        return DEGRADED, "the deployment is nearly out of disk"
+    lease = STATE_DIR / "consumer.lease"
+    if not lease.is_file():
+        return DEGRADED, "no process is holding the Discord consumer lease"
+    return HEALTHY, ""
+
+
 def _supervisor() -> Supervisor:
     return Supervisor(
         DockerContainer(CONTAINER, _run),
         SUPERVISOR_DIR,
         alert=_alert,
         integrity=_integrity,
+        activated=_activated,
+        health=_health,
     )
 
 
@@ -152,6 +223,9 @@ def run(argv: Sequence[str]) -> int:
             return 0
         if command == "rollback":
             return _rollback(execute="--execute" in rest)
+        if command == "activate":
+            print(json.dumps({"activated": str(activate())}, indent=2))
+            return 0
         if command == "uninstall":
             return _uninstall()
     except (StateError, ReleaseError) as exc:
@@ -235,9 +309,61 @@ def _watch() -> int:
 
 
 def _uninstall() -> int:
-    """Remove what this product installed, and nothing else on the host."""
+    """Remove what this product installed, and nothing else on the host.
+
+    Disabling supervision and the broker while leaving the container running
+    was the defect: the Discord consumer stayed connected and the bridge stayed
+    up, so an "uninstalled" deployment was still answering people. Supervision
+    is held first so nothing restarts what is being removed, and the container
+    is stopped and proven stopped before anything else happens.
+    """
 
     removed: list[str] = []
+    _supervisor().hold("uninstalling")
+    container = DockerContainer(CONTAINER, _run)
+    if container.present():
+        owned, ownership = _run(
+            [
+                "docker",
+                "inspect",
+                "--format",
+                '{{ index .Config.Labels "com.scotty.deployment" }}',
+                CONTAINER,
+            ]
+        )
+        if owned != 0 or ownership.strip() != "managed":
+            # Something with this name that this product did not create.
+            print(
+                "scotty-supervisor: refusing to remove a container this product does not own",
+                file=sys.stderr,
+            )
+            return 1
+        if container.is_running():
+            container.stop()
+        if container.is_running():
+            print(
+                "scotty-supervisor: the container did not stop; nothing was removed",
+                file=sys.stderr,
+            )
+            return 1
+        removed.append(f"container {CONTAINER} (stopped)")
+        status, _ = _run(["docker", "container", "rm", CONTAINER])
+        if status == 0:
+            removed.append(f"container {CONTAINER} (removed)")
+    network, listed = _run(
+        [
+            "docker",
+            "network",
+            "inspect",
+            "--format",
+            '{{ index .Labels "com.scotty.deployment" }}',
+            NETWORK,
+        ]
+    )
+    if network == 0 and listed.strip() == "managed":
+        status, _ = _run(["docker", "network", "rm", NETWORK])
+        if status == 0:
+            removed.append(f"network {NETWORK}")
     for unit in (
         "scotty-supervisor.service",
         "scotty-credential-broker.service",

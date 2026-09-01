@@ -395,5 +395,163 @@ class GuidedSetupThroughTheReadToolTests(unittest.TestCase):
             self.assertIn("setup status", unknown["diagnosis"])
 
 
+class ActorQualifiedStagingTests(unittest.TestCase):
+    """Mikey's Google account survives being closed and reopened.
+
+    The defect this covers lost data in silence. Staging wrote the employee's
+    account under `employee_account_email`; reading validated every stored
+    field against a schema that knew only `account_email`, so the employee's
+    entry failed validation and was dropped on the way back in. Mikey typed his
+    address, saw it accepted, came back, and it was gone -- and root setup
+    never saw it either.
+    """
+
+    def store(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from assistant.scotty_business.setup_flow import SetupStagingStore
+
+        directory = tempfile.TemporaryDirectory(prefix="scotty-staging-")
+        self.addCleanup(directory.cleanup)
+        return SetupStagingStore(
+            Path(directory.name) / "setup-staging.json", owner_uid=os.geteuid()
+        )
+
+    def test_each_user_s_google_account_survives_a_reopen(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        store = self.store()
+        store.stage(
+            "google_workspace",
+            "account_email",
+            "trent@example.invalid",
+            role=Role.MAIN_OPERATOR,
+        )
+        store.stage(
+            "google_workspace", "account_email", "mikey@example.invalid", role=Role.EMPLOYEE
+        )
+        # Close and reopen: a new store over the same file, as root setup does.
+        reopened = type(store)(store.path, owner_uid=store.owner_uid)
+        staged = reopened.read()["google_workspace"]
+        self.assertEqual(staged["account_email"], "trent@example.invalid")
+        self.assertEqual(staged["employee_account_email"], "mikey@example.invalid")
+
+    def test_each_user_sees_their_own_progress_and_not_the_others(self) -> None:
+        import synthetic
+
+        from assistant.scotty_business.config import RuntimeConfig
+        from assistant.scotty_business.policy import Role
+        from assistant.scotty_business.setup_flow import setup_progress
+
+        store = self.store()
+        store.stage(
+            "google_workspace", "account_email", "mikey@example.invalid", role=Role.EMPLOYEE
+        )
+        config = RuntimeConfig.from_mapping(synthetic.private_mapping())
+        staged = store.read()
+        for role, expected in ((Role.EMPLOYEE, True), (Role.MAIN_OPERATOR, False)):
+            with self.subTest(role=role):
+                progress = {
+                    item.provider: item for item in setup_progress(config, {}, staged, role=role)
+                }["google_workspace"]
+                self.assertEqual(not progress.missing, expected)
+
+    def test_both_accounts_reach_root_setup_after_a_reopen(self) -> None:
+        """Stage, close, reopen, apply: the whole path both users walk.
+
+        The end that mattered was the middle one. Root setup always read the
+        employee's field correctly; the runtime dropped it before root ever
+        saw the file.
+        """
+
+        import synthetic
+
+        from assistant.scotty_business.policy import Role
+        from assistant.scotty_business.setup import SetupInputs, apply_staged_identifiers
+
+        store = self.store()
+        store.stage(
+            "google_workspace",
+            "account_email",
+            "trent@example.invalid",
+            role=Role.MAIN_OPERATOR,
+        )
+        store.stage(
+            "google_workspace", "account_email", "mikey@example.invalid", role=Role.EMPLOYEE
+        )
+        reopened = type(store)(store.path, owner_uid=store.owner_uid)
+
+        applied = apply_staged_identifiers(
+            SetupInputs(
+                model_provider="openrouter",
+                model_name="synthetic/model",
+                guild_id=synthetic.CLIENT_GUILD,
+                operator_channel_id=synthetic.OPERATOR_CHANNEL,
+                operator_user_id=synthetic.OPERATOR_USER,
+                employee_channel_id=synthetic.EMPLOYEE_CHANNEL,
+                employee_user_id=synthetic.EMPLOYEE_USER,
+                route_guild_id=synthetic.ROUTE_GUILD,
+                route_channel_id=synthetic.ROUTE_CHANNEL,
+                route_user_id=synthetic.ROUTE_USER,
+                secrets={"DISCORD_BOT_TOKEN": "synthetic-discord"},
+            ),
+            reopened.read(),
+        )
+        self.assertEqual(applied.google_account_email, "trent@example.invalid")
+        self.assertEqual(applied.employee_google_account_email, "mikey@example.invalid")
+        # Two accounts, separately bound. Neither user's consent is the other's.
+        self.assertNotEqual(applied.google_account_email, applied.employee_google_account_email)
+
+    def test_one_user_can_never_stage_into_the_others_google_field(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        store = self.store()
+        # Naming the other user's field explicitly is refused: which field a
+        # user's account lives in is the deployment's decision, not theirs.
+        with self.assertRaises(SetupFlowError):
+            store.stage(
+                "google_workspace",
+                "employee_account_email",
+                "mikey@example.invalid",
+                role=Role.MAIN_OPERATOR,
+            )
+
+    def test_an_actor_qualified_field_is_a_declared_field_not_a_special_case(self) -> None:
+        from assistant.scotty_business.setup_flow import (
+            REQUIRED_IDENTIFIERS,
+            validate_identifier,
+        )
+
+        fields = {item.field for item in REQUIRED_IDENTIFIERS["google_workspace"]}
+        self.assertEqual(fields, {"account_email", "employee_account_email"})
+        # And both validate as what they are: an email address.
+        self.assertEqual(
+            validate_identifier("google_workspace", "employee_account_email", "m@e.invalid"),
+            "m@e.invalid",
+        )
+        with self.assertRaises(SetupFlowError):
+            validate_identifier("google_workspace", "employee_account_email", "not-an-email")
+
+    def test_a_field_nobody_declared_is_refused_when_it_is_staged(self) -> None:
+        store = self.store()
+        with self.assertRaises(SetupFlowError):
+            store.stage("google_workspace", "mystery_field", "x@example.invalid")
+
+    def test_a_tampered_file_loses_only_what_is_actually_unreadable(self) -> None:
+        import json
+
+        store = self.store()
+        store.stage("google_workspace", "account_email", "trent@example.invalid")
+        body = json.loads(store.path.read_text(encoding="utf-8"))
+        body["google_workspace"]["employee_account_email"] = "not-an-email"
+        store.path.write_text(json.dumps(body), encoding="utf-8")
+        staged = store.read()["google_workspace"]
+        # The good entry stands; the bad one is gone rather than trusted.
+        self.assertEqual(staged["account_email"], "trent@example.invalid")
+        self.assertNotIn("employee_account_email", staged)
+
+
 if __name__ == "__main__":
     unittest.main()

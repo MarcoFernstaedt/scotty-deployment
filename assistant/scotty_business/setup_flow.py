@@ -113,8 +113,38 @@ REQUIRED_IDENTIFIERS: Mapping[str, tuple[IdentifierField, ...]] = {
             "The account you want your assistant to work in; consent must be "
             "completed as that account.",
         ),
+        # Google consent is personal, so each user's account is a field of its
+        # own rather than one field written twice. It is declared here, in the
+        # same schema everything else is read against, because the version that
+        # only wrote it -- and validated reads against a schema that did not
+        # know it -- dropped the employee's account on the way back in and lost
+        # it silently.
+        IdentifierField(
+            "google_workspace",
+            "employee_account_email",
+            "the Google Workspace account email",
+            "The account you want your assistant to work in; consent must be "
+            "completed as that account.",
+        ),
     ),
 }
+
+#: Which staged field carries each user's own Google account. One place, so
+#: the writer and the reader cannot disagree about it again.
+GOOGLE_ACCOUNT_FIELDS: Mapping[str, str] = {
+    Role.MAIN_OPERATOR.value: "account_email",
+    Role.EMPLOYEE.value: "employee_account_email",
+}
+
+
+def google_account_field(role: Role) -> str:
+    """The staged field this exact user's Google account lives in."""
+
+    field = GOOGLE_ACCOUNT_FIELDS.get(role.value)
+    if field is None:
+        raise SetupFlowError("only a client user stages a Google account")
+    return field
+
 
 #: Fixed diagnoses. Each names the likely cause and the next correction, so a
 #: setup failure is never answered with a generic refusal or a documentation
@@ -260,7 +290,9 @@ def _configured_identifiers(config: RuntimeConfig, role: Role) -> dict[str, tupl
     present["trello"] = ("board_id", "list_id") if config.trello is not None else ()
     present["ghl"] = ("location_id",) if config.ghl_location_id else ()
     present["rentcast"] = ("endpoint",) if config.rentcast_endpoints else ()
-    present["google_workspace"] = ("account_email",) if config.google_for(role) is not None else ()
+    present["google_workspace"] = (
+        (google_account_field(role),) if config.google_for(role) is not None else ()
+    )
     return present
 
 
@@ -273,8 +305,23 @@ def _staged_for(provider: str, staged: Mapping[str, str], role: Role) -> frozens
 
     if provider != "google_workspace":
         return frozenset(staged)
-    own = "employee_account_email" if role is Role.EMPLOYEE else "account_email"
-    return frozenset({"account_email"} if staged.get(own) else set())
+    own = google_account_field(role)
+    return frozenset({own} if staged.get(own) else set())
+
+
+def _required_of(provider: str, role: Role) -> tuple[IdentifierField, ...]:
+    """What this exact user still has to supply for that provider.
+
+    Google's account is per person, so the schema declares one field per user.
+    A progress view is one person's, so it names their field and not the
+    other's -- otherwise Trent would be told he is missing Mikey's account.
+    """
+
+    fields = REQUIRED_IDENTIFIERS[provider]
+    if provider != "google_workspace":
+        return fields
+    own = google_account_field(role)
+    return tuple(item for item in fields if item.field == own)
 
 
 def setup_progress(
@@ -293,7 +340,7 @@ def setup_progress(
         have = set(configured.get(provider, ()))
         have.update(_staged_for(provider, staged.get(provider, {}), role))
         missing = tuple(
-            item.label for item in REQUIRED_IDENTIFIERS[provider] if item.field not in have
+            item.label for item in _required_of(provider, role) if item.field not in have
         )
         is_connected = bool(connected.get(provider, False))
         guidance = provider_guidance(provider, connected=is_connected)
@@ -397,11 +444,20 @@ class SetupStagingStore:
         its own key rather than overwriting the main operator's.
         """
 
-        checked = validate_identifier(provider, field, value)
-        staged = self.read()
         stored_field = str(field)
-        if provider == "google_workspace" and role is Role.EMPLOYEE:
-            stored_field = "employee_account_email"
+        if provider == "google_workspace":
+            own = google_account_field(role)
+            if stored_field not in {"account_email", own}:
+                # Naming the other user's field is refused rather than honoured.
+                # Which field a person's account lives in is the deployment's
+                # decision, and staging is not a way to write into somebody
+                # else's setup.
+                raise SetupFlowError("that setup field is not one Scotty collects")
+            # The user says "my account"; which field that is comes from the
+            # one table, not from the caller.
+            stored_field = own
+        checked = validate_identifier(provider, stored_field, value)
+        staged = self.read()
         staged.setdefault(str(provider), {})[stored_field] = checked
         payload = json.dumps(staged, sort_keys=True, separators=(",", ":")).encode()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

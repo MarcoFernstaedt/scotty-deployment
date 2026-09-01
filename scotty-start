@@ -141,6 +141,15 @@ if (( GOOGLE_SELECTED == 1 )); then
     || fail 'Google consent does not match the configured account and scopes'
 fi
 
+# Everything above passed, so this deployment is accepted into service. The
+# supervisor restarts what was accepted and nothing else: without this marker a
+# reboot that surfaces a stopped container leaves it stopped, rather than
+# putting a half-installed deployment live because nobody was there to say no.
+if [[ -x /usr/local/sbin/scotty-supervisor ]]; then
+  /usr/local/sbin/scotty-supervisor activate >/dev/null \
+    || fail 'the deployment could not be recorded as accepted'
+fi
+
 COMPLETED=1
 trap - EXIT
 printf 'Scotty is configured, validated, and running. No onboarding message was sent.\n'

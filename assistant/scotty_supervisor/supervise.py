@@ -37,6 +37,14 @@ BACKOFF = timedelta(seconds=30)
 #: actually left is going back to a release somebody accepted.
 OPERATOR_RECOVERY_STEP = "sudo /usr/local/sbin/scotty-supervisor rollback"
 
+#: The fixed vocabulary a health check answers in. `unknown` is never reported
+#: as healthy, and a check that fails is unknown rather than fine.
+HEALTHY = "healthy"
+DEGRADED = "degraded"
+BLOCKED = "blocked"
+UNKNOWN = "unknown"
+HEALTH_STATES = frozenset({HEALTHY, DEGRADED, BLOCKED, UNKNOWN})
+
 
 class Container(Protocol):
     """The exact managed container, and nothing else on the host."""
@@ -66,6 +74,9 @@ class SupervisorState:
     incident_open: bool = False
     hold_reason: str = ""
     last_start: str = ""
+    #: The file exists and could not be understood. Never written; only ever
+    #: the answer to a read, and always a reason to stop rather than proceed.
+    unreadable: bool = False
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -78,6 +89,11 @@ class SupervisorState:
 
 Alert = Callable[[str, str], None]
 Integrity = Callable[[], bool]
+Activated = Callable[[], bool]
+
+#: What a health check answers: one word from the fixed vocabulary, and why.
+#: `unknown` is never reported as healthy.
+Health = Callable[[], tuple[str, str]]
 
 
 def _moment(value: str) -> datetime | None:
@@ -97,6 +113,8 @@ class Supervisor:
         *,
         alert: Alert,
         integrity: Integrity | None = None,
+        activated: Activated | None = None,
+        health: Health | None = None,
     ) -> None:
         self.container = container
         self.path = state_dir / "supervisor.json"
@@ -104,23 +122,37 @@ class Supervisor:
         # Answers "is this release still the one we accepted?". A false answer
         # is never restarted into: that would be looping on a broken release.
         self.integrity = integrity
+        # Answers "has anybody accepted this deployment into service?". A
+        # reboot surfaces a stopped container whether or not setup was ever
+        # finished, and starting that one is how a half-installed deployment
+        # goes live without anybody deciding it should.
+        self.activated = activated
+        # Answers "is it actually working?", which is not the same question as
+        # "is the process up". Absent one, a running container is reported as
+        # running and nothing stronger is claimed.
+        self.health = health
 
     # -- state -----------------------------------------------------------
 
     def state(self) -> SupervisorState:
-        """Read what earlier passes recorded, trusting nothing malformed."""
+        """Read what earlier passes recorded, trusting nothing malformed.
+
+        A file that is simply absent is a deployment that has not been
+        supervised yet, which is empty history. A file that is present and
+        unreadable is different, and used to be treated the same: the restart
+        count started again from zero, so a corrupt byte handed the supervisor
+        a fresh budget to keep restarting a container that was crash-looping.
+        That case is now `unreadable`, and the pass blocks on it.
+        """
 
         if self.path.is_symlink() or not self.path.is_file():
             return SupervisorState()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            # A state file that cannot be read is treated as no history rather
-            # than as permission: the restart count starts again from zero, and
-            # the window bounds it just the same.
-            return SupervisorState()
+            return SupervisorState(unreadable=True)
         if not isinstance(raw, Mapping):
-            return SupervisorState()
+            return SupervisorState(unreadable=True)
         restarts = raw.get("restarts")
         return SupervisorState(
             restarts=tuple(item for item in restarts if type(item) is str)
@@ -171,10 +203,26 @@ class Supervisor:
         now = (at or datetime.now(UTC)).astimezone(UTC)
         state = self.state()
 
+        if state.unreadable:
+            # Not empty history: history nobody can read. Proceeding would hand
+            # out a restart budget that may already be spent.
+            self._open_incident(
+                state,
+                "the supervisor's own state file cannot be read, so nothing was started.",
+            )
+            return Decision("blocked", "the supervision state cannot be read")
+
         if state.hold_reason:
             return Decision("held", state.hold_reason)
 
         if self.container.is_running():
+            verdict, detail = self._health()
+            if verdict != HEALTHY:
+                # Running is not working. A gateway that never connected, a
+                # database that will not open, a lease nobody holds: the
+                # process is up and the deployment is not serving anybody.
+                self._open_incident(state, f"the assistant is running but {verdict}: {detail}")
+                return Decision(verdict, detail)
             if state.restarts or state.incident_open:
                 # It went down and came back. That is worth exactly one line:
                 # the history is cleared, so a healthy container stays quiet.
@@ -186,6 +234,12 @@ class Supervisor:
             # There is nothing to start. Creating one is an install decision,
             # not a supervision decision.
             return Decision("absent", "the managed container is not installed")
+
+        if self.activated is not None and not self.activated():
+            # A stopped container a reboot surfaced, in a deployment nobody has
+            # finished setting up. Supervision restarts what was accepted; it
+            # does not put something into service for the first time.
+            return Decision("blocked", "this deployment has not been accepted into service yet")
 
         if self.integrity is not None and not self.integrity():
             self._open_incident(
@@ -207,7 +261,9 @@ class Supervisor:
         if last is not None and now - last < BACKOFF:
             return Decision("waiting", "waiting out the backoff before trying again")
 
-        started = self.container.start()
+        # Recorded before the attempt, not after. A crash in between used to
+        # lose the fact that a restart had been tried at all, which is how a
+        # bounded number of restarts becomes an unbounded one.
         stamps = [*(item.isoformat() for item in recent), now.isoformat()]
         self._write(
             SupervisorState(
@@ -217,9 +273,23 @@ class Supervisor:
                 last_start=now.isoformat(),
             )
         )
+        started = self.container.start()
         if not started:
             return Decision("start_failed", "the container did not start")
         return Decision("started", "the container was not running and was started")
+
+    def _health(self) -> tuple[str, str]:
+        """What the deployment's own checks say, or the honest minimum."""
+
+        if self.health is None:
+            return HEALTHY, ""
+        try:
+            verdict, detail = self.health()
+        except Exception as exc:  # noqa: BLE001 - a failed check is not a pass
+            return UNKNOWN, f"the health check itself failed: {type(exc).__name__}"
+        if verdict not in HEALTH_STATES:
+            return UNKNOWN, "the health check answered something unrecognised"
+        return verdict, detail
 
     def _open_incident(self, state: SupervisorState, message: str) -> None:
         if state.incident_open:
