@@ -40,6 +40,8 @@ def private_mapping(**overrides: object) -> dict[str, object]:
             },
         },
         "discord": {"announcement_channel_ids": [ANNOUNCEMENT_CHANNEL]},
+        # Trent's assistant is named; the employee names their own.
+        "personas": {"main_operator": "Scotty"},
         "maintainer_route": {
             "guild_id": ROUTE_GUILD,
             "channel_id": ROUTE_CHANNEL,

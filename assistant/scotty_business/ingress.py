@@ -6,12 +6,13 @@ from pathlib import Path
 
 from .config import RuntimeConfig
 from .credential_intake import INTAKE_COMMANDS, CredentialIntake
+from .persona import resolve_persona
 from .policy import (
     CODING_REFUSAL,
-    EMPLOYEE_SUMMARY,
     FIXED_WIZARD_COMMAND,
-    SETUP_WIZARD,
     Role,
+    employee_summary,
+    setup_wizard,
 )
 from .routing import RouteKind, resolve_route
 from .wizard import deliver_once, message_key
@@ -48,11 +49,20 @@ class IngressGuard:
         marker_root: Path | None = None,
         *,
         intake: CredentialIntake | None = None,
+        personas: Callable[[Role], str] | None = None,
     ) -> None:
         self.config = config
         self.enqueue = enqueue
         self.marker_root = marker_root
         self.intake = intake
+        self.personas = personas
+
+    def _assistant_name(self, role: Role) -> str:
+        """What this reader's own assistant is called, never the other's."""
+
+        if self.personas is not None:
+            return self.personas(role)
+        return resolve_persona(self.config, role).assistant_name
 
     def __call__(self, event: object, **_: object) -> Mapping[str, str]:
         source = getattr(event, "source", None)
@@ -98,7 +108,7 @@ class IngressGuard:
             destination = next(
                 item.channel_id for item in self.config.principals if item.role == Role.EMPLOYEE
             )
-            self.enqueue(destination, EMPLOYEE_SUMMARY)
+            self.enqueue(destination, employee_summary(self._assistant_name(Role.EMPLOYEE)))
             return {"action": "skip", "reason": "fixed-employee-summary"}
         return {"action": "allow"}
 
@@ -111,13 +121,14 @@ class IngressGuard:
         """
 
         destination = self.config.principal_for(Role.MAIN_OPERATOR).channel_id
+        wizard = setup_wizard(self._assistant_name(Role.MAIN_OPERATOR))
         if self.marker_root is None:
-            self.enqueue(destination, SETUP_WIZARD)
+            self.enqueue(destination, wizard)
             return True
         return deliver_once(
             self.marker_root,
             message_key(event, stripped),
             destination,
-            SETUP_WIZARD,
+            wizard,
             self.enqueue,
         )

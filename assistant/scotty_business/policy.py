@@ -12,23 +12,39 @@ CODING_REFUSAL = (
     "I don’t build code, extensions, or integrations. Please contact Marco for that work."
 )
 FIXED_WIZARD_COMMAND = "Scotty, send Trent the setup wizard."
-SETUP_WIZARD = (
-    "Welcome to Scotty by The Closing Room.\n"
-    "1. Use this private channel for your own requests and non-secret preferences.\n"
-    "2. Confirm which configured Discord channels, Trello board, Google Workspace "
-    "resources, GoHighLevel location, and RentCast reads you expect to use.\n"
-    "3. Google Workspace access uses provider-owned browser consent; credentials and "
-    "OAuth codes are entered only through local setup, never here.\n"
-    "4. Scotty shows external sends and writes for approval before execution.\n"
-    "5. Never paste credentials here. Scotty cannot accept them in Discord. If one "
-    "appears, rotate it and use local setup.\n"
-    "6. Property and financial analysis is preliminary; verify it with the appropriate qualified professional."
-)
-EMPLOYEE_SUMMARY = (
-    "Scotty by The Closing Room can read configured business resources, prepare drafts and analysis, "
-    "create private reminders, and propose changes. Employee proposals require main-operator or "
-    "maintainer approval. Never paste credentials in Discord."
-)
+
+
+def setup_wizard(assistant_name: str = "your assistant") -> str:
+    """The fixed onboarding text, addressed from this reader's own assistant."""
+
+    return (
+        f"Welcome. This is {assistant_name}, your private assistant.\n"
+        "1. Use this private channel for your own requests and non-secret preferences.\n"
+        "2. Confirm which configured Discord channels, Trello board, Google Workspace "
+        "resources, GoHighLevel location, and RentCast reads you expect to use.\n"
+        "3. Google Workspace access uses provider-owned browser consent; credentials and "
+        "OAuth codes are entered only through local setup, never here.\n"
+        f"4. {assistant_name} shows external sends and writes for approval before execution.\n"
+        f"5. Never paste credentials here. {assistant_name} cannot accept them in this chat. "
+        "If one appears, rotate it and use local setup.\n"
+        "6. Property and financial analysis is preliminary; verify it with the appropriate "
+        "qualified professional."
+    )
+
+
+def employee_summary(assistant_name: str = "your assistant") -> str:
+    """What an employee's own assistant says it can do for them."""
+
+    return (
+        f"{assistant_name} can read configured business resources, prepare drafts and "
+        "analysis, create private reminders, and propose changes. Employee proposals "
+        "require main-operator or maintainer approval. Never paste credentials in this chat."
+    )
+
+
+#: Kept for the fixed maintainer-triggered wizard, whose reader is Trent.
+SETUP_WIZARD = setup_wizard("Scotty")
+EMPLOYEE_SUMMARY = employee_summary("your assistant")
 
 
 class Role(StrEnum):

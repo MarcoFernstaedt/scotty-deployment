@@ -49,6 +49,9 @@
     "profile": "scotty-maintainer",
     "user_id": "320000000000000001"
   },
+  "personas": {
+    "main_operator": "Scotty"
+  },
   "principals": {
     "employee": {
       "channel_id": "202000000000000001",

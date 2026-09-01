@@ -25,7 +25,7 @@ from assistant.scotty_business.ingress import (
     EMPLOYEE_SUMMARY_COMMAND,
     IngressGuard,
 )
-from assistant.scotty_business.policy import CODING_REFUSAL, EMPLOYEE_SUMMARY, Role
+from assistant.scotty_business.policy import CODING_REFUSAL, Role, employee_summary
 
 config = synthetic.config
 event = synthetic.event
@@ -61,7 +61,7 @@ class IngressTests(unittest.TestCase):
     def test_employee_summary_has_separate_fixed_request_and_destination(self) -> None:
         result = self.guard(event(text=EMPLOYEE_SUMMARY_COMMAND))
         self.assertEqual(result["action"], "skip")
-        self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, EMPLOYEE_SUMMARY)])
+        self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, employee_summary("Assistant"))])
 
     def test_fixed_paths_only_ever_reach_configured_client_destinations(self) -> None:
         allowed = set(synthetic.config().client_discord_destinations())
@@ -182,7 +182,13 @@ class PluginRegistrationTests(unittest.TestCase):
             schema = registration["schema"]
             self.assertNotIn("principal", json.dumps(schema))
         self.assertEqual(set(context.hooks), {"pre_gateway_dispatch"})
-        self.assertIn("Scotty by The Closing Room", context.sections["scotty.identity"])
+        identity = context.sections["scotty.identity"]
+        # The section belongs to whoever is served, so it names no product and
+        # no framework; the model reads the user's own name from status.
+        self.assertNotIn("Closing Room", identity)
+        self.assertIn("operation status", identity)
+        for brand in ("hermes", "nous", "openrouter", "anthropic", "openai", "claude"):
+            self.assertNotIn(brand, identity.casefold())
         self.assertNotIn("Hermes", context.sections["scotty.identity"])
         for unload in context.unloads:
             unload()

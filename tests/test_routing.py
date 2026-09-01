@@ -20,10 +20,10 @@ from synthetic import (
 from assistant.scotty_business.config import ConfigError, RuntimeConfig
 from assistant.scotty_business.ingress import EMPLOYEE_SUMMARY_COMMAND, IngressGuard
 from assistant.scotty_business.policy import (
-    EMPLOYEE_SUMMARY,
     FIXED_WIZARD_COMMAND,
     SETUP_WIZARD,
     Role,
+    employee_summary,
 )
 from assistant.scotty_business.routing import (
     ALL_TOOLSETS,
@@ -306,7 +306,7 @@ class IngressRouteTests(unittest.TestCase):
 
     def test_the_employee_summary_still_works_alongside_the_wizard(self) -> None:
         self.guard(synthetic.event(text=EMPLOYEE_SUMMARY_COMMAND))
-        self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, EMPLOYEE_SUMMARY)])
+        self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, employee_summary("Assistant"))])
 
 
 class WizardSingleDeliveryTests(unittest.TestCase):

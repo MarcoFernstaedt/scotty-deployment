@@ -4,6 +4,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from .persona import configured_personas
 from .policy import Principal, Role
 
 _PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{1,62}[a-z0-9]")
@@ -91,6 +92,9 @@ class RuntimeConfig:
     #: One Workspace account per client user, keyed by role. A role that is
     #: absent is simply not linked; it never falls back to another user's.
     google_accounts: Mapping[Role, GoogleWorkspaceScope] = field(default_factory=dict)
+    #: What each client user's assistant is called by default. Presentation
+    #: only: a name carries no authority and never selects an identity.
+    personas: Mapping[Role, str] = field(default_factory=dict)
 
     def google_for(self, role: Role) -> GoogleWorkspaceScope | None:
         return self.google_accounts.get(role)
@@ -161,7 +165,15 @@ class RuntimeConfig:
             ghl_location_id=_ghl(raw.get("ghl")),
             rentcast_endpoints=_rentcast(raw.get("rentcast")),
             google_accounts=_google_accounts(raw.get("google_workspace")),
+            personas=_personas(raw.get("personas")),
         )
+
+
+def _personas(value: object) -> Mapping[Role, str]:
+    try:
+        return configured_personas(value)
+    except ValueError as exc:
+        raise ConfigError(f"personas is malformed: {exc}") from exc
 
 
 def _trello(value: object) -> TrelloScope | None:

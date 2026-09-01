@@ -87,6 +87,7 @@ readonly -a PLUGIN_FILES=(
   "google_readback.py"
   "identity.py"
   "ingress.py"
+  "persona.py"
   "policy.py"
   "progress.py"
   "provider_identity.py"

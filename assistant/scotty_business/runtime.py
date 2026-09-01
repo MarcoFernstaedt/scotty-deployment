@@ -46,6 +46,12 @@ from .google_oauth import (
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
+from .persona import (
+    DEFAULT_ASSISTANT_NAME,
+    PersonaError,
+    PersonaStore,
+    resolve_persona,
+)
 from .policy import Principal, Role
 from .progress import ProgressReporter
 from .provider_identity import reject_identity_override
@@ -465,6 +471,7 @@ class Runtime:
         self.reminders = ReminderStore(state_dir / "reminders.db")
         self.reminders.initialize()
         self.setup_staging = SetupStagingStore(state_dir / "setup-staging.json")
+        self.personas = PersonaStore(state_dir / "personas.json")
         self.self_repair = SelfRepairManager(
             state_dir,
             state_dir / "private.json",
@@ -532,6 +539,32 @@ class Runtime:
 
     def provider_connection_status(self) -> dict[str, bool]:
         return provider_status(self.connected)
+
+    def assistant_name(self, role: Role) -> str:
+        """What this user's assistant is called right now."""
+
+        try:
+            return resolve_persona(self.config, role, self.personas.read()).assistant_name
+        except PersonaError:
+            # The maintainer route has no client persona; it is served by its
+            # own profile and never borrows a client's assistant name.
+            return DEFAULT_ASSISTANT_NAME
+
+    def _persona(self, principal: Principal, args: Mapping[str, object]) -> dict[str, object]:
+        """Show or change this caller's own assistant name, and only theirs."""
+
+        action = _text(args, "action", optional=True) or "show"
+        if action == "show":
+            return resolve_persona(self.config, principal.role, self.personas.read()).as_json()
+        if action != "set":
+            raise ValueError("persona action is not permitted")
+        try:
+            # The role comes from the authorized origin, so a caller can only
+            # ever rename their own assistant.
+            chosen = self.personas.set(principal.role, args.get("name"))
+        except PersonaError as exc:
+            return {"accepted": False, "correction": str(exc)}
+        return {"accepted": True, "assistant_name": chosen, "role": principal.role.value}
 
     def actor_connection_status(self, principal: Principal) -> dict[str, bool]:
         """What this exact user is connected to, not what the deployment has."""
@@ -633,10 +666,14 @@ class Runtime:
                 return {"status": "refused", "reason": str(exc)}
         if operation == "status":
             return {
-                "identity": "Scotty by The Closing Room",
+                # This caller's own assistant, never the other user's and never
+                # the software underneath.
+                "identity": self.assistant_name(principal.role),
                 "addons": list(self.config.addons),
                 "addon_slots_remaining": 6 - len(self.config.addons),
             }
+        if operation == "persona":
+            return self._persona(principal, args)
         if operation == "provider_setup":
             return self._provider_setup(principal, args)
         if operation == "discord":

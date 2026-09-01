@@ -1,6 +1,6 @@
 # Scotty deployment
 
-Scotty by The Closing Room is a bounded day-one business assistant package for one maintainer, one main operator, and one employee. The initial add-ons are Discord, Trello, GoHighLevel, and RentCast. This repository prepares a stopped container from an immutable Hermes Agent 0.20.6 image and installs the generic Scotty plugin into its private data mount.
+This repository builds one white-labelable managed wholesaling assistant for one maintainer and two client users, each of whom gets their own private channel, session, provider identities, and assistant name. "Scotty" is the main operator's assistant, not the product; see `docs/white-label-rename-plan.md` for the post-acceptance rename. The initial add-ons are Discord, Trello, GoHighLevel, and RentCast. This repository prepares a stopped container from an immutable Hermes Agent 0.20.6 image and installs the generic bounded plugin into its private data mount.
 
 The implementation contract is `docs/scotty-basic-release-engineering-contract.md`. The package does not include the future wholesaling application, student access, billing, webhooks, public ports, browser automation, scraping, Twilio, or commercial terms.
 

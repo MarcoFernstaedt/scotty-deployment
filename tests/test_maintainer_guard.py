@@ -229,6 +229,10 @@ class GuardWizardTests(unittest.TestCase):
 
     def test_the_wizard_text_never_requests_a_credential(self) -> None:
         self.assertIn("Never paste credentials here", SETUP_WIZARD)
+        # The guard's standalone copy must say exactly what the plugin says.
+        from assistant.scotty_business.policy import setup_wizard
+
+        self.assertEqual(SETUP_WIZARD, setup_wizard("Scotty"))
         self.assertNotIn("token", SETUP_WIZARD.lower())
 
     def test_nothing_is_delivered_without_an_explicit_trigger(self) -> None:

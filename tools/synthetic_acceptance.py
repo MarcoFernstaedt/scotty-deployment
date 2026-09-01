@@ -21,6 +21,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from assistant.scotty_business import client_tool_schemas, identity_prompt  # noqa: E402
 from assistant.scotty_business.approvals import ApprovalStore  # noqa: E402
 from assistant.scotty_business.config import RuntimeConfig  # noqa: E402
 from assistant.scotty_business.guidance import (  # noqa: E402
@@ -34,12 +35,12 @@ from assistant.scotty_business.ingress import (  # noqa: E402
 )
 from assistant.scotty_business.policy import (  # noqa: E402
     CODING_REFUSAL,
-    EMPLOYEE_SUMMARY,
     FIXED_WIZARD_COMMAND,
-    SETUP_WIZARD,
     Principal,
     Role,
     can_approve,
+    employee_summary,
+    setup_wizard,
 )
 from assistant.scotty_business.provisioning import (  # noqa: E402
     ChannelPlan,
@@ -371,7 +372,7 @@ def check_maintainer_guard(runtime_config: RuntimeConfig) -> None:
         )
         check(
             "the fixed wizard reaches only the main-operator channel",
-            sent == [(operator.channel_id, SETUP_WIZARD)],
+            sent == [(operator.channel_id, setup_wizard("Scotty"))],
         )
         guard(wizard)
         check("one inbound message delivers the wizard exactly once", len(sent) == 1)
@@ -391,7 +392,7 @@ def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
     guard(SimpleNamespace(text=FIXED_WIZARD_COMMAND, source=maintainer_source))
     check(
         "the root hook also routes the fixed wizard only to the main operator",
-        outbound == [(operator.channel_id, SETUP_WIZARD)],
+        outbound == [(operator.channel_id, setup_wizard("Scotty"))],
     )
     outbound.clear()
     for wrong in (
@@ -415,7 +416,7 @@ def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
     )
     check(
         "the fixed employee summary reaches only the employee channel",
-        outbound == [(employee.channel_id, EMPLOYEE_SUMMARY)],
+        outbound == [(employee.channel_id, employee_summary("Assistant"))],
     )
 
     outbound.clear()
@@ -708,14 +709,55 @@ def check_codex_and_optional_providers(runtime_config: RuntimeConfig) -> None:
     del runtime_config
 
 
+#: What a client must never be told they are talking to.
+_UPSTREAM_BRANDS = (
+    "hermes",
+    "nous research",
+    "nousresearch",
+    "openclaw",
+    "openrouter",
+    "anthropic",
+    "claude",
+    "openai",
+    "gpt-",
+    "codex",
+    "docker",
+    "systemd",
+)
+
+
+def check_white_label(runtime_config: RuntimeConfig) -> None:
+    """No client-visible surface advertises what this assistant runs on."""
+
+    del runtime_config
+    surfaces = {
+        "identity prompt": identity_prompt("Assistant"),
+        "setup wizard": setup_wizard("Scotty"),
+        "employee summary": employee_summary("Assistant"),
+        "coding refusal": CODING_REFUSAL,
+        "tool schemas": json.dumps(client_tool_schemas()),
+        **{f"{name} guidance": provider_guidance(name).as_text() for name in PROVIDERS},
+    }
+    for label, text in surfaces.items():
+        lowered = text.casefold()
+        check(
+            f"the {label} names no framework or model provider",
+            not any(brand in lowered for brand in _UPSTREAM_BRANDS),
+        )
+    check(
+        "each client user's assistant name is their own",
+        setup_wizard("Scotty") != setup_wizard("Nova") and "Scotty" not in employee_summary("Nova"),
+    )
+
+
 def check_secrecy(runtime_config: RuntimeConfig) -> None:
     route = runtime_config.maintainer_route
     identifiers = (route.guild_id, route.channel_id, route.user_id)
     client_text = "\n".join(
         [
-            EMPLOYEE_SUMMARY,
+            employee_summary("Assistant"),
             CODING_REFUSAL,
-            SETUP_WIZARD,
+            setup_wizard("Scotty"),
             FIXED_WIZARD_COMMAND,
             *(provider_guidance(name).as_text() for name in PROVIDERS),
             *(
@@ -746,6 +788,7 @@ def main() -> int:
     check_google_read_bounds()
     check_codex_and_optional_providers(runtime_config)
     check_provisioning(runtime_config)
+    check_white_label(runtime_config)
     check_secrecy(runtime_config)
     for label in CHECKS:
         print(f"  ok  {label}")

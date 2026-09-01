@@ -32,16 +32,21 @@ ALLOW: Mapping[str, str] = {"action": "allow"}
 SKIP_WIZARD: Mapping[str, str] = {"action": "skip", "reason": "fixed-wizard"}
 
 FIXED_WIZARD_COMMAND = "Scotty, send Trent the setup wizard."
+#: The guard is standalone by design, so it carries its own copy of the fixed
+#: wizard. Its only reader is the main operator, whose assistant is named in
+#: configuration, so the name is a literal here and a test holds the two texts
+#: identical.
+ASSISTANT_NAME = "Scotty"
 SETUP_WIZARD = (
-    "Welcome to Scotty by The Closing Room.\n"
+    f"Welcome. This is {ASSISTANT_NAME}, your private assistant.\n"
     "1. Use this private channel for your own requests and non-secret preferences.\n"
     "2. Confirm which configured Discord channels, Trello board, Google Workspace "
     "resources, GoHighLevel location, and RentCast reads you expect to use.\n"
     "3. Google Workspace access uses provider-owned browser consent; credentials and "
     "OAuth codes are entered only through local setup, never here.\n"
-    "4. Scotty shows external sends and writes for approval before execution.\n"
-    "5. Never paste credentials here. Scotty cannot accept them in Discord. If one "
-    "appears, rotate it and use local setup.\n"
+    f"4. {ASSISTANT_NAME} shows external sends and writes for approval before execution.\n"
+    f"5. Never paste credentials here. {ASSISTANT_NAME} cannot accept them in this chat. "
+    "If one appears, rotate it and use local setup.\n"
     "6. Property and financial analysis is preliminary; verify it with the appropriate "
     "qualified professional."
 )
