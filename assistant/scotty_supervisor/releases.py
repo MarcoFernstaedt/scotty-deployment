@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .journal import Journal, JournalError, replace_all
+
 MANIFEST_VERSION = 1
 MAX_FILE_BYTES = 64 * 1024 * 1024
 CURRENT_LINK = "current"
@@ -250,24 +252,94 @@ def _restore_attributes(target: Path, entry: Mapping[str, object]) -> None:
 
 
 def install_release(releases: Path, name: str, destination: Path) -> tuple[str, ...]:
-    """Put a release's exact recorded bytes in place, or write nothing at all."""
+    """Put a release's exact recorded bytes in place, or change nothing at all.
+
+    Two things were wrong with overlaying files one at a time. A failure partway
+    left half of one release and half of another running, and a file the new
+    release does not have simply stayed -- so the deployment ran bytes that
+    were in no release, which is the state a rollback is supposed to make
+    impossible.
+
+    Everything is staged, then cut over through the journal, then the files
+    this release does not have are removed. Exact means exact.
+    """
 
     release = releases / name
     mismatched = verify_release(release)
     if mismatched:
         raise ReleaseError("that release does not match its manifest: " + ", ".join(mismatched))
     destination.mkdir(mode=0o755, parents=True, exist_ok=True)
-    written: list[str] = []
+
+    # A cutover somebody's process died in the middle of.
+    Journal(destination).recover()
+
+    entries = _entries(_manifest(release))
+    wanted = {str(entry.get("name", "")) for entry in entries}
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for entry in entries:
+            relative = str(entry.get("name", ""))
+            target = (destination / relative).resolve()
+            if not str(target).startswith(str(destination.resolve())):
+                raise ReleaseError("a release may only write inside its destination")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.staging"
+            shutil.copy2(release / "files" / relative, staging)
+            _restore_attributes(staging, entry)
+            staged.append((staging, target))
+        moved = replace_all(destination, staged)
+    except ReleaseError:
+        raise
+    except JournalError as exc:
+        raise ReleaseError("the release install failed and was undone") from exc
+    except OSError as exc:
+        raise ReleaseError("the release could not be installed") from exc
+    finally:
+        for staging, _ in staged:
+            with suppress(OSError):
+                staging.unlink(missing_ok=True)
+
+    _remove_absent(destination, wanted)
+    return tuple(str(Path(item).relative_to(destination)) for item in moved)
+
+
+def _remove_absent(destination: Path, wanted: set[str]) -> None:
+    """Delete what this release does not have, so the tree is the release.
+
+    Only files this product would have installed: a journal or a staging file
+    left by the cutover itself is skipped, and so is anything in a directory
+    the release never described.
+    """
+
+    root = destination.resolve()
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_symlink() or path.name.startswith("."):
+            continue
+        if path.is_file():
+            relative = str(path.relative_to(root))
+            if relative not in wanted:
+                with suppress(OSError):
+                    path.unlink()
+        elif path.is_dir() and not any(path.iterdir()):
+            with suppress(OSError):
+                path.rmdir()
+
+
+def verify_installed(releases: Path, name: str, destination: Path) -> tuple[str, ...]:
+    """Names whose installed bytes differ from the release. Empty means exact.
+
+    The supervisor checked the archived release against its own manifest, which
+    says nothing about what is actually running. This reads the deployment.
+    """
+
+    mismatched: list[str] = []
+    release = releases / name
     for entry in _entries(_manifest(release)):
         relative = str(entry.get("name", ""))
-        target = (destination / relative).resolve()
-        if not str(target).startswith(str(destination.resolve())):
-            raise ReleaseError("a release may only write inside its destination")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(release / "files" / relative, target)
-        _restore_attributes(target, entry)
-        written.append(relative)
-    return tuple(written)
+        installed = destination / relative
+        if not installed.is_file() or _digest(installed) != entry.get("sha256"):
+            mismatched.append(relative)
+    return tuple(mismatched)
 
 
 __all__ = [
@@ -281,5 +353,6 @@ __all__ = [
     "publish_release",
     "rollback",
     "select_release",
+    "verify_installed",
     "verify_release",
 ]

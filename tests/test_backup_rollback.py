@@ -26,6 +26,26 @@ from assistant.scotty_business.backup import (
 from assistant.scotty_supervisor import state as host_state
 
 
+def make_database(path, label: str) -> None:
+    """A real SQLite database, because a backup now proves it can open one.
+
+    The fixtures used to write the file's magic bytes and nothing else. That
+    was enough while a backup copied bytes; it is not enough now that a backup
+    snapshots a database through SQLite itself and refuses one it cannot read.
+    """
+
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO rows (value) VALUES (?)", (label,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class StateFixture(unittest.TestCase):
     def state(self) -> Path:
         directory = tempfile.TemporaryDirectory(prefix="scotty-state-")
@@ -33,10 +53,10 @@ class StateFixture(unittest.TestCase):
         root = Path(directory.name)
         (root / "workflows.json").write_text('{"workflows": []}', encoding="utf-8")
         (root / "personas.json").write_text('{"employee": "Nova"}', encoding="utf-8")
-        (root / "reminders.db").write_bytes(b"SQLite format 3\x00reminders")
-        (root / "approvals.db").write_bytes(b"SQLite format 3\x00approvals")
-        (root / "property-effects.db").write_bytes(b"SQLite format 3\x00effects")
-        (root / "budgets.db").write_bytes(b"SQLite format 3\x00budgets")
+        make_database(root / "reminders.db", "reminders")
+        make_database(root / "approvals.db", "approvals")
+        make_database(root / "property-effects.db", "property-effects")
+        make_database(root / "budgets.db", "budgets")
         # These must never be copied.
         (root / "google-oauth.main_operator.json").write_text(
             '{"refresh_token": "synthetic-refresh"}', encoding="utf-8"

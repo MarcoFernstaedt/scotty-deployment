@@ -31,6 +31,26 @@ from assistant.scotty_supervisor.state import (
 )
 
 
+def make_database(path, label: str) -> None:
+    """A real SQLite database, because a backup now proves it can open one.
+
+    The fixtures used to write the file's magic bytes and nothing else. That
+    was enough while a backup copied bytes; it is not enough now that a backup
+    snapshots a database through SQLite itself and refuses one it cannot read.
+    """
+
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, value TEXT)")
+        connection.execute("INSERT INTO rows (value) VALUES (?)", (label,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class ReleaseHarness(unittest.TestCase):
     def root(self) -> Path:
         directory = tempfile.TemporaryDirectory(prefix="scotty-releases-")
@@ -124,7 +144,7 @@ class StateHarness(unittest.TestCase):
         root = Path(directory.name)
         (root / "workflows.json").write_text('{"workflows": []}', encoding="utf-8")
         (root / "personas.json").write_text('{"employee": "Nova"}', encoding="utf-8")
-        (root / "reminders.db").write_bytes(b"SQLite format 3\x00reminders")
+        make_database(root / "reminders.db", "reminders")
         (root / "google-oauth.main_operator.json").write_text(
             '{"refresh_token": "synthetic-refresh"}', encoding="utf-8"
         )
@@ -174,25 +194,41 @@ class RestoreTests(StateHarness):
         self.assertIn("rotated-since", token.read_text(encoding="utf-8"))
 
     def test_an_interrupted_cutover_leaves_no_half_written_file(self) -> None:
-        state, destination = self.state(), self.destination()
-        backup_state(state, destination)
+        """A failure partway restores every prior byte, not some of them.
 
-        calls = {"count": 0}
+        The injectable `replace` this used to take is gone: a caller that can
+        substitute the cutover is a caller that can substitute the safety, and
+        the cutover is now the journal's rather than an argument's.
+        """
+
+        import os
+        from unittest import mock
+
+        state, destination = self.state(), self.destination()
+        (state / "workflows.json").write_text('{"workflows": ["before"]}', encoding="utf-8")
+        backup_state(state, destination)
+        (state / "workflows.json").write_text('{"workflows": ["after"]}', encoding="utf-8")
+        (state / "personas.json").write_text('{"employee": "after"}', encoding="utf-8")
+
+        real = os.replace
+        calls: list[int] = []
+        watched = {"workflows.json", "personas.json", "reminders.db"}
 
         def failing_replace(source, target):
-            calls["count"] += 1
-            if calls["count"] == 2:
-                raise OSError("interrupted")
-            import os
+            if Path(target).name in watched:
+                calls.append(1)
+                if len(calls) == 2:
+                    raise OSError("interrupted")
+            return real(source, target)
 
-            os.replace(source, target)
+        with mock.patch("os.replace", failing_replace), self.assertRaises(StateError):
+            restore_state(destination, state)
 
-        with self.assertRaises(StateError):
-            restore_state(destination, state, replace=failing_replace)
-        # Every file is either its old content or its restored content, and
-        # nothing is left staged.
+        # Nothing staged is left behind, and the generation that was running is
+        # the one still running.
         self.assertEqual(list(state.glob("*.staging")), [])
-        self.assertTrue((state / "workflows.json").read_text(encoding="utf-8").strip())
+        self.assertIn("after", (state / "workflows.json").read_text(encoding="utf-8"))
+        self.assertIn("after", (state / "personas.json").read_text(encoding="utf-8"))
 
     def test_verification_reports_exactly_which_file_disagrees(self) -> None:
         state, destination = self.state(), self.destination()

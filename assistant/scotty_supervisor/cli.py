@@ -15,12 +15,15 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .journal import Journal, JournalError
 from .releases import (
     ReleaseError,
     current_release,
     install_release,
+    publish_release,
     rollback,
     select_release,
+    verify_installed,
     verify_release,
 )
 from .state import (
@@ -79,7 +82,12 @@ def _alert(kind: str, text: str) -> None:
 
 
 def _integrity() -> bool:
-    """Whether the selected release still matches what was recorded."""
+    """Whether the bytes actually running are the ones that were accepted.
+
+    Checking the archived release against its own manifest -- which is what
+    this did -- proves the archive is intact and says nothing about the
+    deployment. What matters on a restart is the tree being started.
+    """
 
     name = current_release(RELEASES_DIR)
     if not name:
@@ -87,7 +95,9 @@ def _integrity() -> bool:
         # there is nothing to contradict.
         return True
     try:
-        return not verify_release(RELEASES_DIR / name)
+        if verify_release(RELEASES_DIR / name):
+            return False
+        return not verify_installed(RELEASES_DIR, name, DEPLOYMENT_DIR)
     except ReleaseError:
         return False
 
@@ -163,8 +173,32 @@ def _named_backup(name: str) -> Path:
     return candidate
 
 
+def _recover_cutovers() -> list[str]:
+    """Undo any cutover a process died in the middle of, before doing anything.
+
+    Both the state directory and the deployment tree can be left mid-move by a
+    process that stopped at the wrong instant. Whatever is found is put back to
+    the generation that was running, which is a generation somebody accepted.
+    """
+
+    recovered: list[str] = []
+    for root in (STATE_DIR, DEPLOYMENT_DIR):
+        if not root.is_dir():
+            continue
+        try:
+            restored = Journal(root).recover()
+        except JournalError as exc:
+            _alert("cutover", f"an interrupted change to {root} needs a person: {exc}")
+            continue
+        if restored:
+            _alert("cutover", f"an interrupted change to {root} was undone")
+            recovered.extend(restored)
+    return recovered
+
+
 def run(argv: Sequence[str]) -> int:
     command, *rest = argv
+    _recover_cutovers()
     try:
         if command == "watch":
             return _watch()
@@ -223,6 +257,37 @@ def run(argv: Sequence[str]) -> int:
             return 0
         if command == "rollback":
             return _rollback(execute="--execute" in rest)
+        if command == "publish":
+            if len(rest) < 2:
+                print("scotty-supervisor: publish needs a source and a name", file=sys.stderr)
+                return 2
+            manifest = publish_release(Path(rest[0]), RELEASES_DIR, rest[1])
+            published = manifest["files"]
+            print(
+                json.dumps(
+                    {
+                        "release": manifest["release"],
+                        "files": len(published) if isinstance(published, list) else 0,
+                    }
+                )
+            )
+            return 0
+        if command == "stage":
+            if not rest:
+                print("scotty-supervisor: stage needs a release name", file=sys.stderr)
+                return 2
+            mismatched = verify_release(RELEASES_DIR / rest[0])
+            print(
+                json.dumps(
+                    {"release": rest[0], "intact": not mismatched, "mismatched": list(mismatched)}
+                )
+            )
+            return 0 if not mismatched else 1
+        if command == "accept":
+            if not rest:
+                print("scotty-supervisor: accept needs a release name", file=sys.stderr)
+                return 2
+            return _accept(rest[0])
         if command == "activate":
             print(json.dumps({"activated": str(activate())}, indent=2))
             return 0
@@ -233,6 +298,41 @@ def run(argv: Sequence[str]) -> int:
         return 1
     print(f"scotty-supervisor: unknown command {command}", file=sys.stderr)
     return 2
+
+
+def _accept(name: str) -> int:
+    """Install one release, prove the installed bytes, then make it current.
+
+    The order is the correction. `current` used to be selected before the
+    install succeeded, so a failure left the new release recorded as running
+    and the old bytes on disk -- and a rollback then had nowhere honest to go.
+    Nothing is accepted until what is actually installed matches what was
+    published.
+    """
+
+    release = RELEASES_DIR / name
+    mismatched = verify_release(release)
+    if mismatched:
+        print("scotty-supervisor: that release does not match its manifest", file=sys.stderr)
+        return 1
+    previous = current_release(RELEASES_DIR)
+    try:
+        install_release(RELEASES_DIR, name, DEPLOYMENT_DIR)
+    except ReleaseError as exc:
+        print(f"scotty-supervisor: {exc}", file=sys.stderr)
+        return 1
+    installed = verify_installed(RELEASES_DIR, name, DEPLOYMENT_DIR)
+    if installed:
+        print(
+            "scotty-supervisor: the installed bytes do not match the release; it was not accepted",
+            file=sys.stderr,
+        )
+        return 1
+    select_release(RELEASES_DIR, name, accepted=True)
+    print(
+        json.dumps({"accepted": name, "previous": previous, "installed_verified": True}, indent=2)
+    )
+    return 0
 
 
 def _rollback(*, execute: bool) -> int:

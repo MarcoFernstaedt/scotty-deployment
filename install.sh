@@ -38,6 +38,7 @@ readonly SUPERVISOR_DIR=/usr/local/lib/scotty/scotty_supervisor
 readonly -a SUPERVISOR_FILES=(
   "__init__.py"
   "cli.py"
+  "journal.py"
   "releases.py"
   "state.py"
   "supervise.py"
