@@ -14,12 +14,43 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from assistant.scotty_broker.broker import ACTORS, Broker, BrokerError, CredentialStore, Peer
+from assistant.scotty_broker.broker import (
+    RUNTIME_ACTOR,
+    Broker,
+    BrokerError,
+    CredentialStore,
+    Peer,
+)
 from assistant.scotty_broker.executor import ExecutionError, Executor
 from assistant.scotty_broker.operations import OPERATIONS, PROVIDER_BASES, SHAPES
 
 ROOT = Peer(pid=1, uid=0, gid=0)
 RUNTIME = Peer(pid=2, uid=10_000, gid=10_000)
+
+#: One synthetic Discord message, in the main operator's own channel, written
+#: by the main operator. The broker asks Discord about it; the fake below
+#: answers. Citing it is how a request says who it is for.
+_CITATION = {"channel_id": "80000000000000001", "message_id": "90000000000000001"}
+
+
+def _fetch(url, headers):
+    if url.endswith(_CITATION["message_id"]):
+        return 200, {
+            "channel_id": _CITATION["channel_id"],
+            "author": {"id": "70000000000000001"},
+        }
+    return 404, None
+
+
+def _resolver():
+    from assistant.scotty_broker.provenance import ProvenanceResolver, Route
+
+    return ProvenanceResolver(
+        (Route(_CITATION["channel_id"], "70000000000000001", "main_operator"),),
+        lambda: "synthetic-bot-token",
+        fetch=_fetch,
+    )
+
 
 OPERATOR_TOKEN = "synthetic-trello-token-operator"  # noqa: S105 - synthetic
 SHARED_TOKEN = "synthetic-trello-token-shared"  # noqa: S105 - synthetic
@@ -133,6 +164,21 @@ class UrlTests(ExecutorHarness):
                 executor.run("rentcast.fetch", {"endpoint": endpoint}, actor="shared")
 
 
+class _GrantsFor:
+    """The smallest grant store that answers the one question asked of it."""
+
+    def __init__(self, *allowed: tuple[str, str, str]) -> None:
+        self.allowed = set(allowed)
+
+    def find(self, actor: str, provider: str, operation: str, resource: str = ""):
+        return object() if (actor, provider, operation) in self.allowed else None
+
+    def any_for(self, actor: str, provider: str):
+        return next(
+            (object() for item in self.allowed if item[0] == actor and item[1] == provider), None
+        )
+
+
 class CredentialTests(ExecutorHarness):
     def test_the_actors_own_credential_is_used_when_they_have_one(self) -> None:
         recorder = Recorder()
@@ -142,13 +188,44 @@ class CredentialTests(ExecutorHarness):
         self.assertIn(OPERATOR_TOKEN, recorder.last.full_url)
         self.assertNotIn(SHARED_TOKEN, recorder.last.full_url)
 
-    def test_an_actor_without_their_own_uses_the_shared_business_identity(self) -> None:
+    def test_a_shared_identity_is_not_reachable_without_a_grant(self) -> None:
+        """Existing is not permission.
+
+        This is the defect turned round. The executor used to fall back to the
+        shared business identity for any actor with none of their own; nothing
+        anywhere said they were allowed to act as the business. Now the fallback
+        needs a grant, and the refusal says `not authorized`, which is a
+        different thing from `not connected`.
+        """
+
         recorder = Recorder()
-        Executor(self.store(), opener=recorder).run(
-            "trello.get_card", {"card_id": "card-1"}, actor="employee"
+        executor = Executor(self.store(), _GrantsFor(), opener=recorder)
+        with self.assertRaises(ExecutionError) as refused:
+            executor.run("trello.get_card", {"card_id": "card-1"}, actor="employee")
+        self.assertIn("not authorized", str(refused.exception))
+        self.assertEqual(recorder.requests, [])
+
+    def test_a_grant_makes_the_shared_identity_reachable_for_what_it_names(self) -> None:
+        recorder = Recorder()
+        executor = Executor(
+            self.store(),
+            _GrantsFor(("employee", "trello", "trello.get_card")),
+            opener=recorder,
         )
+        executor.run("trello.get_card", {"card_id": "card-1"}, actor="employee")
         self.assertIn(SHARED_TOKEN, recorder.last.full_url)
         self.assertNotIn(OPERATOR_TOKEN, recorder.last.full_url)
+
+    def test_a_grant_for_another_operation_authorizes_nothing(self) -> None:
+        recorder = Recorder()
+        executor = Executor(
+            self.store(),
+            _GrantsFor(("employee", "trello", "trello.list_board_cards")),
+            opener=recorder,
+        )
+        with self.assertRaises(ExecutionError):
+            executor.run("trello.get_card", {"card_id": "card-1"}, actor="employee")
+        self.assertEqual(recorder.requests, [])
 
     def test_an_unconnected_provider_is_refused_rather_than_borrowing(self) -> None:
         directory = tempfile.TemporaryDirectory(prefix="scotty-exec-empty-")
@@ -208,7 +285,11 @@ class WireTests(ExecutorHarness):
 
     def broker(self, recorder: Recorder | None = None) -> Broker:
         store = self.store()
-        return Broker(store, executor=Executor(store, opener=recorder or Recorder()))
+        return Broker(
+            store,
+            executor=Executor(store, opener=recorder or Recorder()),
+            provenance=_resolver(),
+        )
 
     def test_the_runtime_may_execute_but_never_read_a_credential(self) -> None:
         from assistant.scotty_broker.broker import OPERATIONS as WIRE_OPERATIONS
@@ -218,16 +299,17 @@ class WireTests(ExecutorHarness):
         for name in WIRE_OPERATIONS:
             self.assertNotIn(name, {"read", "get", "reveal", "lease", "fetch"})
 
-    def test_execution_runs_for_the_runtime_account(self) -> None:
+    def test_execution_runs_as_whoever_discord_says_is_asking(self) -> None:
         recorder = Recorder()
         reply = self.broker(recorder).handle(
             RUNTIME,
             {
                 "op": "execute",
                 "operation": "trello.get_card",
-                "actor": "main_operator",
                 "arguments": {"card_id": "card-1"},
+                "provenance": _CITATION,
             },
+            actor=RUNTIME_ACTOR,
         )
         self.assertTrue(reply["ok"])
         self.assertEqual(reply["body"]["id"], "card-1")
@@ -245,8 +327,15 @@ class WireTests(ExecutorHarness):
                 },
             )
 
-    def test_an_unknown_actor_on_the_wire_is_refused(self) -> None:
-        for actor in ("maintainer", "root", "..", "SHARED"):
+    def test_no_actor_may_be_named_on_the_wire_at_all(self) -> None:
+        """The name is gone from the protocol, not merely validated.
+
+        This is the defect closed. A request used to carry `"actor"`, and the
+        broker believed it; the fix is not a better check on that field, it is
+        that naming one is refused however it is spelled.
+        """
+
+        for actor in ("main_operator", "employee", "maintainer", "shared", "root", ".."):
             with self.subTest(actor=actor), self.assertRaises(BrokerError):
                 self.broker().handle(
                     RUNTIME,
@@ -255,9 +344,10 @@ class WireTests(ExecutorHarness):
                         "operation": "trello.get_card",
                         "actor": actor,
                         "arguments": {"card_id": "card-1"},
+                        "provenance": _CITATION,
                     },
+                    actor=RUNTIME_ACTOR,
                 )
-        self.assertEqual(ACTORS, {"shared", "main_operator", "employee"})
 
     def test_a_broker_without_an_executor_refuses_rather_than_pretending(self) -> None:
         store = self.store()
@@ -278,9 +368,10 @@ class WireTests(ExecutorHarness):
             {
                 "op": "execute",
                 "operation": "trello.get_card",
-                "actor": "shared",
                 "arguments": {"card_id": "card-1"},
+                "provenance": _CITATION,
             },
+            actor=RUNTIME_ACTOR,
         )
         # A provider that echoed the key back is the one case the projection
         # cannot fix, so it is asserted here to stay visible: what matters is

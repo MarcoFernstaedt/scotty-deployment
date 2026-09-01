@@ -251,23 +251,95 @@ class UnixSocketBroker:
         )
         return reply is not None and reply.get("ok") is True
 
-    def status(self, provider: str, credential_class: str, actor: str = "shared") -> bool:
-        """Whether the broker holds this credential. Never returns the value."""
+    def status(self, provider: str, credential_class: str) -> bool:
+        """Whether this caller has a usable route to that provider.
+
+        Whose route is not a question this side gets to ask. The broker answers
+        for the actor whose socket this is, and for nobody else -- which is why
+        there is no actor on the wire any more.
+        """
 
         reply = self._request(
             {
                 "op": "status",
                 "provider": provider,
                 "credential_class": credential_class,
-                "actor": actor,
             }
         )
         return bool(reply and reply.get("ok") is True)
 
+    def status_for(
+        self, provider: str, credential_class: str, provenance: Mapping[str, object]
+    ) -> bool:
+        """Whether the broker will act on that provider for whoever wrote this.
+
+        The citation is the identity. On the shared runtime socket it is the
+        only identity there is, which is why it is not optional here.
+        """
+
+        reply = self._request(
+            {
+                "op": "status",
+                "provider": provider,
+                "credential_class": credential_class,
+                "provenance": dict(provenance),
+            }
+        )
+        return bool(reply and reply.get("ok") is True)
+
+    def owned_for(
+        self, provider: str, credential_class: str, provenance: Mapping[str, object]
+    ) -> bool:
+        """Whether the credential in use is this person's own, or the shared one.
+
+        A display detail rather than an authority one -- both answers mean the
+        call will work. It exists so Scotty can say "your Trello" or "the
+        business Trello" without ever learning which value either is.
+        """
+
+        reply = self._request(
+            {
+                "op": "status",
+                "provider": provider,
+                "credential_class": credential_class,
+                "provenance": dict(provenance),
+                "own_only": True,
+            }
+        )
+        return bool(reply and reply.get("ok") is True)
+
+    def state(self, provider: str, credential_class: str) -> str:
+        """The broker's fixed word for why, so `not authorized` reads as itself."""
+
+        reply = self._request(
+            {
+                "op": "status",
+                "provider": provider,
+                "credential_class": credential_class,
+            }
+        )
+        if reply is None:
+            return "unavailable"
+        state = reply.get("state")
+        return state if isinstance(state, str) else "unavailable"
+
     def execute(
-        self, operation: str, arguments: Mapping[str, object], *, actor: str = "shared"
+        self,
+        operation: str,
+        arguments: Mapping[str, object],
+        *,
+        provenance: Mapping[str, object] | None = None,
+        approval_id: str = "",
+        idempotency_key: str = "",
+        deadline: str = "",
     ) -> Mapping[str, object] | None:
         """Ask the broker to run one declared provider operation.
+
+        There is no actor here. The broker decides who is asking from the
+        socket and from the Discord message this call cites, both of which are
+        outside this process's reach. What travels is the operation, its
+        arguments, and -- for anything with a consequence -- the approval it
+        was granted, the key that makes it happen once, and its deadline.
 
         The reply carries what the provider said, bounded. It never carries the
         credential the broker used, and this side never had one to begin with.
@@ -275,14 +347,20 @@ class UnixSocketBroker:
         refusal: the provider may or may not have acted.
         """
 
-        return self._request(
-            {
-                "op": "execute",
-                "operation": operation,
-                "actor": actor,
-                "arguments": dict(arguments),
-            }
-        )
+        frame: dict[str, object] = {
+            "op": "execute",
+            "operation": operation,
+            "arguments": dict(arguments),
+        }
+        if provenance is not None:
+            frame["provenance"] = dict(provenance)
+        if approval_id:
+            frame["approval_id"] = approval_id
+        if idempotency_key:
+            frame["idempotency_key"] = idempotency_key
+        if deadline:
+            frame["deadline"] = deadline
+        return self._request(frame)
 
 
 class SourceMessageDeleter(Protocol):

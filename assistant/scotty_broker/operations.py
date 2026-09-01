@@ -214,6 +214,19 @@ PROVIDER_CREDENTIALS: Mapping[str, tuple[tuple[str, str], ...]] = {
     "rentcast": (("api_key", "X-Api-Key"),),
 }
 
+#: Credentials that identify the integration rather than a person.
+#:
+#: Trello's API key says which application is calling; the token says who is
+#: calling. Requiring a grant to use the application key would be requiring
+#: permission to be this product, which is not a permission anybody grants. The
+#: token is the one that carries an identity, and that one needs a grant when
+#: it is the business's rather than the person's.
+APPLICATION_CREDENTIALS: Mapping[str, frozenset[str]] = {
+    "trello": frozenset({"api_key"}),
+    "ghl": frozenset(),
+    "rentcast": frozenset(),
+}
+
 
 def known(operation: object) -> Operation:
     """Look one operation up, or refuse. There is no default and no wildcard."""
@@ -229,6 +242,7 @@ __all__ = [
     "AUTH_QUERY",
     "OPERATIONS",
     "PROVIDER_BASES",
+    "APPLICATION_CREDENTIALS",
     "PROVIDER_CREDENTIALS",
     "SHAPES",
     "Operation",

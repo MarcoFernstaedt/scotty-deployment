@@ -25,9 +25,20 @@ from .routing import CLIENT_PROFILES
 
 
 class CredentialHolder(Protocol):
-    """Whatever can answer whether a credential is held. Never what it is."""
+    """Whatever can answer whether a credential is usable. Never what it is.
 
-    def status(self, provider: str, credential_class: str, actor: str = ...) -> bool: ...
+    Both questions are asked per citation rather than per actor name: the
+    broker decides whose the request is from the Discord message it cites, so
+    this side has no actor to pass and no way to name one.
+    """
+
+    def status_for(
+        self, provider: str, credential_class: str, provenance: Mapping[str, object]
+    ) -> bool: ...
+
+    def owned_for(
+        self, provider: str, credential_class: str, provenance: Mapping[str, object]
+    ) -> bool: ...
 
 
 class ProviderIdentityError(RuntimeError):
@@ -74,8 +85,11 @@ _MAX_OVERRIDE_DEPTH = 12
 
 #: The credential that decides whether a provider is reachable at all, asked of
 #: the broker by (provider, class, actor). The values live only in the broker.
+#: The credential that carries an identity for each provider, not the one that
+#: carries the application's. Trello's api_key says which product is calling;
+#: the token says who. "Whose Trello is this" is a question about the token.
 _PROVIDER_CREDENTIALS: tuple[tuple[str, str], ...] = (
-    ("trello", "api_key"),
+    ("trello", "token"),
     ("ghl", "private_token"),
     ("rentcast", "api_key"),
 )
@@ -183,12 +197,18 @@ class ProviderIdentityResolver:
 
         if self.broker is None:
             return {}
+        citation = principal.citation()
+        if citation is None:
+            # Nobody has asked for anything, so there is no person to answer
+            # about. Not an error: an empty mapping is "reaches nothing".
+            return {}
         held: dict[str, bool] = {}
         for provider, credential_class in _PROVIDER_CREDENTIALS:
-            if self.broker.status(provider, credential_class, principal.role.value):
-                held[provider] = True
-            elif self.broker.status(provider, credential_class, "shared"):
-                held[provider] = False
+            # One question, asked of the broker for whoever Discord says wrote
+            # the message this work is for. Whether the credential is their own
+            # or a granted shared one is the broker's business, not this side's.
+            if self.broker.status_for(provider, credential_class, citation):
+                held[provider] = self.broker.owned_for(provider, credential_class, citation)
         return held
 
 

@@ -50,7 +50,17 @@ def config(**overrides: object) -> RuntimeConfig:
 
 
 def principal(role: Role) -> Principal:
-    return config().principal_for(role)
+    """One configured route, as somebody who has just said something.
+
+    A principal with no citation is nobody in particular now: the broker
+    settles identity from the message, so a test that asks "what can this
+    person reach" has to give it one.
+    """
+
+    from dataclasses import replace
+
+    configured = config().principal_for(role)
+    return replace(configured, message_id="9" + configured.channel_id[1:])
 
 
 class PerActorGoogleIdentityTests(unittest.TestCase):
@@ -101,13 +111,32 @@ class PerActorGoogleIdentityTests(unittest.TestCase):
 
 class CredentialSelectionTests(unittest.TestCase):
     def holder(self, **held: bool):
-        """A stand-in for the broker: says what is held, never what it is."""
+        """A stand-in for the broker: says what is held, never what it is.
+
+        It answers per citation now rather than per actor name, because that is
+        what the wire carries: the request cites a message and the broker
+        decides whose it is. The stand-in maps the channel back to the actor
+        the same way root's route map does.
+        """
+
+        actors = {
+            synthetic.OPERATOR_CHANNEL: "main_operator",
+            synthetic.EMPLOYEE_CHANNEL: "employee",
+        }
 
         class Holder:
-            def status(self, provider: str, credential_class: str, actor: str = "shared") -> bool:
+            @staticmethod
+            def _actor(provenance) -> str:
+                return actors.get(str(provenance.get("channel_id")), "")
+
+            def status_for(self, provider, credential_class, provenance) -> bool:
                 del credential_class
-                own = held.get(f"{provider}:{actor}")
-                return bool(own)
+                actor = self._actor(provenance)
+                return bool(held.get(f"{provider}:{actor}") or held.get(f"{provider}:shared"))
+
+            def owned_for(self, provider, credential_class, provenance) -> bool:
+                del credential_class
+                return bool(held.get(f"{provider}:{self._actor(provenance)}"))
 
         return Holder()
 
@@ -305,6 +334,12 @@ class RuntimeWiringTests(unittest.TestCase):
 
         return runtime(DISCORD_BOT_TOKEN="synthetic-discord", **environment)
 
+    @staticmethod
+    def principal(instance, role):
+        from test_provider_connection import principal_for
+
+        return principal_for(instance, role)
+
     def test_each_user_gets_an_adapter_bound_to_their_own_actor(self) -> None:
         """The runtime holds no credential, so the binding is the actor itself."""
 
@@ -314,15 +349,42 @@ class RuntimeWiringTests(unittest.TestCase):
             SCOTTY_TRELLO_API_KEY_MAIN_OPERATOR="operator-key",
             SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
         ) as runtime:
-            operator = runtime.config.principal_for(Role.MAIN_OPERATOR)
-            employee = runtime.config.principal_for(Role.EMPLOYEE)
+            operator = self.principal(runtime, Role.MAIN_OPERATOR)
+            employee = self.principal(runtime, Role.EMPLOYEE)
             self.assertIsNot(runtime._trello(operator), runtime._trello(employee))
-            # The broker holds the operator's own; the employee falls back to
-            # the shared business identity, and both are reported as such.
+            # The broker holds the operator's own. The employee has none, and a
+            # shared business identity existing is not permission to use it --
+            # so Trello is not something they reach at all until somebody says
+            # so in a grant.
             self.assertIs(runtime.identity_for(operator).held["trello"], True)
-            self.assertIs(runtime.identity_for(employee).held["trello"], False)
+            self.assertNotIn("trello", runtime.identity_for(employee).held)
             # Nothing in this process ever held either value.
             self.assertFalse(hasattr(runtime.identity_for(operator), "trello_token"))
+
+    def test_a_granted_shared_identity_becomes_reachable_and_reads_as_shared(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from assistant.scotty_broker.grants import Grant
+
+        with self.runtime(
+            SCOTTY_TRELLO_API_KEY="shared-key",
+            SCOTTY_TRELLO_TOKEN="shared-token",  # noqa: S106 - synthetic
+        ) as runtime:
+            employee = self.principal(runtime, Role.EMPLOYEE)
+            self.assertNotIn("trello", runtime.identity_for(employee).held)
+            runtime.broker_grants.put(
+                Grant(
+                    actor="employee",
+                    provider="trello",
+                    operations=("trello.list_board_cards", "trello.get_card"),
+                    resources=(),
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                )
+            )
+            held = runtime.identity_for(employee).held
+            self.assertIn("trello", held)
+            # Reachable, and named as the business's rather than their own.
+            self.assertIs(held["trello"], False)
 
     def test_a_user_without_a_credential_is_not_connected_to_that_provider(self) -> None:
         from assistant.scotty_business.runtime import ProviderNotConnected
@@ -331,34 +393,55 @@ class RuntimeWiringTests(unittest.TestCase):
             SCOTTY_TRELLO_API_KEY_MAIN_OPERATOR="operator-key",
             SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
         ) as runtime:
-            operator = runtime.config.principal_for(Role.MAIN_OPERATOR)
-            employee = runtime.config.principal_for(Role.EMPLOYEE)
+            operator = self.principal(runtime, Role.MAIN_OPERATOR)
+            employee = self.principal(runtime, Role.EMPLOYEE)
             self.assertTrue(runtime.actor_connection_status(operator)["trello"])
             self.assertFalse(runtime.actor_connection_status(employee)["trello"])
             with self.assertRaises(ProviderNotConnected):
                 runtime.handle_read(employee, {"operation": "trello_cards"})
 
-    def test_one_users_read_never_runs_on_the_others_adapter(self) -> None:
+    def test_one_users_read_never_runs_as_the_other(self) -> None:
+        """Whose identity a read runs as, observed where it is actually decided.
+
+        There is no per-role adapter table to swap any more, which is the
+        point: the adapter is built for the principal making the call and
+        carries that principal's own citation. So this watches the privileged
+        side -- the only place that decides whose credential is spent -- and
+        asserts it saw the right person.
+        """
+
         with self.runtime(
             SCOTTY_TRELLO_API_KEY="shared-key",
             SCOTTY_TRELLO_TOKEN="shared-token",  # noqa: S106 - synthetic
+            SCOTTY_TRELLO_TOKEN_EMPLOYEE="employee-token",  # noqa: S106 - synthetic
+            SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
         ) as runtime:
-            calls: list[str] = []
+            seen: list[str] = []
 
-            class Recorder:
-                def __init__(self, label: str) -> None:
-                    self.label = label
+            class Watching:
+                def run(self, operation_id, arguments, *, actor, timeout=10.0):
+                    del operation_id, arguments, timeout
+                    seen.append(actor)
 
-                def list_cards(self):
-                    calls.append(self.label)
-                    return ()
+                    class Outcome:
+                        ok = True
+                        status = 200
+                        body: list[object] = []
 
-            runtime.trello_adapters[Role.MAIN_OPERATOR] = Recorder("operator")
-            runtime.trello_adapters[Role.EMPLOYEE] = Recorder("employee")
+                        @staticmethod
+                        def as_reply():
+                            return {"ok": True, "status": 200, "body": [], "state": ""}
+
+                    return Outcome()
+
+            runtime.broker_harness._broker.executor = Watching()
             runtime.handle_read(
-                runtime.config.principal_for(Role.EMPLOYEE), {"operation": "trello_cards"}
+                self.principal(runtime, Role.EMPLOYEE), {"operation": "trello_cards"}
             )
-            self.assertEqual(calls, ["employee"])
+            runtime.handle_read(
+                self.principal(runtime, Role.MAIN_OPERATOR), {"operation": "trello_cards"}
+            )
+            self.assertEqual(seen, ["employee", "main_operator"])
 
     def test_local_setup_collects_a_credential_for_each_user(self) -> None:
         from assistant.scotty_business.setup import OPTIONAL_SECRETS, PER_ACTOR_SECRETS

@@ -7,6 +7,7 @@ import threading
 import unittest
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,19 +70,62 @@ class _BrokerHarness:
                 commitment.material,
                 commitment.actor,
             )
-        self._broker = Broker(store, runtime_uid=os.getuid(), executor=Executor(store))
+        # A real broker, with this process's own account standing in for each
+        # actor's. The uid map is deployment configuration -- the root service
+        # reads it from the host's accounts -- so setting it here is the same
+        # thing the installed service does, not a way round the check.
+        from assistant.scotty_broker.broker import ACTOR_UIDS, RUNTIME_ACTOR
+        from assistant.scotty_broker.effects import EffectLedger
+        from assistant.scotty_broker.grants import GrantStore
+        from assistant.scotty_broker.provenance import ProvenanceResolver, Route
+
+        grants = GrantStore(home / "broker-grants.json")
+        effects = EffectLedger(home / "broker-effects.db")
+        effects.initialize()
+        self.grants = grants
+        self.effects = effects
+        routes = (
+            Route(synthetic.OPERATOR_CHANNEL, synthetic.OPERATOR_USER, "main_operator"),
+            Route(synthetic.EMPLOYEE_CHANNEL, synthetic.EMPLOYEE_USER, "employee"),
+        )
+        self.messages = {
+            _citation_id(synthetic.OPERATOR_CHANNEL): {
+                "channel_id": synthetic.OPERATOR_CHANNEL,
+                "author": {"id": synthetic.OPERATOR_USER},
+            },
+            _citation_id(synthetic.EMPLOYEE_CHANNEL): {
+                "channel_id": synthetic.EMPLOYEE_CHANNEL,
+                "author": {"id": synthetic.EMPLOYEE_USER},
+            },
+        }
+
+        def fetch(url, headers):
+            body = self.messages.get(url.rsplit("/", 1)[-1])
+            return (200, body) if body is not None else (404, None)
+
+        self._broker = Broker(
+            store,
+            executor=Executor(store, grants),
+            grants=grants,
+            effects=effects,
+            provenance=ProvenanceResolver(routes, lambda: "synthetic-bot-token", fetch=fetch),
+            actor_uids={
+                **dict.fromkeys(ACTOR_UIDS, os.getuid()),
+                RUNTIME_ACTOR: os.getuid(),
+            },
+        )
         self._server: object | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
     def start(self) -> None:
-        from assistant.scotty_broker.broker import bind_socket, serve_forever
+        from assistant.scotty_broker.broker import RUNTIME_ACTOR, bind_socket, serve_forever
 
         self._server = bind_socket(self.socket_path, group=os.getgid())
         self._thread = threading.Thread(
             target=serve_forever,
             args=(self._broker, self._server),
-            kwargs={"should_stop": self._stop.is_set},
+            kwargs={"actor": RUNTIME_ACTOR, "should_stop": self._stop.is_set},
             daemon=True,
         )
         self._thread.start()
@@ -92,6 +136,12 @@ class _BrokerHarness:
             self._thread.join(3.0)
         if self._server is not None:
             self._server.close()  # type: ignore[attr-defined]
+
+
+def _citation_id(channel_id: str) -> str:
+    """A stable synthetic message id per channel, so tests can cite one."""
+
+    return "9" + channel_id[1:]
 
 
 @contextmanager
@@ -115,7 +165,13 @@ def runtime(private: dict[str, object] | None = None, **secrets: str) -> Iterato
                 if name in CONTAINER_ENVIRONMENT_NAMES:
                     os.environ[name] = value
             broker.start()
-            yield Runtime(home, broker_socket=broker.socket_path)
+            instance = Runtime(home, broker_socket=broker.socket_path)
+            # Root's own grant store, reachable from the test the way root
+            # reaches it on the host: through the broker, never through the
+            # runtime. Exposed here so a test can grant and then observe.
+            instance.broker_grants = broker.grants  # type: ignore[attr-defined]
+            instance.broker_harness = broker  # type: ignore[attr-defined]
+            yield instance
         finally:
             broker.stop()
             for name, value in saved.items():
@@ -125,12 +181,25 @@ def runtime(private: dict[str, object] | None = None, **secrets: str) -> Iterato
                     os.environ[name] = value
 
 
+def principal_for(instance, role: Role) -> Principal:
+    """One configured route, as a person who has just said something.
+
+    The broker settles identity from the cited message, so a principal with no
+    citation is nobody in particular. Production builds these from real events;
+    tests build them from the synthetic ones the broker harness answers for.
+    """
+
+    configured = instance.config.principal_for(role)
+    return replace(configured, message_id=_citation_id(configured.channel_id))
+
+
 def operator() -> Principal:
     return Principal(
         guild_id=synthetic.CLIENT_GUILD,
         channel_id=synthetic.OPERATOR_CHANNEL,
         user_id=synthetic.OPERATOR_USER,
         role=Role.MAIN_OPERATOR,
+        message_id=_citation_id(synthetic.OPERATOR_CHANNEL),
     )
 
 

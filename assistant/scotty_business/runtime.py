@@ -106,6 +106,23 @@ from .workflows import (
 
 logger = logging.getLogger(__name__)
 
+#: Exactly the property-card operations this tool serves. An operation absent
+#: from here is refused for being absent, whatever else is or is not connected.
+_CARD_OPERATIONS = frozenset(
+    {
+        "normalize_address",
+        "compare",
+        "preview_merge",
+        "duplicates",
+        "reformat",
+        "apply_template",
+        "dry_run",
+        "create",
+        "update",
+        "move",
+    }
+)
+
 #: The run controls a workflow's owner has. Everything else about a workflow is
 #: a declaration; these are the ones that make something happen.
 _WORKFLOW_RUN_ACTIONS = frozenset(
@@ -115,7 +132,10 @@ _WORKFLOW_RUN_ACTIONS = frozenset(
 #: The provider credentials the root-owned broker can be asked about. Google is
 #: absent: it uses provider-owned browser consent, not a stored key.
 BROKER_CREDENTIALS: Mapping[str, str] = {
-    "trello": "api_key",
+    # The credential that carries an identity, not the one that carries the
+    # application's. Trello's api_key says which product is calling; the token
+    # says who. "Is Trello connected for you" is a question about the token.
+    "trello": "token",
     "ghl": "private_token",
     "rentcast": "api_key",
 }
@@ -478,73 +498,34 @@ class Runtime:
         # outside this container. Nothing here has one to give an adapter.
         self.provider_broker = UnixSocketBroker(self.broker_socket)
         self.identities = ProviderIdentityResolver(self.config, self.provider_broker)
-        trello_scope = self.config.trello
-        location_id = self.config.ghl_location_id
-        endpoints = self.config.rentcast_endpoints
-        self.trello_adapters: dict[Role, TrelloReadPort] = {}
-        self.ghl_adapters: dict[Role, GHLReadPort] = {}
-        self.rentcast_adapters: dict[Role, RentCastPort] = {}
-        self.actor_connected: dict[Role, dict[str, bool]] = {}
+        self.trello_scope = self.config.trello
+        self.ghl_location_id = self.config.ghl_location_id
+        self.rentcast_endpoints = self.config.rentcast_endpoints
+        # Adapters are no longer built once and shared. They are built for the
+        # principal making the call, carrying that principal's own citation, so
+        # an employee's effect can never leave through the main operator's
+        # connector -- which is exactly what a single shared adapter allowed.
+        self._adapter_cache: dict[tuple[str, str], object] = {}
+        self.actor_connected: dict[Role, dict[str, bool]] = {
+            role: {"trello": False, "ghl": False, "rentcast": False} for role in CLIENT_ROLES
+        }
+        # Deployment-level readiness: whether the broker holds anything at all
+        # for this provider. Whether a given person may use it is a different
+        # question, answered per call against that person's own citation.
         broker_available = self.provider_broker.available()
-        for role in CLIENT_ROLES:
-            # A provider is connected for this user when the broker holds a
-            # credential it can act with — their own or the shared business
-            # identity — and the configured resource scope is present. The
-            # runtime never learns which, and never sees either.
-            trello_held = broker_available and (
-                self.provider_broker.status("trello", "api_key", role.value)
-                or self.provider_broker.status("trello", "api_key", "shared")
-            )
-            ghl_held = broker_available and (
-                self.provider_broker.status("ghl", "private_token", role.value)
-                or self.provider_broker.status("ghl", "private_token", "shared")
-            )
-            rentcast_held = broker_available and (
-                self.provider_broker.status("rentcast", "api_key", role.value)
-                or self.provider_broker.status("rentcast", "api_key", "shared")
-            )
-            trello_ready = bool(trello_held and trello_scope is not None)
-            ghl_ready = bool(ghl_held and location_id is not None)
-            rentcast_ready = bool(rentcast_held and endpoints)
-            brokered = BrokeredTransport(self.provider_broker, actor=role.value)
-            self.actor_connected[role] = {
-                "trello": trello_ready,
-                "ghl": ghl_ready,
-                "rentcast": rentcast_ready,
-            }
-            # The adapters still build their own requests, but the transport
-            # under them cannot send one: it recognises the request as a
-            # declared operation and hands that to the broker. The credential
-            # arguments below are placeholders the broker discards and
-            # replaces with what it holds.
-            self.trello_adapters[role] = (
-                TrelloAdapter(brokered, _BROKERED, _BROKERED, trello_scope)
-                if trello_ready and trello_scope is not None
-                else UnconnectedProvider("Trello")
-            )
-            self.ghl_adapters[role] = (
-                GHLAdapter(brokered, _BROKERED, location_id)
-                if ghl_ready and location_id is not None
-                else UnconnectedProvider("GoHighLevel")
-            )
-            self.rentcast_adapters[role] = (
-                RentCastAdapter(brokered, _BROKERED, endpoints)
-                if rentcast_ready and endpoints
-                else UnconnectedProvider("RentCast")
-            )
         self.connected = {
             "discord": True,
-            "trello": any(item["trello"] for item in self.actor_connected.values()),
-            "ghl": any(item["ghl"] for item in self.actor_connected.values()),
-            "rentcast": any(item["rentcast"] for item in self.actor_connected.values()),
+            "trello": broker_available
+            and self.trello_scope is not None
+            and self.provider_broker.status("trello", "api_key"),
+            "ghl": broker_available
+            and self.ghl_location_id is not None
+            and self.provider_broker.status("ghl", "private_token"),
+            "rentcast": broker_available
+            and bool(self.rentcast_endpoints)
+            and self.provider_broker.status("rentcast", "api_key"),
             "google_workspace": False,
         }
-        # The main operator's adapters back the deployment-level service and the
-        # shared property board; per-actor work resolves its own below.
-        operator = Role.MAIN_OPERATOR
-        self.trello: TrelloReadPort = self.trello_adapters[operator]
-        self.ghl: GHLReadPort = self.ghl_adapters[operator]
-        self.rentcast: RentCastPort = self.rentcast_adapters[operator]
         state_dir = home / "scotty"
         # Consent is personal, so each client user has their own token record
         # and their own adapter. Nothing here is shared between the two.
@@ -591,11 +572,7 @@ class Runtime:
         self.consumer_lease = ConsumerLease(state_dir / "consumer.lease")
         self.property_effects = EffectLog(state_dir / "property-effects.db")
         self.property_effects.initialize()
-        self.property_cards: PropertyCardEngine | None = (
-            PropertyCardEngine(self.config, self.trello, self.property_effects)
-            if self.connected["trello"]
-            else None
-        )
+
         self.self_repair = SelfRepairManager(
             state_dir,
             state_dir / "private.json",
@@ -607,9 +584,12 @@ class Runtime:
         self.service = ScottyService(
             self.config,
             self.approvals,
-            trello=self.trello,
-            ghl=self.ghl,
-            rentcast=self.rentcast,
+            # The service resolves each provider from the principal executing
+            # the proposal, so an approved effect leaves through that person's
+            # own connector rather than the deployment's first one.
+            trello=self._trello,
+            ghl=self._ghl,
+            rentcast=self._rentcast,
             discord=self.discord,
             discord_admin=self.discord_admin,
             google_workspace=self.google_workspace_for,
@@ -699,9 +679,22 @@ class Runtime:
         """
 
         operation = _text(args, "card_operation")
+        if operation not in _CARD_OPERATIONS:
+            # Refused for being unknown, before anything is asked about
+            # connectivity: "Trello is not connected" is a confusing answer to
+            # an operation that would not exist if it were.
+            raise ValueError("property-card operation is not permitted")
         if operation == "normalize_address":
             return normalize_address(_text(args, "address")).as_json()
-        engine = self.property_cards
+        if operation in {"compare", "preview_merge"}:
+            # Two cards somebody pasted, compared arithmetically. No provider
+            # is touched, so none needs to be connected.
+            left = parse_card(_object(args, "card"))
+            right = parse_card(_object(args, "other_card"))
+            if operation == "compare":
+                return compare(left, right).as_json()
+            return merge_preview(left, right).as_json()
+        engine = self._property_engine(principal)
         if engine is None:
             raise ProviderNotConnected("Trello is not connected")
         if operation == "duplicates":
@@ -710,12 +703,6 @@ class Runtime:
                 {"card_id": match.card_id, **result.as_json()}
                 for match, result in find_duplicates(candidate, engine.existing())
             ]
-        if operation in {"compare", "preview_merge"}:
-            left = parse_card(_object(args, "card"))
-            right = parse_card(_object(args, "other_card"))
-            if operation == "compare":
-                return compare(left, right).as_json()
-            return merge_preview(left, right).as_json()
         if operation == "reformat":
             return engine.reformat(parse_card(_object(args, "card"))).as_json()
         if operation == "apply_template":
@@ -942,12 +929,35 @@ class Runtime:
             raise ValueError(str(exc)) from exc
 
     def actor_connection_status(self, principal: Principal) -> dict[str, bool]:
-        """What this exact user is connected to, not what the deployment has."""
+        """What this exact user is connected to, not what the deployment has.
+
+        Asked of the broker, for this person, at the moment of asking. The
+        broker answers for whoever Discord says wrote the message this work is
+        for -- so "connected" here means "connected for you", and a shared
+        business identity nobody granted this person reads as not authorized
+        rather than as connected.
+        """
 
         connected = dict(self.connected)
-        connected.update(self.actor_connected.get(principal.role, {}))
+        for provider, credential_class in BROKER_CREDENTIALS.items():
+            if provider not in connected:
+                continue
+            connected[provider] = connected[provider] and self._held_for(
+                principal, provider, credential_class
+            )
         connected["google_workspace"] = self.google_connected.get(principal.role, False)
         return provider_status(connected)
+
+    def _held_for(self, principal: Principal, provider: str, credential_class: str) -> bool:
+        """Whether the broker will act for this person on that provider."""
+
+        citation = principal.citation()
+        if citation is None:
+            # Nothing to cite means nobody has asked for anything, so there is
+            # no person to be connected on behalf of.
+            return False
+        reply = self.provider_broker.status_for(provider, credential_class, citation)
+        return reply
 
     def _maintenance(self, principal: Principal, args: Mapping[str, object]) -> object:
         """Backup, restore-preview, rollback-plan and health. Maintainer only.
@@ -1118,14 +1128,63 @@ class Runtime:
 
         return self.identities.resolve(principal)
 
+    def _transport_for(self, principal: Principal) -> BrokeredTransport:
+        """One transport, carrying this exact person's own citation.
+
+        Built per principal rather than per role, because the citation is per
+        message. Two people's work therefore cannot share a transport even by
+        accident, which is what let an employee's effect leave through the main
+        operator's connector before.
+        """
+
+        return BrokeredTransport(self.provider_broker, provenance=principal.citation())
+
+    def _reaches(self, principal: Principal, provider: str) -> bool:
+        """Whether this exact person has a usable route to that provider.
+
+        Asked of the broker, per person, per call. The deployment holding a
+        credential is not the same question, and answering the deployment's
+        question for a person is what let one user's work leave through
+        another's connector.
+        """
+
+        if not self.connected.get(provider):
+            return False
+        credential_class = BROKER_CREDENTIALS.get(provider)
+        if credential_class is None:  # pragma: no cover - table is exhaustive
+            return False
+        return self._held_for(principal, provider, credential_class)
+
     def _trello(self, principal: Principal) -> TrelloReadPort:
-        return self.trello_adapters.get(principal.role, UnconnectedProvider("Trello"))
+        if not self._reaches(principal, "trello") or self.trello_scope is None:
+            return UnconnectedProvider("Trello")
+        return TrelloAdapter(
+            self._transport_for(principal), _BROKERED, _BROKERED, self.trello_scope
+        )
 
     def _ghl(self, principal: Principal) -> GHLReadPort:
-        return self.ghl_adapters.get(principal.role, UnconnectedProvider("GoHighLevel"))
+        if not self._reaches(principal, "ghl") or self.ghl_location_id is None:
+            return UnconnectedProvider("GoHighLevel")
+        return GHLAdapter(self._transport_for(principal), _BROKERED, self.ghl_location_id)
 
     def _rentcast(self, principal: Principal) -> RentCastPort:
-        return self.rentcast_adapters.get(principal.role, UnconnectedProvider("RentCast"))
+        if not self._reaches(principal, "rentcast") or not self.rentcast_endpoints:
+            return UnconnectedProvider("RentCast")
+        return RentCastAdapter(self._transport_for(principal), _BROKERED, self.rentcast_endpoints)
+
+    def _property_engine(self, principal: Principal) -> PropertyCardEngine | None:
+        """The card engine, bound to whoever is asking.
+
+        One shared engine meant one shared connector: an employee creating a
+        card sent it through the main operator's Trello identity and recorded it
+        against the main operator's effects. The engine is per principal now,
+        over that principal's own transport.
+        """
+
+        trello = self._trello(principal)
+        if isinstance(trello, UnconnectedProvider):
+            return None
+        return PropertyCardEngine(self.config, trello, self.property_effects)
 
     def _provider_setup(
         self, principal: Principal, args: Mapping[str, object]

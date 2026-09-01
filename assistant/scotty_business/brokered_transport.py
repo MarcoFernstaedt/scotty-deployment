@@ -87,11 +87,18 @@ _CREDENTIAL_QUERY = frozenset({"key", "token"})
 
 
 class BrokeredTransport:
-    """Sends declared operations to the broker instead of making requests."""
+    """Sends declared operations to the broker instead of making requests.
 
-    def __init__(self, broker: object, *, actor: str = "shared"):
+    There is no actor here any more. This side used to name one, and the broker
+    believed it; now it carries the Discord message the work is being done for,
+    and the broker asks Discord who wrote it. A transport built without a
+    citation can still be built -- it simply cannot act, which is the right
+    answer for work nobody asked for.
+    """
+
+    def __init__(self, broker: object, *, provenance: Mapping[str, object] | None = None):
         self.broker = broker
-        self.actor = actor
+        self.provenance = dict(provenance) if provenance else None
 
     def _route(self, method: str, path: str) -> _Route | None:
         for route in _ROUTES:
@@ -136,7 +143,7 @@ class BrokeredTransport:
             arguments[name] = value
 
         reply = self.broker.execute(  # type: ignore[attr-defined]
-            route.operation, arguments, actor=self.actor
+            route.operation, arguments, provenance=self.provenance
         )
         if reply is None:
             # The broker did not answer, so what the provider did is unknown.

@@ -52,8 +52,11 @@ readonly BROKER_DIR=/usr/local/lib/scotty/scotty_broker
 readonly -a BROKER_FILES=(
   "__init__.py"
   "broker.py"
+  "effects.py"
   "executor.py"
+  "grants.py"
   "operations.py"
+  "provenance.py"
 )
 readonly CONTAINER=scotty
 readonly NETWORK=scotty-egress

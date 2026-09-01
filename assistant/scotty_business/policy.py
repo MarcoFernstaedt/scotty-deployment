@@ -59,9 +59,23 @@ class Principal:
     channel_id: str
     user_id: str
     role: Role
+    #: The Discord message this work is being done for, when there is one.
+    #:
+    #: It is not part of the identity tuple and never widens authority here.
+    #: It travels so the privileged broker can ask Discord who actually wrote
+    #: it: on the pinned single-gateway topology that citation is what turns
+    #: "the runtime says it is Mikey" into "Discord says Mikey wrote this".
+    message_id: str = ""
 
     def as_tuple(self) -> tuple[str, str, str, str]:
         return (self.guild_id, self.channel_id, self.user_id, self.role.value)
+
+    def citation(self) -> dict[str, str] | None:
+        """What the broker needs to confirm who is asking, or nothing."""
+
+        if not self.message_id:
+            return None
+        return {"channel_id": self.channel_id, "message_id": self.message_id}
 
 
 _APPROVAL_ACTIONS = frozenset(

@@ -16,16 +16,18 @@ from contextlib import suppress
 from pathlib import Path
 
 from assistant.scotty_broker.broker import (
+    ACTOR_OPERATIONS,
     CREDENTIAL_CLASSES,
     MAX_FRAME_BYTES,
     MAX_MATERIAL_CHARS,
     ROOT_OPERATIONS,
-    RUNTIME_OPERATIONS,
+    RUNTIME_ACTOR,
     RUNTIME_UID,
     Broker,
     BrokerError,
     CredentialStore,
     Peer,
+    bind_control_socket,
     bind_socket,
     serve_forever,
 )
@@ -34,6 +36,18 @@ SECRET = "synthetic-provider-key-000000"  # noqa: S105 - synthetic fixture
 OTHER = "synthetic-provider-key-000001"  # noqa: S105 - synthetic fixture
 ROOT = Peer(pid=1, uid=0, gid=0)
 RUNTIME = Peer(pid=2, uid=RUNTIME_UID, gid=RUNTIME_UID)
+
+
+def as_runtime(broker, request):
+    """One request from the shared runtime container, on its own socket.
+
+    The socket is the identity now, so a test that reaches the broker as the
+    runtime has to arrive the way the runtime does.
+    """
+
+    return broker.handle(RUNTIME, request, actor=RUNTIME_ACTOR)
+
+
 STRANGER = Peer(pid=3, uid=1234, gid=1234)
 
 
@@ -64,7 +78,7 @@ class AuthorizationTests(BrokerHarness):
     """Authority comes from the kernel's peer credentials, not the message."""
 
     def test_root_may_use_every_operation(self) -> None:
-        for operation in sorted(ROOT_OPERATIONS | RUNTIME_OPERATIONS):
+        for operation in sorted(ROOT_OPERATIONS | ACTOR_OPERATIONS):
             with self.subTest(operation=operation):
                 self.assertTrue(ROOT.may(operation))
 
@@ -72,12 +86,12 @@ class AuthorizationTests(BrokerHarness):
         self.assertEqual(
             {operation for operation in ROOT_OPERATIONS if RUNTIME.may(operation)}, set()
         )
-        self.assertTrue(RUNTIME.may("status"))
+        self.assertTrue(RUNTIME.may("status", actor=RUNTIME_ACTOR))
 
     def test_an_unprivileged_caller_may_do_nothing_at_all(self) -> None:
-        for operation in sorted(ROOT_OPERATIONS | RUNTIME_OPERATIONS):
+        for operation in sorted(ROOT_OPERATIONS | ACTOR_OPERATIONS):
             with self.subTest(operation=operation):
-                self.assertFalse(STRANGER.may(operation))
+                self.assertFalse(STRANGER.may(operation, actor=RUNTIME_ACTOR))
 
     def test_the_runtime_cannot_commit_or_revoke_a_credential(self) -> None:
         broker, store = self.broker()
@@ -100,7 +114,7 @@ class AuthorizationTests(BrokerHarness):
             },
         ):
             with self.subTest(op=request["op"]), self.assertRaises(BrokerError) as caught:
-                broker.handle(RUNTIME, request)
+                as_runtime(broker, request)
             self.assertEqual(str(caught.exception), "unauthorized")
         self.assertTrue(store.present("trello", "api_key"))
 
@@ -118,8 +132,8 @@ class FixedOperationTests(BrokerHarness):
         outcome = self.commit(broker)
         self.assertEqual(outcome, {"ok": True, "state": "credential present"})
 
-        status = broker.handle(
-            RUNTIME, {"op": "status", "provider": "trello", "credential_class": "api_key"}
+        status = as_runtime(
+            broker, {"op": "status", "provider": "trello", "credential_class": "api_key"}
         )
         self.assertEqual(status, {"ok": True, "state": "credential present"})
         self.assertNotIn(SECRET, json.dumps(status))
@@ -128,8 +142,8 @@ class FixedOperationTests(BrokerHarness):
     def test_an_absent_credential_reports_absent(self) -> None:
         broker, _ = self.broker()
         self.assertEqual(
-            broker.handle(
-                RUNTIME, {"op": "status", "provider": "ghl", "credential_class": "private_token"}
+            as_runtime(
+                broker, {"op": "status", "provider": "ghl", "credential_class": "private_token"}
             ),
             {"ok": False, "state": "credential absent"},
         )
@@ -178,8 +192,8 @@ class FixedOperationTests(BrokerHarness):
             (7, 7),
         ):
             with self.subTest(provider=provider), self.assertRaises(BrokerError):
-                broker.handle(
-                    ROOT,
+                as_runtime(
+                    broker,
                     {"op": "status", "provider": provider, "credential_class": credential_class},
                 )
         self.assertNotIn("google_workspace", CREDENTIAL_CLASSES)
@@ -385,14 +399,14 @@ class InstalledSocketTests(unittest.TestCase):
         # runtime operation is genuinely authorized. Production policy is
         # untouched — root operations are gated on uid 0 alone, so a non-root
         # harness cannot reach them however this is set.
-        self.broker = Broker(self.store, runtime_uid=os.getuid())
+        self.broker = Broker(self.store, actor_uids={RUNTIME_ACTOR: os.getuid()})
         self.server = bind_socket(self.socket_path, group=os.getgid())
         self.addCleanup(self.server.close)
         self.stop = threading.Event()
         self.thread = threading.Thread(
             target=serve_forever,
             args=(self.broker, self.server),
-            kwargs={"should_stop": self.stop.is_set},
+            kwargs={"actor": RUNTIME_ACTOR, "should_stop": self.stop.is_set},
             daemon=True,
         )
         self.thread.start()
@@ -467,7 +481,28 @@ class InstalledSocketTests(unittest.TestCase):
 
     @unittest.skipUnless(os.geteuid() == 0, "the full lifecycle needs a genuinely root peer")
     def test_the_whole_lifecycle_runs_over_the_real_socket_when_root(self) -> None:
-        """When the test peer really is root, nothing is simulated at all."""
+        """When the test peer really is root, nothing is simulated at all.
+
+        Root's operations arrive on root's own socket. The actor sockets carry
+        no root authority at all now -- not even for root -- which is why this
+        binds the control socket rather than reusing the one above.
+        """
+
+        control_path = self.root / "control.sock"
+        control = bind_control_socket(control_path)
+        self.addCleanup(control.close)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=serve_forever,
+            args=(self.broker, control),
+            kwargs={"should_stop": stop.is_set},
+            daemon=True,
+        )
+        thread.start()
+        self.addCleanup(thread.join, 3.0)
+        self.addCleanup(stop.set)
+        saved, self.socket_path = self.socket_path, control_path
+        self.addCleanup(setattr, self, "socket_path", saved)
 
         opened = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
         self.assertTrue(opened["ok"])
@@ -587,13 +622,13 @@ class InstalledSocketTests(unittest.TestCase):
         self.stop.set()
         self.thread.join(3.0)
         self.server.close()
-        restarted = Broker(self.store, runtime_uid=os.getuid())
+        restarted = Broker(self.store, actor_uids={RUNTIME_ACTOR: os.getuid()})
         self.server = bind_socket(self.socket_path, group=os.getgid())
         self.stop = threading.Event()
         self.thread = threading.Thread(
             target=serve_forever,
             args=(restarted, self.server),
-            kwargs={"should_stop": self.stop.is_set},
+            kwargs={"actor": RUNTIME_ACTOR, "should_stop": self.stop.is_set},
             daemon=True,
         )
         self.thread.start()
@@ -623,7 +658,7 @@ class InstalledSocketTests(unittest.TestCase):
         link = self.root / "link.sock"
         link.symlink_to(target)
         with self.assertRaises(BrokerError):
-            bind_socket(link)
+            bind_socket(link, group=os.getgid())
 
 
 class RuntimeBrokerStatusTests(unittest.TestCase):
@@ -664,8 +699,8 @@ class RuntimeBrokerStatusTests(unittest.TestCase):
                     "material": SECRET,
                 },
             )
-            reply = broker.handle(
-                RUNTIME, {"op": "status", "provider": "rentcast", "credential_class": "api_key"}
+            reply = as_runtime(
+                broker, {"op": "status", "provider": "rentcast", "credential_class": "api_key"}
             )
             self.assertEqual(reply, {"ok": True, "state": "credential present"})
             self.assertNotIn(SECRET, json.dumps(reply))
@@ -789,7 +824,8 @@ class PackagedArtefactTests(unittest.TestCase):
                 # account, so the client below is genuinely authorized for the
                 # runtime operation rather than pretending to be.
                 "serve_forever(Broker(CredentialStore("
-                f"{str(store_path)!r}), runtime_uid={os.getuid()}), server)\n"
+                f"{str(store_path)!r}), actor_uids={{'runtime': {os.getuid()}}}), server,"
+                " actor='runtime')\n"
             )
             process = subprocess.Popen(  # noqa: S603 - fixed interpreter and script
                 [sys.executable, "-c", script],

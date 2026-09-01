@@ -255,7 +255,9 @@ class RuntimeSurfaceTests(unittest.TestCase):
         )
 
     def actor(self, runtime, role=Role.MAIN_OPERATOR):
-        return runtime.config.principal_for(role)
+        from test_provider_connection import principal_for
+
+        return principal_for(runtime, role)
 
     def test_address_normalization_needs_no_provider_at_all(self) -> None:
         with self.runtime() as runtime:

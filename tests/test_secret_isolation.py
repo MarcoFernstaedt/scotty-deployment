@@ -199,21 +199,52 @@ class BrokerStoreTests(unittest.TestCase):
                 },
             )
 
-    def test_an_unknown_actor_is_refused(self) -> None:
+    def test_an_unknown_actor_is_refused_where_root_may_still_name_one(self) -> None:
+        """Root writes on behalf of an actor; the name is still checked.
+
+        The runtime cannot name an actor at all any more -- that is asserted in
+        the authority tests. What remains here is root's own path, where an
+        actor name is a real argument and a bad one must be refused rather than
+        creating a slot nobody meant.
+        """
+
         from assistant.scotty_broker.broker import Broker, BrokerError, Peer
 
         broker = Broker(self.store())
-        for actor in ("maintainer", "root", "", "../shared", "MAIN_OPERATOR"):
+        for actor in ("root", "", "../shared", "MAIN_OPERATOR", "employee "):
             with self.subTest(actor=actor), self.assertRaises(BrokerError):
                 broker.handle(
                     Peer(pid=1, uid=0, gid=0),
                     {
-                        "op": "status",
+                        "op": "revoke",
                         "provider": "trello",
                         "credential_class": "token",
                         "actor": actor,
                     },
                 )
+
+    def test_the_runtime_cannot_name_an_actor_at_all(self) -> None:
+        from assistant.scotty_broker.broker import (
+            RUNTIME_ACTOR,
+            RUNTIME_UID,
+            Broker,
+            BrokerError,
+            Peer,
+        )
+
+        broker = Broker(self.store())
+        with self.assertRaises(BrokerError) as caught:
+            broker.handle(
+                Peer(pid=1, uid=RUNTIME_UID, gid=RUNTIME_UID),
+                {
+                    "op": "status",
+                    "provider": "trello",
+                    "credential_class": "token",
+                    "actor": "main_operator",
+                },
+                actor=RUNTIME_ACTOR,
+            )
+        self.assertIn("actor", str(caught.exception))
 
 
 if __name__ == "__main__":

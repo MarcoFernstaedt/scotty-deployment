@@ -1,25 +1,37 @@
-"""The root-owned credential broker: four fixed operations, nothing else.
+"""The root-owned credential broker: fixed operations, kernel-decided identity.
 
-Scotty's runtime must be able to know whether a provider credential is present
-and usable without ever being able to read it. That is what this process is
-for. It runs as root, outside the container, and owns the only copy of the
-stored material. The runtime reaches it through a Unix socket and can ask
-exactly one question: is this provider connected?
+Scotty's runtime must be able to spend a provider credential without ever being
+able to read one. That is what this process is for. It runs as root, outside
+every container, and owns the only copy of the stored material.
 
-Authority comes from the kernel, not from the message. Every connection's peer
-credentials are read with SO_PEERCRED, and the operations a caller may use are
-decided by its uid: root may open a window, validate, commit, and revoke; the
-unprivileged runtime account may only ask for status. Anything else is refused
-before the request is even parsed.
+The authority model is the part worth reading. An earlier version took the
+actor out of the request: a caller said `"actor": "employee"` and the broker
+believed it. Every process running as the one runtime account -- a compromised
+plugin, a maintainer shell, anything sharing that uid -- could therefore act as
+either client user. A boundary whose authority comes from the message it is
+protecting is not a boundary.
 
-Committing is deliberately awkward. A commit needs a window that root opened
-moments earlier, that has not expired, and that has not already been used.
-Windows live only in memory, so a restart invalidates every one of them rather
-than leaving a usable opening behind.
+So identity comes from the kernel, twice. Each actor has its own listening
+socket, owned by that actor's own group and unreachable by anyone else, and the
+actor *is* whichever socket the connection arrived on. `SO_PEERCRED` then
+confirms the connecting process really runs as that actor's account. A request
+that names an actor is refused outright rather than ignored, because a caller
+that can ask and be quietly overruled is a caller somebody will eventually
+trust.
+
+What that buys is worth stating plainly: the three runtime workers run as three
+different accounts, so "act as the other user" is not a check one of them can
+fail to make -- it is a socket they cannot open.
+
+On top of that the privileged side proves two more things before it spends
+anything. A shared business identity needs an explicit root-written grant
+naming the actor, provider, operations and resources. Anything with a
+consequence needs an approval bound to this exact actor, operation, payload and
+resource, spent once, inside its deadline. Neither is reachable from an actor
+socket.
 
 No response ever carries credential material, and nothing here writes material
-to a log, an argument list, or an exception. The only vocabulary on the wire is
-a boolean and a fixed state word.
+to a log, an argument list, or an exception.
 """
 
 from __future__ import annotations
@@ -35,15 +47,59 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-#: The installed socket, and the store only root can read.
+#: The root-only control socket, and the store only root can read. Opening a
+#: window, committing, revoking, granting and approving all happen here, and
+#: this socket is mode 0600 so nothing but root can even connect.
 SOCKET_PATH = "/run/scotty/credential-broker.sock"
 STORE_PATH = "/var/lib/scotty/credentials.json"
 
-#: The unprivileged account the container runtime runs as.
+#: One account per actor, and one socket per actor owned by that account's
+#: group. These are the whole authority model: a worker running as the employee
+#: account cannot open the main operator's socket, so it cannot ask as them.
+#:
+#: 10000 -- the single account every profile used to share -- is deliberately
+#: not among them. Nothing runs as it any more, and nothing may reach an actor
+#: socket as it.
+ACTOR_UIDS: Mapping[str, int] = {
+    "main_operator": 10001,
+    "employee": 10002,
+    "maintainer": 10003,
+}
+
+#: One directory per actor, holding that actor's socket and nothing else. The
+#: directory rather than the file is what gets bind-mounted into that actor's
+#: worker, so a worker cannot see another actor's socket at all -- not because
+#: it is refused, but because it is not in its filesystem.
+ACTOR_SOCKET_DIRS: Mapping[str, str] = {
+    "main_operator": "/run/scotty/broker/main_operator",
+    "employee": "/run/scotty/broker/employee",
+    "maintainer": "/run/scotty/broker/maintainer",
+}
+
+#: What every worker sees, at the same path, because each one has a different
+#: directory mounted there.
+WORKER_SOCKET = "/run/scotty/broker/broker.sock"
+
+ACTOR_SOCKETS: Mapping[str, str] = {
+    actor: f"{directory}/broker.sock" for actor, directory in ACTOR_SOCKET_DIRS.items()
+}
+
+#: Kept for the installer and the supervisor, which still speak of "the runtime
+#: account" when they mean the set of them.
+RUNTIME_UIDS = frozenset(ACTOR_UIDS.values())
+
+#: The account the pinned single-gateway runtime container runs as.
+#:
+#: That container is not an actor and never can be: it is one process serving
+#: three profiles, so no uid it could have would say which person is asking. It
+#: gets its own socket, on which nothing is answered until the request cites a
+#: Discord message and the broker asks Discord who wrote it.
 RUNTIME_UID = 10000
+RUNTIME_ACTOR = "runtime"
 
 #: Exactly the provider and credential classes the broker will hold.
 CREDENTIAL_CLASSES: Mapping[str, frozenset[str]] = {
@@ -59,9 +115,12 @@ CREDENTIAL_CLASSES: Mapping[str, frozenset[str]] = {
 #: declared provider operations and its arguments, and the broker makes the
 #: call with a credential the runtime never sees. It returns what the provider
 #: said, bounded — never the credential that was used.
-ROOT_OPERATIONS = frozenset({"open", "validate", "commit", "revoke"})
-RUNTIME_OPERATIONS = frozenset({"status", "execute"})
-OPERATIONS = ROOT_OPERATIONS | RUNTIME_OPERATIONS
+ROOT_OPERATIONS = frozenset({"open", "validate", "commit", "revoke", "grant", "approve"})
+
+#: What a worker may ask on its own actor socket. Nothing here writes a
+#: credential, a grant, or an approval.
+ACTOR_OPERATIONS = frozenset({"status", "execute"})
+OPERATIONS = ROOT_OPERATIONS | ACTOR_OPERATIONS
 
 #: Bounds. A frame past these is refused rather than parsed.
 MAX_FRAME_BYTES = 8192
@@ -71,9 +130,21 @@ WINDOW_SECONDS = 300
 
 _MATERIAL = re.compile(r"[A-Za-z0-9._:/+\-=]+")
 _WINDOW_ID = re.compile(r"[0-9a-f]{32}")
+_PAYLOAD_HASH = re.compile(r"[0-9a-f]{64}")
+_IDEMPOTENCY = re.compile(r"[A-Za-z0-9._:\-]{1,128}")
 
 
+from .effects import (  # noqa: E402
+    FAILED,
+    UNKNOWN,
+    VERIFIED,
+    EffectError,
+    EffectLedger,
+)
 from .executor import ExecutionError, Executor  # noqa: E402
+from .grants import Grant, GrantStore  # noqa: E402
+from .operations import APPLICATION_CREDENTIALS, known  # noqa: E402
+from .provenance import ProvenanceError, ProvenanceResolver  # noqa: E402
 
 
 class BrokerError(Exception):
@@ -88,25 +159,35 @@ class Peer:
     uid: int
     gid: int
 
-    def may(self, operation: str, *, runtime_uid: int = RUNTIME_UID) -> bool:
+    def may(
+        self,
+        operation: str,
+        *,
+        actor: str = "",
+        actor_uids: Mapping[str, int] | None = None,
+    ) -> bool:
         """Whether this kernel-reported peer may run this exact operation.
 
-        Root may do everything. The one account the runtime container runs as
-        may ask for status and nothing else. Every other uid may do nothing.
+        Root, on the control socket, may do everything. On an actor socket, the
+        peer must actually be running as that actor's own account -- the socket
+        mode keeps everyone else from connecting, and this keeps a misconfigured
+        socket from being the only thing standing in the way.
 
-        `runtime_uid` is deployment configuration — which account the container
-        was installed to run as — not something a caller can assert. It arrives
-        from the root-owned service that constructed the broker, never from the
-        wire, so no client can widen its own authority by naming a uid. Root
-        operations are gated on uid 0 alone and are unreachable however it is
-        set.
+        No caller can widen this. The actor comes from which socket accepted the
+        connection, and the uid from the kernel; neither is anywhere in the
+        request.
         """
 
-        if self.uid == 0:
-            return operation in OPERATIONS
-        if self.uid == runtime_uid:
-            return operation in RUNTIME_OPERATIONS
-        return False
+        if not actor:
+            # The control socket. Root only, and root only ever reaches it
+            # because the socket itself is mode 0600.
+            return self.uid == 0 and operation in OPERATIONS
+        mapping = dict(actor_uids or ACTOR_UIDS)
+        mapping.setdefault(RUNTIME_ACTOR, RUNTIME_UID)
+        expected = mapping.get(actor)
+        if expected is None or self.uid != expected:
+            return False
+        return operation in ACTOR_OPERATIONS
 
 
 def peer_of(connection: socket.socket) -> Peer:
@@ -118,21 +199,57 @@ def peer_of(connection: socket.socket) -> Peer:
 
 
 #: Whose credential this is. One shared business identity, or exactly one
-#: client user. The actor is part of the address, so one user's token is stored
-#: and read separately from the other's and no request can reach across.
-ACTORS = frozenset({"shared", "main_operator", "employee"})
+#: person. The actor is part of the address, so one user's token is stored and
+#: read separately from the other's and no request can reach across.
+ACTORS = frozenset({"shared", *ACTOR_UIDS})
 
 
-def _known(
-    provider: object, credential_class: object, actor: object = "shared"
-) -> tuple[str, str, str]:
+def _known(provider: object, credential_class: object) -> tuple[str, str]:
     if type(provider) is not str or provider not in CREDENTIAL_CLASSES:
         raise BrokerError("unknown provider")
     if type(credential_class) is not str or credential_class not in CREDENTIAL_CLASSES[provider]:
         raise BrokerError("unknown credential class")
-    if type(actor) is not str or actor not in ACTORS:
+    return provider, credential_class
+
+
+def _actor(value: object) -> str:
+    """One actor name, from root's own request on the control socket."""
+
+    if type(value) is not str or value not in ACTORS:
         raise BrokerError("unknown actor")
-    return provider, credential_class, actor
+    return value
+
+
+def _expiry(value: object) -> datetime:
+    """One timezone-aware moment from root's own request."""
+
+    if type(value) is not str:
+        raise BrokerError("malformed expiry")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise BrokerError("malformed expiry") from None
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _resource(operation: Any, arguments: Mapping[str, object]) -> str:
+    """What this call acts on, taken from the operation's own declared shape.
+
+    An approval that named no resource would authorize the operation against
+    anything; taking the resource from the operation table rather than from a
+    caller-chosen key is what keeps "send to this contact" from becoming "send
+    to any contact".
+    """
+
+    for name in operation.path_args:
+        value = arguments.get(name)
+        if type(value) is str and value:
+            return value
+    for name in ("contactId", "id", "card_id", "channel_id"):
+        value = arguments.get(name)
+        if type(value) is str and value:
+            return value
+    return ""
 
 
 def _material(value: object) -> str:
@@ -260,69 +377,123 @@ class Broker:
         store: CredentialStore,
         *,
         validator: Validator = _accept_shape,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] | Callable[[], datetime] = time.monotonic,
         window_seconds: float = WINDOW_SECONDS,
-        runtime_uid: int = RUNTIME_UID,
         executor: Executor | None = None,
+        grants: GrantStore | None = None,
+        effects: EffectLedger | None = None,
+        provenance: ProvenanceResolver | None = None,
+        actor_uids: Mapping[str, int] | None = None,
     ) -> None:
         self.store = store
         # Present in the service, absent in the pure-policy tests. When absent,
         # provider execution is refused rather than silently unavailable.
         self.executor = executor
+        self.grants = grants
+        self.effects = effects
+        # Who is asking, established from Discord rather than from the request.
+        # Absent a resolver the socket's own actor stands alone, which is the
+        # right answer on a topology that really does give each actor its own
+        # account and its own socket.
+        self.provenance = provenance
         self.validator = validator
+        # Which account each actor's worker was installed to run as. Set by the
+        # root-owned service from the host's own accounts, never by a request,
+        # so no caller can widen its own authority by naming a uid.
+        self.actor_uids: Mapping[str, int] = dict(actor_uids or ACTOR_UIDS)
         self.clock = clock
         self.window_seconds = window_seconds
-        # Which account the runtime container was installed to run as. Set by
-        # the root-owned service, never by a request.
-        self.runtime_uid = runtime_uid
         # In memory only: a restart must not leave a usable window behind.
         self._windows: dict[str, tuple[str, str, float]] = {}
 
-    def handle(self, peer: Peer, request: object) -> dict[str, object]:
-        """Answer one request. Authority is checked before anything is parsed."""
+    def _monotonic(self) -> float:
+        moment = self.clock()
+        return moment.timestamp() if isinstance(moment, datetime) else moment
+
+    def _wall(self) -> datetime:
+        moment = self.clock()
+        if isinstance(moment, datetime):
+            return moment.astimezone(UTC) if moment.tzinfo else moment.replace(tzinfo=UTC)
+        return datetime.now(UTC)
+
+    def handle(self, peer: Peer, request: object, *, actor: str = "") -> dict[str, object]:
+        """Answer one request. Authority is settled before anything is parsed.
+
+        `actor` is supplied by the socket layer -- it is the actor whose socket
+        accepted this connection -- and never by the request.
+        """
 
         if not isinstance(request, Mapping):
             raise BrokerError("malformed request")
+        if actor and actor not in self.actor_uids and actor != RUNTIME_ACTOR:
+            raise BrokerError("unknown actor")
         operation = request.get("op")
         if type(operation) is not str or operation not in OPERATIONS:
             raise BrokerError("unknown operation")
-        if not peer.may(operation, runtime_uid=self.runtime_uid):
+        if not peer.may(operation, actor=actor, actor_uids=self.actor_uids):
             raise BrokerError("unauthorized")
-        handler: dict[str, Callable[[Mapping[str, Any]], dict[str, object]]] = {
+        if actor and "actor" in request:
+            # Refused rather than ignored. A caller that can name an actor and
+            # be silently overruled is one somebody will eventually trust.
+            raise BrokerError("a request may not name an actor")
+        if actor:
+            handlers: dict[str, Callable[[Mapping[str, Any], str], dict[str, object]]] = {
+                "status": self._status,
+                "execute": self._execute,
+            }
+            if operation == "status" and actor == RUNTIME_ACTOR and "provenance" not in request:
+                # "Does this deployment hold anything for that provider?" is a
+                # fact about the deployment, not about a person, and it cannot
+                # be used to act. Readiness at startup is asked before anybody
+                # has said anything, so there is nothing to cite yet.
+                return self._deployment_status(request)
+            # On the shared runtime socket there is no actor until Discord says
+            # so, and `status` is per-person, so it is settled the same way.
+            resolved = self._attested(request, "" if actor == RUNTIME_ACTOR else actor)
+            return handlers[operation](request, resolved)
+        root_handlers: dict[str, Callable[[Mapping[str, Any]], dict[str, object]]] = {
             "open": self._open,
             "validate": self._validate,
             "commit": self._commit,
             "revoke": self._revoke,
-            "status": self._status,
-            "execute": self._execute,
+            "grant": self._grant,
+            "approve": self._approve,
+            # Root asks "is this integration set up" during setup and repair.
+            # It is the same deployment-level answer the runtime gets, and it
+            # authorizes nothing.
+            "status": self._deployment_status,
         }
-        return handler[operation](request)
+        if operation not in root_handlers:
+            raise BrokerError("that operation is not available on this socket")
+        return root_handlers[operation](request)
 
     def _open(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class, actor = _known(
-            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
+        provider, credential_class = _known(
+            request.get("provider"), request.get("credential_class")
         )
+        actor = _actor(request.get("actor", "shared"))
         self._expire()
         window = secrets.token_hex(16)
         self._windows[window] = (
             f"{provider}/{credential_class}/{actor}",
             "",
-            self.clock() + self.window_seconds,
+            self._monotonic() + self.window_seconds,
         )
         return {"ok": True, "state": "window open", "window": window}
 
     def _validate(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class, _ = _known(
-            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
+        provider, credential_class = _known(
+            request.get("provider"), request.get("credential_class")
         )
         material = _material(request.get("material"))
         accepted = bool(self.validator(provider, credential_class, material))
         return {"ok": accepted, "state": "validation passed" if accepted else "validation failed"}
 
     def _commit(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class, actor = _known(
-            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
+        provider, credential_class = _known(
+            request.get("provider"), request.get("credential_class")
         )
+        actor = _actor(request.get("actor", "shared"))
         window = request.get("window")
         if type(window) is not str or not _WINDOW_ID.fullmatch(window):
             raise BrokerError("malformed window")
@@ -343,47 +514,258 @@ class Broker:
         return {"ok": True, "state": "credential present"}
 
     def _revoke(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class, actor = _known(
-            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
+        provider, credential_class = _known(
+            request.get("provider"), request.get("credential_class")
         )
+        actor = _actor(request.get("actor", "shared"))
         removed = self.store.drop(provider, credential_class, actor)
         return {"ok": removed, "state": "credential removed" if removed else "no credential"}
 
-    def _status(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class, actor = _known(
-            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
-        )
-        present = self.store.present(provider, credential_class, actor)
-        return {
-            "ok": present,
-            "state": "credential present" if present else "credential absent",
-        }
+    def _grant(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Write down that one actor may spend the shared business identity.
 
-    def _execute(self, request: Mapping[str, Any]) -> dict[str, object]:
-        """Run one declared provider operation on the caller's behalf.
+        Root only, on the control socket. Nothing on an actor socket can reach
+        this, which is what makes a grant mean anything.
+        """
+
+        if self.grants is None:
+            raise BrokerError("grants are not configured")
+        actor = _actor(request.get("actor"))
+        if actor == "shared":
+            raise BrokerError("a grant is held by a person, not by the shared identity")
+        provider = request.get("provider")
+        if type(provider) is not str or provider not in CREDENTIAL_CLASSES:
+            raise BrokerError("unknown provider")
+        operations = request.get("operations")
+        resources = request.get("resources", [])
+        if not isinstance(operations, list) or not operations:
+            raise BrokerError("a grant must name the operations it covers")
+        if not isinstance(resources, list):
+            raise BrokerError("malformed resources")
+        expires = _expiry(request.get("expires_at"))
+        grant = self.grants.put(
+            Grant(
+                actor=actor,
+                provider=provider,
+                operations=tuple(str(item) for item in operations),
+                resources=tuple(str(item) for item in resources),
+                expires_at=expires,
+            )
+        )
+        return {"ok": True, "state": "granted", "grant_id": grant.grant_id}
+
+    def _approve(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Record one human approval for one exact consequential call.
+
+        Root only. The runtime can propose all day; it cannot approve, because
+        this operation is not reachable from the socket it can open.
+        """
+
+        if self.effects is None:
+            raise BrokerError("the effect ledger is not configured")
+        actor = _actor(request.get("actor"))
+        operation = request.get("operation")
+        payload_hash = request.get("payload_hash")
+        if type(operation) is not str or not operation:
+            raise BrokerError("an approval names one operation")
+        if type(payload_hash) is not str or not _PAYLOAD_HASH.fullmatch(payload_hash):
+            raise BrokerError("an approval names one payload")
+        resource = request.get("resource", "")
+        if type(resource) is not str:
+            raise BrokerError("malformed resource")
+        approval = self.effects.approve(
+            actor=actor,
+            operation=operation,
+            payload_hash=payload_hash,
+            resource=resource,
+            expires_at=_expiry(request.get("expires_at")),
+        )
+        return {"ok": True, "state": "approved", "approval_id": approval.approval_id}
+
+    def _deployment_status(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Whether this deployment holds any credential for that provider.
+
+        Deliberately says nothing about whose. It is the answer to "is this
+        integration set up at all", which is what a startup readiness check is
+        actually asking, and it authorizes nothing.
+        """
+
+        provider, credential_class = _known(
+            request.get("provider"), request.get("credential_class")
+        )
+        for actor in sorted(ACTORS):
+            if self.store.present(provider, credential_class, actor):
+                return {"ok": True, "state": "credential present"}
+        return {"ok": False, "state": "credential absent"}
+
+    def _status(self, request: Mapping[str, Any], actor: str) -> dict[str, object]:
+        """Whether this caller has a usable route to that provider.
+
+        Three answers, and the difference between the last two matters to
+        whoever has to fix it: this actor holds their own credential; there is
+        a shared identity but nobody granted them the use of it; or there is
+        nothing here at all.
+        """
+
+        provider, credential_class = _known(
+            request.get("provider"), request.get("credential_class")
+        )
+        if self.store.present(provider, credential_class, actor):
+            return {"ok": True, "state": "credential present"}
+        if credential_class in APPLICATION_CREDENTIALS.get(provider, frozenset()):
+            # The application key says which product is calling, not who. There
+            # is no per-person version of it and no permission to grant.
+            present = self.store.present(provider, credential_class, "shared")
+            return {
+                "ok": present,
+                "state": "credential present" if present else "credential absent",
+            }
+        if request.get("own_only") is True:
+            # "Is this one mine?" rather than "can I use one?". A shared
+            # identity, granted or not, is not this person's own.
+            return {"ok": False, "state": "credential absent"}
+        if not self.store.present(provider, credential_class, "shared"):
+            return {"ok": False, "state": "credential absent"}
+        if self.grants is not None and self.grants.any_for(actor, provider) is not None:
+            return {"ok": True, "state": "credential present"}
+        # The shared credential exists. Its existing is not permission.
+        return {"ok": False, "state": "not authorized"}
+
+    def _execute(self, request: Mapping[str, Any], actor: str) -> dict[str, object]:
+        """Run one declared provider operation as the actor on this socket.
 
         The caller names an operation and its arguments. It does not name a
-        host, a path, a method, a header, or a credential — those come from the
-        operation table and the store, on this side of the socket.
+        host, a path, a method, a header, a credential, or a person -- those
+        come from the operation table, the store, and the socket.
         """
 
         if self.executor is None:
             raise BrokerError("provider execution is not configured")
-        actor = request.get("actor", "shared")
-        if type(actor) is not str or actor not in ACTORS:
-            raise BrokerError("unknown actor")
         arguments = request.get("arguments", {})
         if not isinstance(arguments, Mapping):
             raise BrokerError("malformed arguments")
+        operation_id = request.get("operation")
         try:
-            outcome = self.executor.run(request.get("operation"), arguments, actor=actor)
-        except ExecutionError as exc:
-            # The message is written by our own code and names no credential.
+            operation = known(operation_id)
+        except KeyError:
+            raise BrokerError("unknown operation") from None
+
+        if not operation.consequence:
+            try:
+                outcome = self.executor.run(operation_id, arguments, actor=actor)
+            except ExecutionError as exc:
+                raise BrokerError(str(exc)) from None
+            return outcome.as_reply()
+        return self._consequence(operation_id, operation, arguments, actor, request)
+
+    def _attested(self, request: Mapping[str, Any], actor: str) -> str:
+        """Who is really asking, when the socket alone cannot say.
+
+        On a topology where each actor runs as its own account, the socket has
+        already answered and there is nothing to add. On the pinned single
+        gateway, where three profiles share one process, the socket can only
+        say "the runtime" -- so the caller must cite the Discord message it is
+        acting on, and this asks Discord who wrote it.
+
+        The two answers must agree. A runtime that has its own socket and cites
+        somebody else's message gets neither identity.
+        """
+
+        if self.provenance is None:
+            if not actor:
+                raise BrokerError("this deployment cannot confirm who is asking")
+            return actor
+        if actor and "provenance" not in request:
+            # A worker with its own account and its own socket has already been
+            # identified by the kernel; a citation is welcome but not required.
+            return actor
+        try:
+            attested = self.provenance.resolve(request.get("provenance"))
+        except ProvenanceError as exc:
             raise BrokerError(str(exc)) from None
-        return outcome.as_reply()
+        if actor and attested.actor != actor:
+            raise BrokerError("that message is not from the user this socket belongs to")
+        return attested.actor
+
+    def _consequence(
+        self,
+        operation_id: object,
+        operation: Any,
+        arguments: Mapping[str, object],
+        actor: str,
+        request: Mapping[str, Any],
+    ) -> dict[str, object]:
+        """A call somebody has to have approved, made at most once.
+
+        Everything is settled before the provider is touched: the deadline has
+        not passed, an approval exists for this exact actor, operation, payload
+        and resource, and this idempotency key has not already been spent. The
+        effect row is written first, so a process that dies mid-flight leaves
+        `unknown` rather than leaving nothing.
+        """
+
+        if self.effects is None:
+            raise BrokerError("the effect ledger is not configured")
+        now = self._wall()
+        deadline = _expiry(request.get("deadline"))
+        if deadline <= now:
+            raise BrokerError("this request is past its deadline")
+        idempotency_key = request.get("idempotency_key")
+        if type(idempotency_key) is not str or not _IDEMPOTENCY.fullmatch(idempotency_key):
+            raise BrokerError("a consequence needs an idempotency key")
+        approval_id = request.get("approval_id")
+        if type(approval_id) is not str or not approval_id:
+            raise BrokerError("this operation needs an approval")
+        payload_hash = self.effects.payload_hash(arguments)
+        resource = _resource(operation, arguments)
+
+        held = self.effects.by_idempotency(actor, idempotency_key)
+        if held is not None:
+            if held.state == UNKNOWN:
+                # Nobody could see what became of the first attempt. Repeating
+                # it is how one message becomes two.
+                raise BrokerError("an earlier attempt is unresolved; reconcile before retrying")
+            return {"ok": held.state == VERIFIED, "state": held.state, "effect_id": held.effect_id}
+
+        try:
+            self.effects.claim(
+                approval_id,
+                actor=actor,
+                operation=str(operation_id),
+                payload_hash=payload_hash,
+                resource=resource,
+            )
+        except EffectError as exc:
+            raise BrokerError(str(exc)) from None
+
+        effect, mine = self.effects.begin(
+            actor=actor,
+            operation=str(operation_id),
+            payload_hash=payload_hash,
+            resource=resource,
+            idempotency_key=idempotency_key,
+            approval_id=approval_id,
+        )
+        if not mine:  # pragma: no cover - the lookup above already returned
+            return {
+                "ok": effect.state == VERIFIED,
+                "state": effect.state,
+                "effect_id": effect.effect_id,
+            }
+        try:
+            outcome = self.executor.run(  # type: ignore[union-attr]
+                operation_id, arguments, actor=actor
+            )
+        except ExecutionError as exc:
+            # Left as unknown: a transport that failed may still have delivered.
+            self.effects.settle(effect.effect_id, UNKNOWN, str(exc))
+            raise
+        state = VERIFIED if outcome.ok else FAILED
+        self.effects.settle(effect.effect_id, state, "")
+        return {**outcome.as_reply(), "effect_id": effect.effect_id, "state": state}
 
     def _expire(self) -> None:
-        now = self.clock()
+        now = self._monotonic()
         for window, held in list(self._windows.items()):
             if held[2] <= now:
                 del self._windows[window]
@@ -413,14 +795,18 @@ def read_frame(connection: socket.socket) -> object:
         raise BrokerError("malformed frame") from exc
 
 
-def serve_once(broker: Broker, connection: socket.socket) -> None:
-    """Handle exactly one request on one connection, then close it."""
+def serve_once(broker: Broker, connection: socket.socket, *, actor: str = "") -> None:
+    """Handle exactly one request on one connection, then close it.
+
+    `actor` belongs to the listening socket, not to the request. It is how the
+    caller's identity reaches the broker without the caller ever stating it.
+    """
 
     try:
         peer = peer_of(connection)
-        reply = broker.handle(peer, read_frame(connection))
-    except BrokerError as exc:
-        # The reason is a fixed word from this module, never request content.
+        reply = broker.handle(peer, read_frame(connection), actor=actor)
+    except (BrokerError, ExecutionError) as exc:
+        # The reason is a fixed word from our own code, never request content.
         reply = {"ok": False, "state": str(exc)}
     except Exception:
         reply = {"ok": False, "state": "unavailable"}
@@ -428,17 +814,65 @@ def serve_once(broker: Broker, connection: socket.socket) -> None:
         connection.sendall(json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n")
 
 
-def bind_socket(path: str | os.PathLike[str], *, group: int = RUNTIME_UID) -> socket.socket:
-    """Create the listening socket so only root and the runtime can reach it."""
+def bind_control_socket(path: str | os.PathLike[str] = SOCKET_PATH) -> socket.socket:
+    """The root-only socket. Mode 0600: nothing else can even connect."""
 
+    target = _prepare(path, mode=0o755)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    previous = os.umask(0o177)
+    try:
+        server.bind(str(target))
+    finally:
+        os.umask(previous)
+    if os.getuid() == 0:
+        os.chown(target, 0, 0)
+    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
+    server.listen(8)
+    return server
+
+
+def bind_actor_socket(
+    actor: str, *, group: int, path: str | os.PathLike[str] = ""
+) -> socket.socket:
+    """One actor's own socket, owned by that actor's own group.
+
+    Mode 0660 with a per-actor group is the first lock: a worker running as the
+    employee account is not in the main operator's group, so it cannot open
+    that socket at all. The peer check inside the broker is the second.
+    """
+
+    if actor not in ACTOR_SOCKETS:
+        raise BrokerError("unknown actor")
+    target = _prepare(path or ACTOR_SOCKETS[actor], mode=0o755)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    previous = os.umask(0o117)
+    try:
+        server.bind(str(target))
+    finally:
+        os.umask(previous)
+    if os.getuid() == 0:
+        os.chown(target, 0, group)
+    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP)
+    server.listen(8)
+    return server
+
+
+def _prepare(path: str | os.PathLike[str], *, mode: int) -> Path:
     target = Path(path)
-    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    target.parent.mkdir(mode=mode, parents=True, exist_ok=True)
     if target.is_symlink():
         raise BrokerError("socket path is unsafe")
     if target.exists():
         target.unlink()
+    return target
+
+
+def bind_socket(path: str | os.PathLike[str], *, group: int) -> socket.socket:
+    """Backwards-compatible binder for one socket with a named group."""
+
+    target = _prepare(path, mode=0o755)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    previous = os.umask(0o177)
+    previous = os.umask(0o117)
     try:
         server.bind(str(target))
     finally:
@@ -451,8 +885,14 @@ def bind_socket(path: str | os.PathLike[str], *, group: int = RUNTIME_UID) -> so
 
 
 def serve_forever(
-    broker: Broker, server: socket.socket, *, should_stop: Callable[[], bool] = lambda: False
+    broker: Broker,
+    server: socket.socket,
+    *,
+    actor: str = "",
+    should_stop: Callable[[], bool] = lambda: False,
 ) -> None:
+    """Serve one socket. Everything accepted here belongs to one actor."""
+
     server.settimeout(0.5)
     while not should_stop():
         try:
@@ -463,4 +903,32 @@ def serve_forever(
             break
         with connection:
             connection.settimeout(5.0)
-            serve_once(broker, connection)
+            serve_once(broker, connection, actor=actor)
+
+
+def serve_all(
+    broker: Broker,
+    sockets: Mapping[str, socket.socket],
+    *,
+    should_stop: Callable[[], bool] = lambda: False,
+) -> None:
+    """Serve the control socket and every actor socket from one process.
+
+    One process, several listening sockets, and the actor decided entirely by
+    which of them accepted a connection. Nothing in the loop below can be
+    talked into a different answer.
+    """
+
+    for server in sockets.values():
+        server.settimeout(0.2)
+    while not should_stop():
+        for actor, server in sockets.items():
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(5.0)
+                serve_once(broker, connection, actor="" if actor == "control" else actor)

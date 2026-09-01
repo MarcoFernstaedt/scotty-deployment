@@ -122,9 +122,9 @@ class ScottyService:
         config: RuntimeConfig,
         approvals: ApprovalStore,
         *,
-        trello: TrelloPort,
-        ghl: GHLPort,
-        rentcast: RentCastPort | None,
+        trello: TrelloPort | Callable[[Principal], TrelloPort],
+        ghl: GHLPort | Callable[[Principal], GHLPort],
+        rentcast: RentCastPort | None | Callable[[Principal], RentCastPort],
         discord: DiscordPort,
         discord_admin: DiscordAdminAdapter | None = None,
         google_workspace: GoogleWorkspacePort
@@ -141,6 +141,22 @@ class ScottyService:
         self.discord_admin = discord_admin
         self.google_workspace = google_workspace
         self.clock = clock
+
+    def _trello_for(self, actor: Principal) -> TrelloPort:
+        """This exact person's Trello connector, never the deployment's first.
+
+        Holding one adapter for the service meant every approved effect left
+        through whichever actor happened to build it -- in practice the main
+        operator, for the employee's cards as well as their own.
+        """
+
+        return self.trello(actor) if callable(self.trello) else self.trello
+
+    def _ghl_for(self, actor: Principal) -> GHLPort:
+        return self.ghl(actor) if callable(self.ghl) else self.ghl
+
+    def _rentcast_for(self, actor: Principal) -> RentCastPort | None:
+        return self.rentcast(actor) if callable(self.rentcast) else self.rentcast
 
     def _workspace_for(self, actor: Principal) -> GoogleWorkspacePort | None:
         """The Workspace this exact actor may act on, and no other.
@@ -191,8 +207,9 @@ class ScottyService:
     ) -> Proposal:
         if source_card_id == destination_card_id:
             raise ProviderError("merge source and destination must differ")
-        source = self.trello.get_card(source_card_id)
-        destination = self.trello.get_card(destination_card_id)
+        trello = self._trello_for(requester)
+        source = trello.get_card(source_card_id)
+        destination = trello.get_card(destination_card_id)
         source_address = _string_field(source, "normalized_address", "address", "name")
         destination_address = _string_field(destination, "normalized_address", "address", "name")
         source_provider_id = _string_field(
@@ -270,7 +287,7 @@ class ScottyService:
     ) -> Proposal:
         if operation not in {"update", "move", "archive"}:
             raise ProviderError("Trello operation is not permitted")
-        current = self.trello.get_card(card_id)
+        current = self._trello_for(requester).get_card(card_id)
         payload = {
             "operation": operation,
             "card_id": current.source_id,
@@ -313,7 +330,7 @@ class ScottyService:
         normalized_destination: str,
         body: str,
     ) -> Proposal:
-        contact = self.ghl.get_contact(contact_id)
+        contact = self._ghl_for(requester).get_contact(contact_id)
         authoritative_phone = _string_field(contact, "phone")
         if authoritative_phone != normalized_destination:
             raise ProviderError("SMS destination does not match the configured contact")
@@ -645,15 +662,18 @@ class ScottyService:
     def _execute_sms(
         self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
     ) -> Proposal:
+        # The requester's connector, not the approver's. Approving somebody's
+        # message does not move it onto the approver's account.
+        ghl = self._ghl_for(proposal.requester)
         contact_id = _payload_text(proposal.payload, "contact_id")
         destination = _payload_text(proposal.payload, "normalized_destination")
         body = _payload_text(proposal.payload, "body")
-        contact = self.ghl.get_contact(contact_id)
+        contact = ghl.get_contact(contact_id)
         executing = self._claim(
             principal, proposal, expected_version, nonce, contact.source_revision
         )
         try:
-            send_receipt = self.ghl.send_sms(contact_id, destination, body)
+            send_receipt = ghl.send_sms(contact_id, destination, body)
         except AmbiguousEffectError:
             return self._unknown(
                 executing,
@@ -662,7 +682,7 @@ class ScottyService:
         except ProviderError as exc:
             return self._failed(executing, str(exc))
         try:
-            message = self.ghl.get_message(
+            message = ghl.get_message(
                 send_receipt["conversation_id"], send_receipt["message_id"], contact_id
             )
             if message.fields.get("body") != body:
@@ -726,6 +746,9 @@ class ScottyService:
     def _execute_trello(
         self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
     ) -> Proposal:
+        # The requester's connector, not the approver's. Approving somebody's
+        # card does not move it onto the approver's Trello identity.
+        trello = self._trello_for(proposal.requester)
         operation = proposal.payload.get("operation")
         if operation == "merge":
             return self._execute_merge(principal, proposal, expected_version, nonce)
@@ -738,7 +761,7 @@ class ScottyService:
                 fields = proposal.payload.get("fields")
                 if not isinstance(fields, Mapping):
                     raise ProviderError("Trello create fields are malformed")
-                result = self.trello.create_card(list_id, fields)
+                result = trello.create_card(list_id, fields)
             except AmbiguousEffectError:
                 return self._unknown(
                     executing, {"verified": False, "reason": "ambiguous Trello create"}
@@ -752,7 +775,7 @@ class ScottyService:
                 receipt={"verified": True, "resulting_card_id": result.source_id},
             )
         card_id = _payload_text(proposal.payload, "card_id")
-        current = self.trello.get_card(card_id)
+        current = trello.get_card(card_id)
         executing = self._claim(
             principal, proposal, expected_version, nonce, current.source_revision
         )
@@ -761,13 +784,13 @@ class ScottyService:
                 fields = proposal.payload.get("fields")
                 if not isinstance(fields, Mapping):
                     raise ProviderError("Trello update fields are malformed")
-                result = self.trello.update_card(card_id, fields)
+                result = trello.update_card(card_id, fields)
             elif operation == "move":
-                result = self.trello.move_card(
+                result = trello.move_card(
                     card_id, _payload_text(proposal.payload, "destination_list_id")
                 )
             elif operation == "archive":
-                result = self.trello.archive_card(card_id)
+                result = trello.archive_card(card_id)
             else:
                 raise ProviderError("Trello operation is not permitted")
         except AmbiguousEffectError:
@@ -784,23 +807,24 @@ class ScottyService:
     def _execute_merge(
         self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
     ) -> Proposal:
+        trello = self._trello_for(proposal.requester)
         source_id = _payload_text(proposal.payload, "source_card_id")
         destination_id = _payload_text(proposal.payload, "destination_card_id")
-        source = self.trello.get_card(source_id)
-        destination = self.trello.get_card(destination_id)
+        source = trello.get_card(source_id)
+        destination = trello.get_card(destination_id)
         revision = f"source={source.source_revision};destination={destination.source_revision}"
         executing = self._claim(principal, proposal, expected_version, nonce, revision)
         merged_fields = proposal.payload.get("merged_fields")
         if not isinstance(merged_fields, dict):
             return self._failed(executing, "merge payload is malformed")
         try:
-            self.trello.update_card(destination_id, merged_fields)
+            trello.update_card(destination_id, merged_fields)
         except AmbiguousEffectError:
             return self._unknown(executing, {"verified": False, "reason": "ambiguous merge update"})
         except ProviderError as exc:
             return self._failed(executing, str(exc))
         try:
-            readback = self.trello.get_card(destination_id)
+            readback = trello.get_card(destination_id)
             for field, expected in merged_fields.items():
                 if readback.fields.get(field) != expected:
                     raise ProviderError("merge destination readback mismatch")
@@ -810,8 +834,8 @@ class ScottyService:
                 {"verified": False, "reason": "destination readback failed; source not archived"},
             )
         try:
-            self.trello.archive_card(source_id)
-            archived = self.trello.get_card(source_id)
+            trello.archive_card(source_id)
+            archived = trello.get_card(source_id)
             if archived.fields.get("closed") is not True:
                 raise ProviderError("duplicate archive readback mismatch")
         except (AmbiguousEffectError, ProviderError):
