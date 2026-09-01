@@ -122,6 +122,102 @@ class StartCommandContractTests(unittest.TestCase):
         )
         return result, log
 
+    def docker_script(
+        self,
+        *,
+        start_rc: int,
+        running: str = "true",
+        label: str = "managed",
+        inspect_rc: int = 0,
+        stop_rc: int = 0,
+        exec_rc: int = 0,
+    ) -> str:
+        """A fake docker whose start is ambiguous: it fails but takes effect."""
+
+        digest = "sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517"
+        return (
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$*" >>"$SCOTTY_TEST_LOG"\n'
+            'if [ "$1" = "inspect" ]; then\n'
+            f"  if [ {inspect_rc} -ne 0 ]; then exit {inspect_rc}; fi\n"
+            '  case "$3" in\n'
+            "    *State.Running*)\n"
+            '      if [ -f "$SCOTTY_TEST_LOG.started" ]; then\n'
+            f"        printf '{running}\\n'\n"
+            "      else\n"
+            "        printf 'false\\n'\n"
+            "      fi ;;\n"
+            f"    *com.scotty.deployment*) printf '{label}\\n' ;;\n"
+            f"    *com.scotty.image.digest*) printf '{digest}\\n' ;;\n"
+            "    *) printf 'false\\n' ;;\n"
+            "  esac\n"
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = "start" ]; then\n'
+            '  : >"$SCOTTY_TEST_LOG.started"\n'
+            f"  exit {start_rc}\n"
+            "fi\n"
+            f'if [ "$1" = "stop" ]; then exit {stop_rc}; fi\n'
+            f'if [ "$1" = "exec" ]; then exit {exec_rc}; fi\n'
+            "exit 0\n"
+        )
+
+    def test_an_ambiguous_start_still_stops_the_managed_container(self) -> None:
+        """docker start may take effect and still report failure."""
+
+        with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
+            root = Path(directory)
+            result, log = self.run_start(root, self.docker_script(start_rc=1))
+            calls = log.read_text(encoding="utf-8")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("start scotty", calls)
+            self.assertIn("stop scotty", calls)
+            recovery = [line for line in result.stderr.splitlines() if line.startswith("Recovery:")]
+            self.assertEqual(len(recovery), 1)
+
+    def test_a_partial_start_that_fails_later_acceptance_is_stopped(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
+            root = Path(directory)
+            result, log = self.run_start(root, self.docker_script(start_rc=0, exec_rc=23))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stop scotty", log.read_text(encoding="utf-8"))
+
+    def test_a_container_without_the_managed_labels_is_never_stopped(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
+            root = Path(directory)
+            result, log = self.run_start(
+                root, self.docker_script(start_rc=1, label="someone-elses")
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("stop scotty", log.read_text(encoding="utf-8"))
+            self.assertIn("not the managed", result.stderr)
+
+    def test_an_inspection_failure_is_reported_rather_than_assumed_clean(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
+            root = Path(directory)
+            script = (
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >>"$SCOTTY_TEST_LOG"\n'
+                'if [ "$1" = "inspect" ]; then\n'
+                '  if [ -f "$SCOTTY_TEST_LOG.started" ]; then exit 1; fi\n'
+                "  printf 'false\\n'\n"
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "start" ]; then : >"$SCOTTY_TEST_LOG.started"; exit 1; fi\n'
+                "exit 0\n"
+            )
+            result, log = self.run_start(root, script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not be determined", result.stderr)
+            self.assertNotIn("stop scotty", log.read_text(encoding="utf-8"))
+
+    def test_a_failed_stop_is_reported_rather_than_silently_swallowed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
+            root = Path(directory)
+            result, _ = self.run_start(root, self.docker_script(start_rc=1, stop_rc=1))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not be stopped", result.stderr)
+
     def test_an_absent_container_is_diagnosed_not_only_recovered(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
             root = Path(directory)
@@ -184,36 +280,7 @@ class StartCommandContractTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-start-test-") as directory:
             root = Path(directory)
-            log = root / "calls"
-            fake = root / "docker"
-            fake.write_text(
-                "#!/bin/sh\n"
-                'printf \'%s\\n\' "$*" >>"$SCOTTY_TEST_LOG"\n'
-                'case "$1 $2" in\n'
-                "  'inspect --format') printf 'false\\n' ;;\n"
-                "  'start scotty') exit 0 ;;\n"
-                "  'exec -it') exit 23 ;;\n"
-                "  'stop scotty') exit 0 ;;\n"
-                "esac\n",
-                encoding="utf-8",
-            )
-            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
-            setup = root / "setup"
-            setup.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            setup.chmod(setup.stat().st_mode | stat.S_IXUSR)
-            result = subprocess.run(
-                ["/bin/bash", "scotty-start"],
-                cwd=Path.cwd(),
-                env={
-                    "PATH": f"{root}:/usr/bin:/bin",
-                    "SCOTTY_TEST_LOG": str(log),
-                    "SCOTTY_SETUP_COMMAND": str(setup),
-                    "SCOTTY_TEST_EUID": "0",
-                },
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            result, log = self.run_start(root, self.docker_script(start_rc=0, exec_rc=23))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("stop scotty", log.read_text(encoding="utf-8"))
             recovery = [line for line in result.stderr.splitlines() if line.startswith("Recovery:")]

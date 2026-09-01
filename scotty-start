@@ -5,7 +5,7 @@ umask 077
 readonly CONTAINER=scotty
 readonly SETUP_COMMAND=${SCOTTY_SETUP_COMMAND:-/srv/Scotty/operator/setup-scotty}
 readonly GOOGLE_TOKEN=/srv/Scotty/data/scotty/google-oauth.json
-STARTED=0
+readonly IMAGE_DIGEST='sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517'
 COMPLETED=0
 
 # Runs inside the prepared container against the installed plugin only.
@@ -28,10 +28,52 @@ fail() {
   exit 1
 }
 
+# Authoritative reconciliation. A start is treated as potentially effective from
+# the moment it is attempted, because Docker can start the container and still
+# return a failure to the client. So the true state is inspected rather than
+# inferred, and only the exact managed container is ever stopped.
+reconcile_container() {
+  local running label digest probe_rc
+
+  running="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null)"
+  probe_rc=$?
+  if (( probe_rc != 0 )); then
+    printf 'scotty-start: the container state could not be determined; inspect %s before rerunning.\n' \
+      "$CONTAINER" >&2
+    return 1
+  fi
+  [[ $running == true ]] || return 0
+
+  local digest_rc
+  label="$(docker inspect --format '{{index .Config.Labels "com.scotty.deployment"}}' "$CONTAINER" 2>/dev/null)"
+  probe_rc=$?
+  digest="$(docker inspect --format '{{index .Config.Labels "com.scotty.image.digest"}}' "$CONTAINER" 2>/dev/null)"
+  digest_rc=$?
+  if (( probe_rc != 0 || digest_rc != 0 )); then
+    printf 'scotty-start: the container ownership could not be determined; inspect %s before rerunning.\n' \
+      "$CONTAINER" >&2
+    return 1
+  fi
+  if [[ $label != managed || $digest != "$IMAGE_DIGEST" ]]; then
+    printf 'scotty-start: refusing to stop %s because it is not the managed Scotty container.\n' \
+      "$CONTAINER" >&2
+    return 1
+  fi
+
+  docker stop "$CONTAINER" >/dev/null 2>&1 || {
+    printf 'scotty-start: the managed container is running and could not be stopped; stop %s before rerunning.\n' \
+      "$CONTAINER" >&2
+    return 1
+  }
+  return 0
+}
+
 recover() {
   local rc=$?
-  if (( COMPLETED == 0 && STARTED == 1 )); then
-    docker stop "$CONTAINER" >/dev/null 2>&1 || true
+  if (( COMPLETED == 0 )); then
+    # Prerequisites or acceptance are incomplete, so Scotty must not be left
+    # running whether or not the start command reported success.
+    reconcile_container || true
   fi
   if (( rc != 0 )); then
     printf 'Recovery: correct the reported local prerequisite, then rerun sudo /usr/local/sbin/scotty-start.\n' >&2
@@ -56,8 +98,7 @@ state="$(docker inspect --format '{{.State.Running}}' "$CONTAINER" 2>/dev/null |
 
 # The pinned runtime owns the Codex OAuth flow. It must run in the prepared
 # container because no second container or broad mount is allowed.
-docker start "$CONTAINER" >/dev/null
-STARTED=1
+docker start "$CONTAINER" >/dev/null || fail 'Scotty did not start cleanly'
 docker exec -it "$CONTAINER" hermes auth add openai-codex
 
 GOOGLE_SELECTED=0
