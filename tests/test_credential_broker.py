@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 from assistant.scotty_broker.broker import (
@@ -696,6 +697,19 @@ def _unprivileged_uid() -> int | None:
     return None
 
 
+def _terminate(process: subprocess.Popen[str]) -> None:
+    """Stop one spawned broker and close everything it held."""
+
+    with suppress(OSError):
+        process.kill()
+    with suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=10)
+    for stream in (process.stdout, process.stderr, process.stdin):
+        if stream is not None:
+            with suppress(OSError):
+                stream.close()
+
+
 def _drop_to(uid: int) -> Callable[[], None]:
     """Become that account in the child before it executes anything."""
 
@@ -728,20 +742,31 @@ class PackagedArtefactTests(unittest.TestCase):
         unprivileged = _unprivileged_uid()
         if unprivileged is None:
             self.skipTest("no unprivileged account is available to drop to")
-        result = subprocess.run(  # noqa: S603 - fixed interpreter and argument
-            [sys.executable, "scotty-credential-broker"],
-            cwd=Path.cwd(),
-            env={"PATH": "/usr/bin:/bin"},
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=30,
-            preexec_fn=_drop_to(unprivileged),  # noqa: PLW1509 - that is the point
-        )
-        self.assertEqual(result.returncode, 1)
+        with tempfile.TemporaryDirectory(prefix="scotty-broker-refusal-") as directory:
+            # Run from a copy the dropped-to account can actually read. A
+            # checkout is not necessarily world-readable -- on a CI runner it is
+            # not -- and a child that cannot open the file exits 2 from the
+            # interpreter without the guard ever running, which says nothing
+            # about the guard either way.
+            staged = Path(directory) / "scotty-credential-broker"
+            staged.write_bytes(Path("scotty-credential-broker").read_bytes())
+            staged.chmod(0o755)
+            Path(directory).chmod(0o755)
+            result = subprocess.run(  # noqa: S603 - fixed interpreter and argument
+                [sys.executable, staged.name],
+                cwd=directory,
+                env={"PATH": "/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+                preexec_fn=_drop_to(unprivileged),  # noqa: PLW1509 - that is the point
+            )
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("must run as root", result.stderr)
         self.assertNotIn("ModuleNotFoundError", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("Permission denied", result.stderr)
 
     def test_the_packaged_module_serves_a_real_client(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-broker-pkg-") as directory:
@@ -766,13 +791,15 @@ class PackagedArtefactTests(unittest.TestCase):
                 "serve_forever(Broker(CredentialStore("
                 f"{str(store_path)!r}), runtime_uid={os.getuid()}), server)\n"
             )
-            process = subprocess.Popen(
+            process = subprocess.Popen(  # noqa: S603 - fixed interpreter and script
                 [sys.executable, "-c", script],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            self.addCleanup(process.kill)
+            # Killing is not reaping. A cleanup that only kills leaves a zombie
+            # and two open pipes behind for the rest of the suite to trip over.
+            self.addCleanup(_terminate, process)
             deadline = time.monotonic() + 10
             while not socket_path.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)

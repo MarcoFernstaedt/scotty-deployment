@@ -51,12 +51,14 @@ jobs:
       - name: The suite, as an ordinary user
         # The runner is not root, which is the case the broker's peer checks
         # actually have to hold for.
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+        # -W error::ResourceWarning fails the run on a leaked subprocess or an
+        # unclosed stream rather than printing a warning nobody reads.
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 
       - name: The suite, as root
         # And again as root, because a test that only passes as one of the two
         # is a test that will surprise somebody on the host.
-        run: sudo -E python3 -m unittest discover -s tests -p 'test_*.py'
+        run: sudo -E python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 
       - run: make acceptance
       - run: make package
