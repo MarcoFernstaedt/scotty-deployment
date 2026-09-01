@@ -47,6 +47,9 @@ class FakeTrello:
         self.next_id = 1
         self.swallow_acknowledgement = False
         self.readback: dict[str, object] | None = None
+        # Whether a board read saw the whole board. A partial one must never
+        # produce a confident "no duplicate".
+        self.board_complete = True
 
     def _record(self, body: dict[str, object]) -> ProviderRecord:
         return ProviderRecord("trello", str(body["id"]), utc_now(), "rev-1", dict(body), ())
@@ -85,9 +88,13 @@ class FakeTrello:
             raise ProviderError("Trello card is unknown")
         return self._record(self.cards[card_id])
 
-    def list_cards(self):
-        self.calls.append(("list", ""))
+    def list_cards(self, *, before=""):
+        self.calls.append(("list", before))
         return tuple(self._record(body) for body in self.cards.values())
+
+    def list_all_cards(self):
+        self.calls.append(("list_all", ""))
+        return tuple(self._record(body) for body in self.cards.values()), self.board_complete
 
 
 class EngineHarness(unittest.TestCase):
@@ -353,3 +360,21 @@ class AmbiguousRetryTests(EngineHarness):
         self.assertEqual(settled.status, EffectStatus.VERIFIED)
         self.assertTrue(settled.reconciled)
         self.assertNotIn("move", {kind for kind, _ in trello.calls})
+
+
+class PartialBoardTests(EngineHarness):
+    """A duplicate check on part of a board is not a duplicate check."""
+
+    def test_a_create_on_an_unreadable_whole_board_is_refused_not_guessed(self) -> None:
+        engine, trello, _ = self.engine()
+        trello.board_complete = False
+        outcome = engine.create(self.actor(), card())
+        self.assertEqual(outcome.status, EffectStatus.REFUSED)
+        self.assertIn("whole board", outcome.reason)
+        # And nothing was created: refusing is the point.
+        self.assertEqual(trello.cards, {})
+
+    def test_a_complete_board_still_creates_normally(self) -> None:
+        engine, trello, _ = self.engine()
+        outcome = engine.create(self.actor(), card())
+        self.assertEqual(outcome.status, EffectStatus.VERIFIED)

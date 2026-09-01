@@ -198,6 +198,8 @@ unknown -> verified | failed after authoritative reconciliation
 
 An executing proposal becomes unknown after a restart. A timeout, malformed acknowledgement, or failed readback is unknown. It never returns to approved automatically and is never blindly retried.
 
+A board is read a page at a time, up to a fixed cap, and a board larger than that cap is reported as an incomplete read rather than returned as if it were the whole board. Creating a card is refused on an incomplete read: a duplicate check that answers "no match" from part of a board is how one property ends up with two cards.
+
 Trello merge execution requires an exact normalized address or exact provider/property identifier. The proposal includes source fields, destination fields, conflicts, payload hash, and revisions. Scotty updates and reads back the destination before archiving and reading back the duplicate.
 
 RentCast is read-only. Provider records retain endpoint, source ID, retrieval time, revision, source fields, and missing attributes. Deterministic calculations use `Decimal`; every result is preliminary and requires qualified-professional verification.

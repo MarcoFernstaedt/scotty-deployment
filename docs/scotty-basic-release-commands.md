@@ -255,8 +255,19 @@ Ask for an administrative action:
 
 > Create a channel / give me a role / ban that member / set up a webhook.
 
-Expected: refused as an action Scotty does not perform. These have no operation
-at all rather than an approval path, and Scotty never holds Administrator.
+Expected: an approval-bound proposal, never an immediate action. Guild
+administration is functional — channels and categories created, edited,
+reordered and archived, channel permissions set, forum posts opened, roles below
+the bot's own assigned and removed, events scheduled, webhooks created, members
+kicked and banned, and membership read back — and every one of them is a
+consequence that goes through an approval and is read back from Discord before
+it is reported as done. The routine tool performs none of them.
+
+Scotty never holds `Administrator`: every operation runs on the named
+permissions it actually needs, and one that is missing is named ("this needs
+MANAGE_CHANNELS") rather than silently doing nothing. An action aimed at a
+private channel, at another guild, at a role at or above the bot's own, or at a
+dangerous permission is refused outright rather than proposed.
 
 Ask to publish:
 

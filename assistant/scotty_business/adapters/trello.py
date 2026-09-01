@@ -30,6 +30,14 @@ _READ_FIELDS = (
 )
 _UPDATE_FIELDS = frozenset({"name", "desc", "due", "dueComplete", "idLabels"})
 
+#: One page of a board. Trello's own maximum for this endpoint is 1000, which is
+#: not a page, it is a board.
+MAX_CARDS_PER_PAGE = 100
+
+#: The most cards one read of a board will ever hold. Past this the read says it
+#: is incomplete rather than pretending to be the whole board.
+MAX_BOARD_CARDS = 1_000
+
 
 class TrelloAdapter:
     api_version = "1"
@@ -90,16 +98,49 @@ class TrelloAdapter:
         )
         return self._record(require_success(response), retrieved_at=retrieved_at)
 
-    def list_cards(self) -> tuple[ProviderRecord, ...]:
+    def list_cards(self, *, before: str = "") -> tuple[ProviderRecord, ...]:
+        """One bounded page of the configured board, newest first.
+
+        Trello will happily return every card on a board in one response. A
+        board with a few thousand properties on it is then a few thousand cards
+        in memory and in whatever reads them, so this asks for a page and
+        `list_all_cards` walks the rest.
+        """
+
+        query: dict[str, object] = {
+            "fields": list(_READ_FIELDS),
+            "customFieldItems": True,
+            "limit": MAX_CARDS_PER_PAGE,
+        }
+        if before:
+            query["before"] = fixed_id(before, "card id")
         response = self.transport.request(
             "GET",
             f"{_BASE}/boards/{fixed_id(self.scope.board_id, 'board id')}/cards",
-            query=self._query({"fields": list(_READ_FIELDS), "customFieldItems": True}),
+            query=self._query(query),
         )
         body = require_success(response)
         if not isinstance(body, list):
             raise ProviderError("Trello cards response must be a list")
         return tuple(self._record(card) for card in body)
+
+    def list_all_cards(self) -> tuple[tuple[ProviderRecord, ...], bool]:
+        """Every card on the board, and whether that is really every card.
+
+        The second value is the honest part. A board past the cap is read up to
+        it and reported as incomplete, because a duplicate check that answers
+        "no match" from a partial board is how one property gets two cards.
+        """
+
+        collected: list[ProviderRecord] = []
+        before = ""
+        while len(collected) < MAX_BOARD_CARDS:
+            page = self.list_cards(before=before)
+            collected.extend(page)
+            if len(page) < MAX_CARDS_PER_PAGE:
+                return tuple(collected), True
+            before = page[-1].source_id
+        return tuple(collected[:MAX_BOARD_CARDS]), False
 
     def create_card(self, list_id: str, fields: Mapping[str, object]) -> ProviderRecord:
         if list_id not in self.scope.list_ids:

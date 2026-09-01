@@ -126,29 +126,68 @@ class GoogleAdapterTests(AdapterHarness):
         )
         self.assertTrue(any(call[1].endswith("/files") for call in transport.calls))
 
+    #: One synthetic call per routine operation. Driven from the policy's own
+    #: set below, so an operation that is classified but never implemented is a
+    #: failing test rather than a refusal an approver discovers at execution.
+    ROUTINE_CALLS = (
+        ("gmail_modify_labels", "message-1", {"addLabelIds": ["STARRED"]}),
+        ("gmail_create_draft", "new", {"raw": "c3ludGhldGlj"}),
+        ("calendar_create_event", "primary", {"summary": "Internal follow-up"}),
+        ("calendar_update_event", "primary/event-1", {"summary": "Rescheduled"}),
+        ("calendar_cancel_event", "primary/event-1", {}),
+        ("drive_create_file", "new", {"name": "Internal notes"}),
+        ("drive_update_file", "file-1", {"name": "Renamed"}),
+        ("drive_move_file", "file-1", {"addParents": "folder-2", "removeParents": "folder-1"}),
+        ("drive_trash_file", "file-1", {}),
+        ("docs_create", "new", {"title": "Notes"}),
+        ("docs_batch_update", "document-1", {"requests": [{"insertText": {}}]}),
+        ("sheets_create", "new", {"properties": {"title": "Pipeline"}}),
+        ("sheets_batch_update", "spreadsheet-1", {"requests": [{"addSheet": {}}]}),
+        ("contacts_create", "new", {"names": [{"givenName": "Synthetic"}]}),
+        ("contacts_update", "people/contact-1", {"etag": "etag-1", "names": []}),
+        ("gmail_update_draft", "draft-1", {"raw": "c3ludGhldGlj"}),
+        (
+            "sheets_update_values",
+            "spreadsheet-1",
+            {"data": [{"range": "Sheet1!A1", "values": [["x"]]}], "valueInputOption": "RAW"},
+        ),
+    )
+
     def test_routine_reversible_workspace_operations_are_available_without_proposal(self) -> None:
         adapter, _ = self.adapter()
         adapter.transport = SyntheticGoogle()
-        operations = (
-            ("gmail_modify_labels", "message-1", {"addLabelIds": ["STARRED"]}),
-            ("gmail_create_draft", "new", {"raw": "c3ludGhldGlj"}),
-            ("calendar_create_event", "primary", {"summary": "Internal follow-up"}),
-            ("calendar_update_event", "primary/event-1", {"summary": "Rescheduled"}),
-            ("calendar_cancel_event", "primary/event-1", {}),
-            ("drive_create_file", "new", {"name": "Internal notes"}),
-            ("drive_update_file", "file-1", {"name": "Renamed"}),
-            ("drive_move_file", "file-1", {"addParents": "folder-2", "removeParents": "folder-1"}),
-            ("drive_trash_file", "file-1", {}),
-            ("docs_create", "new", {"title": "Notes"}),
-            ("docs_batch_update", "document-1", {"requests": [{"insertText": {}}]}),
-            ("sheets_create", "new", {"properties": {"title": "Pipeline"}}),
-            ("sheets_batch_update", "spreadsheet-1", {"requests": [{"addSheet": {}}]}),
-            ("contacts_create", "new", {"names": [{"givenName": "Synthetic"}]}),
-            ("contacts_update", "people/contact-1", {"etag": "etag-1", "names": []}),
-        )
-        for operation, resource_id, payload in operations:
+        for operation, resource_id, payload in self.ROUTINE_CALLS:
             with self.subTest(operation=operation):
                 self.assertTrue(adapter.execute_routine(operation, resource_id, payload).source_id)
+
+    def test_every_routine_operation_the_policy_names_is_actually_implemented(self) -> None:
+        from assistant.scotty_business.google_policy import ROUTINE_GOOGLE_OPERATIONS
+
+        covered = {operation for operation, _, _ in self.ROUTINE_CALLS}
+        self.assertEqual(covered, set(ROUTINE_GOOGLE_OPERATIONS))
+
+    def test_every_consequence_operation_the_policy_names_runs_once_approved(self) -> None:
+        from assistant.scotty_business.google_policy import CONSEQUENCE_GOOGLE_OPERATIONS
+
+        adapter, _ = self.adapter()
+        adapter.transport = SyntheticGoogle()
+        # A draft to send, made the way a person would make one.
+        draft = adapter.execute_routine("gmail_create_draft", "new", {"raw": "c3ludGhldGlj"})
+        calls = {
+            "gmail_send_draft": (draft.source_id, {}),
+            "drive_delete_permanently": ("file-1", {}),
+            "drive_change_permissions": (
+                "file-2",
+                {"role": "reader", "type": "user", "emailAddress": "synthetic@example.test"},
+            ),
+            "contacts_delete": ("people/contact-1", {}),
+        }
+        self.assertEqual(set(calls), set(CONSEQUENCE_GOOGLE_OPERATIONS))
+        for operation, (resource_id, payload) in sorted(calls.items()):
+            with self.subTest(operation=operation):
+                # `mutate` is the approved path. It must reach the provider
+                # rather than refuse an operation the approver already granted.
+                self.assertTrue(adapter.mutate(operation, resource_id, payload).source_id)
 
     def test_consequence_operations_are_never_accepted_by_routine_path(self) -> None:
         adapter, _ = self.adapter()

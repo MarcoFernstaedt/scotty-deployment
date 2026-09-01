@@ -246,6 +246,9 @@ class SyntheticGuild:
         self.foreign_channels: set[str] = set()
         self.events: dict[str, dict] = {}
         self.bans: set[str] = set()
+        self.webhooks: dict[str, list[dict]] = {}
+        self.hide_webhooks = False
+        self.threads: dict[str, dict] = {}
         self.calls: list[tuple[str, str]] = []
         self.next_id = 1
 
@@ -261,6 +264,31 @@ class SyntheticGuild:
             return self._ok({"roles": list(self.bot_roles)})
         if path.endswith("/roles"):
             return self._ok(list(self.roles.values()))
+        if "/webhooks" in path:
+            channel_id = path.split("/")[2]
+            if method == "GET":
+                return self._ok([] if self.hide_webhooks else self.webhooks.get(channel_id, []))
+            hook = {
+                "id": f"26000000000000000{self.next_id}",
+                "channel_id": channel_id,
+                "name": (json_body or {}).get("name"),
+                "token": "synthetic-webhook-token",
+            }
+            self.next_id += 1
+            self.webhooks.setdefault(channel_id, []).append(dict(hook))
+            return self._ok(hook, status=201)
+        if method == "POST" and path.endswith("/threads"):
+            channel_id = path.split("/")[2]
+            thread_id = f"27000000000000000{self.next_id}"
+            self.next_id += 1
+            self.threads[thread_id] = {
+                "id": thread_id,
+                "guild_id": synthetic.CLIENT_GUILD,
+                "parent_id": channel_id,
+                "name": (json_body or {}).get("name"),
+            }
+            self.channels[thread_id] = dict(self.threads[thread_id])
+            return self._ok(dict(self.threads[thread_id]), status=201)
         if method == "POST" and path.endswith("/channels"):
             channel_id = f"23000000000000000{self.next_id}"
             self.next_id += 1
@@ -330,15 +358,6 @@ class SyntheticGuild:
                 self.events[event_id] = {"id": event_id, **(json_body or {})}
                 return self._ok(dict(self.events[event_id]), status=201)
             return self._ok(dict(self.events[path.split("/")[-1]]))
-        if "/webhooks" in path:
-            return self._ok(
-                {
-                    "id": "260000000000000001",
-                    "name": (json_body or {}).get("name"),
-                    "token": "synthetic-webhook-token",
-                },
-                status=201,
-            )
         if "/bans/" in path:
             member_id = path.split("/")[4]
             if method == "PUT":
@@ -472,6 +491,46 @@ class AdminAdapterTests(unittest.TestCase):
         created = adapter.create_event("Livestream", "2026-10-01T18:00:00Z")
         self.assertEqual(created["name"], "Livestream")
 
+    def test_channels_are_reordered_one_at_a_time_and_each_is_confirmed(self) -> None:
+        adapter, _ = self.adapter()
+        first = adapter.create_channel("deals")
+        second = adapter.create_channel("leads")
+        ordered = adapter.reorder_channels(
+            [{"id": first["id"], "position": 1}, {"id": second["id"], "position": 2}]
+        )
+        self.assertEqual(ordered, (first["id"], second["id"]))
+
+    def test_a_forum_post_is_created_and_read_back_before_it_counts(self) -> None:
+        adapter, _ = self.adapter()
+        forum = adapter.create_channel("property-forum", kind="forum")
+        post = adapter.create_forum_post(forum["id"], "44 Maple St", "asking 240k")
+        self.assertEqual(post["name"], "44 Maple St")
+        self.assertTrue(post["thread_id"])
+
+    def test_a_forum_post_outside_a_forum_channel_is_refused(self) -> None:
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        adapter, _ = self.adapter()
+        text_channel = adapter.create_channel("deal-flow")
+        with self.assertRaises(ProviderError):
+            adapter.create_forum_post(text_channel["id"], "44 Maple St", "asking 240k")
+
+    def test_a_webhook_is_confirmed_against_the_channel_s_own_list(self) -> None:
+        adapter, guild = self.adapter()
+        adapter.create_webhook("230000000000000001", "updates")
+        self.assertIn(
+            ("GET", "https://discord.com/api/v10/channels/230000000000000001/webhooks"),
+            guild.calls,
+        )
+
+    def test_a_webhook_that_does_not_read_back_is_ambiguous_not_success(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, guild = self.adapter()
+        guild.hide_webhooks = True
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.create_webhook("230000000000000001", "updates")
+
 
 class ApprovalPathTests(unittest.TestCase):
     """Administration is reachable only through an approved proposal."""
@@ -526,6 +585,90 @@ class ApprovalPathTests(unittest.TestCase):
                 employee, "create_channel", {"name": "deal-flow"}
             )
             self.assertEqual(proposal.approver.role, Role.MAIN_OPERATOR)
+
+
+class ExecutableSurfaceTests(unittest.TestCase):
+    """Everything the policy advertises can actually be carried out.
+
+    An operation that is classified, permission-mapped and proposable but has
+    no execution is worse than an absent one: the approver grants it, the
+    execution claim is made, and only then does it fail. This walks the whole
+    advertised set through the service's own dispatch.
+    """
+
+    def service(self):
+        from test_provider_connection import runtime
+
+        from assistant.scotty_business.adapters.discord_admin import DiscordAdminAdapter
+
+        context = runtime(DISCORD_BOT_TOKEN="synthetic-discord")
+        live = context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+        guild = SyntheticGuild(required_permissions())
+        live.service.discord_admin = DiscordAdminAdapter(
+            guild, "synthetic-bot-token", synthetic.CLIENT_GUILD
+        )
+        return live.service, guild
+
+    def payloads(self, guild) -> dict[str, dict]:
+        forum = "230000000000000077"
+        guild.channels[forum] = {
+            "id": forum,
+            "guild_id": synthetic.CLIENT_GUILD,
+            "type": 15,
+            "permission_overwrites": [],
+        }
+        guild.members["390000000000000002"] = {"roles": []}
+        return {
+            "create_channel": {"name": "deal-flow"},
+            "create_category": {"name": "Deals"},
+            "edit_channel": {
+                "channel_id": "230000000000000001",
+                "changes": {"name": "deal-flow"},
+            },
+            "archive_channel": {"channel_id": "230000000000000001"},
+            "reorder_channels": {"positions": [{"id": "230000000000000001", "position": 1}]},
+            "set_channel_permissions": {
+                "channel_id": "230000000000000001",
+                "overwrites": [{"id": "240000000000000001", "allow": "0", "deny": "1024"}],
+            },
+            "create_forum_post": {
+                "channel_id": forum,
+                "name": "44 Maple St",
+                "content": "asking 240k",
+            },
+            "assign_role": {
+                "user_id": "390000000000000001",
+                "role_id": "240000000000000001",
+            },
+            "remove_role": {
+                "user_id": "390000000000000001",
+                "role_id": "240000000000000001",
+            },
+            "create_event": {"name": "Livestream", "start": "2026-10-01T18:00:00Z"},
+            "create_webhook": {"channel_id": "230000000000000001", "name": "updates"},
+            "kick_member": {"user_id": "390000000000000001"},
+            "ban_member": {"user_id": "390000000000000001"},
+            # A different member: the kick above removes the first one, and
+            # this is about the operation existing, not about that member.
+            "read_member_permissions": {"user_id": "390000000000000002"},
+        }
+
+    def test_every_advertised_administration_operation_actually_runs(self) -> None:
+        service, guild = self.service()
+        payloads = self.payloads(guild)
+        for operation in sorted(ADMINISTRATION_DISCORD_OPERATIONS):
+            with self.subTest(operation=operation):
+                self.assertIn(operation, payloads, f"{operation} has no synthetic payload")
+                receipt = service._run_administration(operation, payloads[operation])
+                self.assertIsInstance(receipt, dict)
+
+    def test_an_operation_nobody_implemented_is_refused_rather_than_guessed(self) -> None:
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        service, _ = self.service()
+        with self.assertRaises(ProviderError):
+            service._run_administration("delete_guild", {})
 
 
 if __name__ == "__main__":

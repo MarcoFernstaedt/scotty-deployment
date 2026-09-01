@@ -108,6 +108,8 @@ _ADMIN_PAYLOAD_KEYS = frozenset(
         "role_id",
         "start",
         "description",
+        "positions",
+        "content",
     }
 )
 
@@ -544,6 +546,19 @@ class ScottyService:
                     _payload_text(payload, "start"),
                     channel_id=channel_id,
                     description=_optional_text(payload, "description"),
+                )
+            )
+        if operation == "reorder_channels":
+            positions = payload.get("positions")
+            if not isinstance(positions, list):
+                raise ProviderError("a reorder needs each channel and the position to put it in")
+            return {"reordered": list(admin.reorder_channels(positions))}
+        if operation == "create_forum_post":
+            return dict(
+                admin.create_forum_post(
+                    channel_id,
+                    _payload_text(payload, "name"),
+                    _payload_text(payload, "content"),
                 )
             )
         if operation == "create_webhook":

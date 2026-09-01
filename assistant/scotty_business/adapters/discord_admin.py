@@ -50,6 +50,7 @@ class MemberRoles:
 
 MAX_NAME_CHARS = 100
 MAX_TOPIC_CHARS = 1024
+MAX_POST_CHARS = 2000
 MAX_REORDER = 25
 
 #: Channel kinds this deployment creates. Voice and stage channels are absent
@@ -432,6 +433,46 @@ class DiscordAdminAdapter:
             )
         return {"event_id": str(created["id"]), "name": str(readback.get("name", ""))}
 
+    def create_forum_post(self, channel_id: str, name: str, content: str) -> dict[str, object]:
+        """Open one forum thread with its first message, and read it back.
+
+        A forum post is a thread with a message in it, and Discord makes both in
+        one call. The channel is proven to be a forum first: posting a thread
+        into an ordinary text channel is a different thing with a different
+        audience, and quietly doing that instead is not an acceptable outcome.
+        """
+
+        channel = fixed_id(channel_id, "channel id")
+        parent = self.require_in_guild(channel)
+        if parent.get("type") != CHANNEL_KINDS["forum"]:
+            raise ProviderError("that channel is not a forum, so it takes no forum post")
+        if type(content) is not str or not content.strip():
+            raise ProviderError("a forum post needs its first message")
+        if len(content) > MAX_POST_CHARS:
+            raise ProviderError(f"a forum post is at most {MAX_POST_CHARS} characters")
+        response = self.transport.request(
+            "POST",
+            f"{_BASE}/channels/{channel}/threads",
+            headers=self._headers,
+            json_body={"name": _name(name), "message": {"content": content}},
+        )
+        created = require_success(response, expected=(200, 201))
+        thread_id = created.get("id") if isinstance(created, Mapping) else None
+        if type(thread_id) is not str or not thread_id:
+            raise AmbiguousEffectError(
+                "Discord forum acknowledgement is malformed; reconcile before retry"
+            )
+        observed = self._read_channel(thread_id)
+        if observed.get("name") != _name(name) or observed.get("parent_id") != channel:
+            raise AmbiguousEffectError(
+                "the Discord forum post does not read back as intended; reconcile before retry"
+            )
+        return {
+            "thread_id": thread_id,
+            "channel_id": channel,
+            "name": str(observed.get("name", "")),
+        }
+
     def create_webhook(self, channel_id: str, name: str) -> dict[str, object]:
         """Create a webhook and return its identity only, never its token."""
 
@@ -448,10 +489,25 @@ class DiscordAdminAdapter:
             raise AmbiguousEffectError(
                 "Discord webhook acknowledgement is malformed; reconcile before retry"
             )
+        webhook_id = str(created["id"])
+        # A 200 describes the request. A webhook is a credential-bearing route
+        # into a channel, so it counts as created only when the channel itself
+        # lists it.
+        listed = require_success(
+            self.transport.request(
+                "GET", f"{_BASE}/channels/{channel}/webhooks", headers=self._headers
+            )
+        )
+        if not isinstance(listed, list) or not any(
+            isinstance(item, Mapping) and item.get("id") == webhook_id for item in listed
+        ):
+            raise AmbiguousEffectError(
+                "the Discord webhook does not read back on its channel; reconcile before retry"
+            )
         # The token is credential material. It is never returned, logged, or
         # stored here; the operator reads it from Discord if they need it.
         return {
-            "webhook_id": str(created["id"]),
+            "webhook_id": webhook_id,
             "channel_id": channel,
             "name": str(created.get("name", "")),
         }
@@ -532,4 +588,10 @@ class DiscordAdminAdapter:
         return observed
 
 
-__all__ = ["CHANNEL_KINDS", "MAX_REORDER", "DiscordAdminAdapter", "MemberRoles"]
+__all__ = [
+    "CHANNEL_KINDS",
+    "MAX_POST_CHARS",
+    "MAX_REORDER",
+    "DiscordAdminAdapter",
+    "MemberRoles",
+]

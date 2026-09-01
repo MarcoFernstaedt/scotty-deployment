@@ -12,6 +12,10 @@ from assistant.scotty_business.adapters import (
     RentCastAdapter,
     TrelloAdapter,
 )
+from assistant.scotty_business.adapters.trello import (
+    MAX_BOARD_CARDS,
+    MAX_CARDS_PER_PAGE,
+)
 from assistant.scotty_business.config import TrelloScope
 
 
@@ -55,6 +59,62 @@ class TrelloAdapterTests(unittest.TestCase):
         self.assertIn("customFieldItems", record.missing_attributes)
         self.assertNotIn("key-secret", repr(transport.calls))
         self.assertNotIn("token-secret", repr(transport.calls))
+
+    def _page(self, ids, board="board-1"):
+        return HttpResponse(
+            200,
+            {},
+            [
+                {
+                    "id": item,
+                    "idBoard": board,
+                    "idList": "list-1",
+                    "name": item,
+                    "dateLastActivity": "2026-08-28T12:00:00Z",
+                }
+                for item in ids
+            ],
+        )
+
+    def test_a_board_read_is_bounded_and_says_so_in_the_request(self) -> None:
+        transport = FakeTransport([self._page(["card-1", "card-2"])])
+        adapter = TrelloAdapter(transport, "k", "t", self.scope)
+        adapter.list_cards()
+        query = transport.calls[0]["query"]
+        # A board with thousands of cards must not come back in one response.
+        self.assertEqual(query["limit"], str(MAX_CARDS_PER_PAGE))
+
+    def test_the_whole_board_is_read_by_paging_not_by_asking_for_all_of_it(self) -> None:
+        first = self._page([f"card-{index}" for index in range(MAX_CARDS_PER_PAGE)])
+        second = self._page(["card-last"])
+        transport = FakeTransport([first, second])
+        adapter = TrelloAdapter(transport, "k", "t", self.scope)
+        cards, complete = adapter.list_all_cards()
+        self.assertEqual(len(cards), MAX_CARDS_PER_PAGE + 1)
+        self.assertTrue(complete)
+        # The second page continues from the last card of the first, so no card
+        # is read twice and none is skipped.
+        self.assertEqual(transport.calls[1]["query"]["before"], f"card-{MAX_CARDS_PER_PAGE - 1}")
+
+    def test_a_board_larger_than_the_cap_reports_that_it_is_incomplete(self) -> None:
+        pages = [
+            self._page([f"page{page}-card-{index}" for index in range(MAX_CARDS_PER_PAGE)])
+            for page in range(MAX_BOARD_CARDS // MAX_CARDS_PER_PAGE)
+        ]
+        adapter = TrelloAdapter(FakeTransport(pages), "k", "t", self.scope)
+        cards, complete = adapter.list_all_cards()
+        self.assertEqual(len(cards), MAX_BOARD_CARDS)
+        # Saying "that is all of them" when it is not is how a duplicate check
+        # comes back clean on a board that has the card.
+        self.assertFalse(complete)
+
+    def test_a_short_page_ends_the_paging(self) -> None:
+        transport = FakeTransport([self._page(["card-1"])])
+        adapter = TrelloAdapter(transport, "k", "t", self.scope)
+        cards, complete = adapter.list_all_cards()
+        self.assertEqual(len(cards), 1)
+        self.assertTrue(complete)
+        self.assertEqual(len(transport.calls), 1)
 
     def test_cross_board_or_unconfigured_list_response_fails_closed(self) -> None:
         for body in (

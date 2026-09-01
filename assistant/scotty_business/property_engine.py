@@ -317,11 +317,18 @@ class PropertyCardEngine:
     def existing(self) -> tuple[PropertyCard, ...]:
         """Every card currently on the configured board, canonically shaped."""
 
-        return self._existing()
+        return self._existing()[0]
 
-    def _existing(self) -> tuple[PropertyCard, ...]:
-        records = self.trello.list_cards()  # type: ignore[attr-defined]
-        return tuple(self._to_card(record) for record in records)
+    def _existing(self) -> tuple[tuple[PropertyCard, ...], bool]:
+        """The board, and whether that really is the whole board.
+
+        The flag travels with the cards because a duplicate check is only worth
+        anything against a complete board: answering "no match" from the first
+        thousand cards of a larger one is how one property gets two cards.
+        """
+
+        records, complete = self.trello.list_all_cards()  # type: ignore[attr-defined]
+        return tuple(self._to_card(record) for record in records), complete
 
     def _to_card(self, record: ProviderRecord) -> PropertyCard:
         """Read one Trello card back into the canonical shape."""
@@ -357,7 +364,16 @@ class PropertyCardEngine:
         except ValueError as exc:
             return EffectOutcome(EffectStatus.REFUSED, "", reason=str(exc))
 
-        existing = self._existing()
+        existing, complete = self._existing()
+        if not complete:
+            # Refusing is the only honest answer: the duplicate this would
+            # create might be sitting in the part of the board we did not read.
+            return EffectOutcome(
+                EffectStatus.REFUSED,
+                "",
+                reason="this board is larger than one read, so the whole board could not be "
+                "checked for an existing card; narrow the board or archive old cards first",
+            )
         matches = find_duplicates(card, existing)
         record, claimed = self.effects.claim(
             operation="create",

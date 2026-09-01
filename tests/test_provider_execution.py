@@ -288,5 +288,18 @@ class WireTests(ExecutorHarness):
         self.assertNotIn(OPERATOR_TOKEN, json.dumps(reply))
 
 
+class ProjectionBoundTests(unittest.TestCase):
+    def test_a_trello_page_always_fits_inside_what_the_broker_returns(self) -> None:
+        from assistant.scotty_broker.executor import _project
+        from assistant.scotty_business.adapters.trello import MAX_CARDS_PER_PAGE
+
+        # The broker bounds every list it hands back. If a page were larger than
+        # that bound, the page would come back short, the paging would think it
+        # had reached the end, and a partial board would be reported as whole.
+        projected = _project([{"id": str(index)} for index in range(MAX_CARDS_PER_PAGE)])
+        assert isinstance(projected, list)
+        self.assertEqual(len(projected), MAX_CARDS_PER_PAGE)
+
+
 if __name__ == "__main__":
     unittest.main()
