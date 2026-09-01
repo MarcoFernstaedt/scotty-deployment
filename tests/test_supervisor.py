@@ -250,6 +250,26 @@ class RuntimeWiringTests(unittest.TestCase):
                 any("oauth" in name or "private" in name for name in checked["would_restore"])
             )
 
+    def test_a_backup_name_can_never_reach_outside_the_backups_directory(self) -> None:
+        with self.runtime() as runtime:
+            for name in (
+                "../../../etc",
+                "..",
+                "../backups",
+                "20260901T000000/../..",
+                "not-a-backup",
+                "/etc",
+            ):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    runtime.handle_read(
+                        self.maintainer(runtime),
+                        {
+                            "operation": "maintenance",
+                            "maintenance_action": "verify_backup",
+                            "backup": name,
+                        },
+                    )
+
     def test_a_rollback_plan_is_returned_and_nothing_is_executed(self) -> None:
         with self.runtime() as runtime:
             plan = runtime.handle_read(

@@ -306,6 +306,22 @@ if __name__ == "__main__":
 
 
 class StoreIsolationTests(unittest.TestCase):
+    def test_a_stored_entry_can_never_claim_the_maintainer_as_its_owner(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory(prefix="scotty-workflows-") as directory:
+            path = Path(directory) / "workflows.json"
+            body = definition()
+            body.update({"workflow_id": "w-1", "owner": "maintainer", "state": "active"})
+            path.write_text(json.dumps({"workflows": [body]}), encoding="utf-8")
+            store = WorkflowStore(path, owner_uid=None)
+            # The entry is dropped on read rather than becoming a workflow the
+            # maintainer route owns.
+            for role in (Role.MAINTAINER, Role.MAIN_OPERATOR, Role.EMPLOYEE):
+                self.assertEqual(store.list(role), ())
+        with self.assertRaises(WorkflowError):
+            parse_workflow(definition(), owner=Role.MAINTAINER)
+
     def test_saving_one_workflow_never_drops_an_entry_it_cannot_parse(self) -> None:
         """Including the other user's, if a later version tightens validation."""
 

@@ -342,9 +342,16 @@ def _examples(value: object) -> tuple[Mapping[str, object], ...]:
     return tuple(dict(entry) for entry in value)
 
 
+#: Only a client user has workflows. The maintainer route is served separately
+#: and never owns one, so a stored entry cannot claim that owner.
+_OWNER_ROLES: frozenset[Role] = frozenset({Role.MAIN_OPERATOR, Role.EMPLOYEE})
+
+
 def parse_workflow(definition: object, *, owner: Role, workflow_id: str | None = None) -> Workflow:
     """Validate one definition whole, or refuse it whole."""
 
+    if owner not in _OWNER_ROLES:
+        raise WorkflowError("only a client user owns a workflow")
     if not isinstance(definition, Mapping):
         raise WorkflowError("a workflow definition must be an object")
     try:

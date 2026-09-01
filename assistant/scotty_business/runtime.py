@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import uuid
@@ -419,6 +420,11 @@ def _object(
     return value
 
 
+#: The exact shape a backup directory is created with, so a name argument can
+#: only ever select one of this deployment's own backups.
+_BACKUP_NAME = re.compile(r"[0-9]{8}T[0-9]{6}")
+
+
 class Runtime:
     def __init__(self, home: Path):
         self.home = home
@@ -730,6 +736,24 @@ class Runtime:
             raise PermissionError("that operation is not available on this route")
         action = _text(args, "maintenance_action")
         backups = self.state_dir / "backups"
+
+        def named_backup() -> Path:
+            """One backup this deployment took, by its own name and no other.
+
+            The name is an argument, so it is matched against the fixed shape a
+            backup is created with and the resolved path is required to sit
+            directly in the backups directory: a name of "../.." would otherwise
+            read a manifest from anywhere on disk.
+            """
+
+            name = _text(args, "backup")
+            if not _BACKUP_NAME.fullmatch(name):
+                raise ValueError("that is not the name of a backup")
+            candidate = (backups / name).resolve()
+            if candidate.parent != backups.resolve():
+                raise ValueError("that is not the name of a backup")
+            return candidate
+
         if action == "backup":
             destination = backups / datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             backup_state(self.state_dir, destination)
@@ -739,7 +763,7 @@ class Runtime:
                 "intact": not verify_backup(destination),
             }
         if action in {"verify_backup", "restorable"}:
-            destination = backups / _text(args, "backup")
+            destination = named_backup()
             mismatched = verify_backup(destination)
             return {
                 "backup": destination.name,

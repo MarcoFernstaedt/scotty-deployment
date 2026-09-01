@@ -126,14 +126,28 @@ class ConsumerLease:
         try:
             holder, renewed = self._current()
         except UnreadableState:
-            # An unreadable lease is not an unheld one. Refusing keeps the
-            # singleton; the operator clears the file to recover.
-            return False
+            # An unreadable lease is not an unheld one, so it is not simply
+            # taken. But refusing forever would need an operator to clear a
+            # file, so a lease nobody has renewed for longer than its lifetime
+            # is treated as abandoned: a live holder renews, which keeps its
+            # modification time fresh.
+            if not self._stale(moment):
+                return False
+            holder, renewed = "", None
         held_by_other = holder and holder != process_id and renewed is not None
         if held_by_other and moment - renewed < self.ttl:  # type: ignore[operator]
             return False
         _write_json(self.path, {"holder": process_id, "renewed_at": moment.isoformat()})
         return True
+
+    def _stale(self, moment: datetime) -> bool:
+        """Whether an unreadable lease has gone untouched past its lifetime."""
+
+        try:
+            touched = datetime.fromtimestamp(self.path.stat().st_mtime, tz=UTC)
+        except OSError:
+            return True
+        return moment - touched >= self.ttl
 
     def holder(self) -> str:
         try:
