@@ -28,6 +28,15 @@ readonly -a GUARD_FILES=(
 )
 readonly GUARD_BIN=/usr/local/libexec/scotty-egress-guard
 readonly GUARD_UNIT=/etc/systemd/system/scotty-egress-guard.service
+readonly BROKER_BIN=/usr/local/sbin/scotty-credential-broker
+readonly BROKER_UNIT=/etc/systemd/system/scotty-credential-broker.service
+readonly BROKER_DIR=/srv/Scotty/data/plugins/scotty_broker
+# The broker runs as root outside the container and holds provider credentials.
+# The runtime may only ask it whether a provider is connected.
+readonly -a BROKER_FILES=(
+  "__init__.py"
+  "broker.py"
+)
 readonly CONTAINER=scotty
 readonly NETWORK=scotty-egress
 readonly SUBNET=172.30.50.0/24
@@ -48,6 +57,10 @@ INSTALLED_SETUP=0
 INSTALLED_START=0
 INSTALLED_GUARD=0
 INSTALLED_UNIT=0
+INSTALLED_BROKER=0
+INSTALLED_BROKER_UNIT=0
+CREATED_BROKER_DIR=0
+ENABLED_BROKER=0
 RELOADED_SYSTEMD=0
 ENABLED_GUARD=0
 CREATED_NETWORK=0
@@ -219,6 +232,26 @@ install_plugin_file() {
   [[ -f $target && ! -L $target ]] || die "plugin install reported success but safe target is absent: ${relative}"
 }
 
+install_broker_file() {
+  local relative=$1 source target install_rc
+  source=${SOURCE_DIR}/assistant/scotty_broker/${relative}
+  target=${BROKER_DIR}/${relative}
+  [[ -f $source && ! -L $source ]] || die "broker source is absent or unsafe: ${relative}"
+  require_safe_ancestors "$target"
+  require_absent_destination "$target"
+  explicit_status_begin
+  install -o root -g root -m 0600 "$source" "$target"
+  install_rc=$?
+  explicit_status_end
+  if [[ -f $target && ! -L $target ]]; then
+    INSTALLED_PLUGIN_FILES+=("$target")
+  elif [[ -L $target ]]; then
+    die "broker install produced or encountered an unowned symlink: ${target}"
+  fi
+  (( install_rc == 0 )) || die "broker install failed for ${relative} (status ${install_rc})"
+  [[ -f $target && ! -L $target ]] || die "broker install reported success but target is absent: ${relative}"
+}
+
 cleanup() {
   local original_rc=$1 label inventory probe_rc remove_rc disable_rc guard_rc rc=0
   local installed_file index
@@ -271,6 +304,31 @@ cleanup() {
         remove_rc=$?
         (( remove_rc == 0 )) || rc=1
       fi
+    fi
+  fi
+  if (( ENABLED_BROKER )); then
+    systemctl disable --now scotty-credential-broker.service >/dev/null 2>&1
+    remove_rc=$?
+    (( remove_rc == 0 )) || rc=1
+  fi
+  if (( INSTALLED_BROKER_UNIT )); then
+    if [[ -L $BROKER_UNIT ]]; then
+      printf 'install: refusing to remove replacement symlink: %s\n' "$BROKER_UNIT" >&2
+      rc=1
+    else
+      rm -f -- "$BROKER_UNIT"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
+  if (( INSTALLED_BROKER )); then
+    if [[ -L $BROKER_BIN ]]; then
+      printf 'install: refusing to remove replacement symlink: %s\n' "$BROKER_BIN" >&2
+      rc=1
+    else
+      rm -f -- "$BROKER_BIN"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
     fi
   fi
   if (( ENABLED_GUARD )); then
@@ -372,6 +430,15 @@ cleanup() {
       (( remove_rc == 0 )) || rc=1
     fi
   done
+  if (( CREATED_BROKER_DIR )); then
+    if [[ -L $BROKER_DIR ]]; then
+      rc=1
+    else
+      rmdir -- "$BROKER_DIR"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
   if (( CREATED_PLUGIN_ADAPTERS )); then
     if [[ -L $PLUGIN_ADAPTERS_DIR ]]; then
       rc=1
@@ -499,6 +566,8 @@ preflight() {
     "$START_BIN"
     "$GUARD_BIN"
     "$GUARD_UNIT"
+    "$BROKER_BIN"
+    "$BROKER_UNIT"
   )
   local destination
   for destination in "${protected_destinations[@]}"; do
@@ -508,6 +577,8 @@ preflight() {
   require_safe_ancestors "$GUARD_BIN"
   require_safe_ancestors "$START_BIN"
   require_safe_ancestors "$GUARD_UNIT"
+  require_safe_ancestors "$BROKER_BIN"
+  require_safe_ancestors "$BROKER_UNIT"
 
   command_output containers docker container ls -a --format '{{.Names}}'
   contains_exact_line "$containers" "$CONTAINER" && die "container already exists: ${CONTAINER}"
@@ -521,6 +592,8 @@ preflight() {
 
   command_output unit_state systemctl show scotty-egress-guard.service --property=LoadState --value
   [[ $unit_state == not-found ]] || die "systemd unit is already loaded: ${unit_state}"
+  command_output unit_state systemctl show scotty-credential-broker.service --property=LoadState --value
+  [[ $unit_state == not-found ]] || die "broker unit is already loaded: ${unit_state}"
 }
 
 verify_install() {
@@ -540,7 +613,9 @@ verify_install() {
   [[ $actual == "managed|sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517" ]] || die "label mismatch: ${actual}"
 
   command_output actual docker inspect --format '{{len .Mounts}}|{{(index .Mounts 0).Type}}|{{(index .Mounts 0).Source}}|{{(index .Mounts 0).Destination}}|{{(index .Mounts 0).RW}}' "$CONTAINER"
-  [[ $actual == '1|bind|/srv/Scotty/data|/opt/data|true' ]] || die "mount mismatch: ${actual}"
+  [[ $actual == '2|bind|/srv/Scotty/data|/opt/data|true' ]] || die "mount mismatch: ${actual}"
+  command_output actual docker inspect --format '{{(index .Mounts 1).Type}}|{{(index .Mounts 1).Source}}|{{(index .Mounts 1).Destination}}' "$CONTAINER"
+  [[ $actual == 'bind|/run/scotty|/run/scotty' ]] || die "broker mount mismatch: ${actual}"
 
   command_output actual docker inspect --format '{{json .Config.ExposedPorts}}|{{json .HostConfig.PortBindings}}|{{json .HostConfig.Devices}}|{{.HostConfig.Privileged}}|{{json .HostConfig.SecurityOpt}}|{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER"
   [[ $actual == 'null|{}|[]|false|["no-new-privileges:true"]|no' ]] || die "exposure/security mismatch: ${actual}"
@@ -582,6 +657,14 @@ verify_install() {
       || die "client profile must not carry the maintainer guard: ${client_profile}"
   done
 
+  systemctl is-active --quiet scotty-credential-broker.service || die 'credential broker is not active'
+  command_output actual stat -c '%u:%g:%a' /run/scotty/credential-broker.sock
+  [[ $actual == '0:10000:660' ]] || die "broker socket ownership/mode mismatch: ${actual}"
+  command_output actual stat -c '%u:%g:%a' "$BROKER_BIN" "$BROKER_UNIT" "$BROKER_DIR"
+  [[ $actual == $'0:0:755\n0:0:644\n0:0:700' ]] || die "broker artefact ownership/mode mismatch: ${actual}"
+  [[ ! -e /srv/Scotty/data/profiles/scotty-main-operator/plugins/scotty_broker ]] \
+    || die 'a client profile must never carry the broker'
+
   systemctl is-active --quiet scotty-egress-guard.service || die 'firewall service is not active'
   "$GUARD_BIN" verify
 }
@@ -617,10 +700,18 @@ install_profile_dir "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
 for guard_file in "${GUARD_FILES[@]}"; do
   install_guard_file "$guard_file" "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
 done
+install_owned CREATED_BROKER_DIR "$BROKER_DIR" -d -o root -g root -m 0700 "$BROKER_DIR"
+for broker_file in "${BROKER_FILES[@]}"; do
+  install_broker_file "$broker_file"
+done
+install_owned INSTALLED_BROKER "$BROKER_BIN" -o root -g root -m 0755 "$SOURCE_DIR/scotty-credential-broker" "$BROKER_BIN"
+install_owned INSTALLED_BROKER_UNIT "$BROKER_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/broker/scotty-credential-broker.service" "$BROKER_UNIT"
 install_owned INSTALLED_GUARD "$GUARD_BIN" -o root -g root -m 0755 "$SOURCE_DIR/firewall/scotty-egress-guard" "$GUARD_BIN"
 install_owned INSTALLED_UNIT "$GUARD_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/firewall/scotty-egress-guard.service" "$GUARD_UNIT"
 RELOADED_SYSTEMD=1
 systemctl daemon-reload
+ENABLED_BROKER=1
+systemctl enable --now scotty-credential-broker.service
 ENABLED_GUARD=1
 systemctl enable --now scotty-egress-guard.service
 

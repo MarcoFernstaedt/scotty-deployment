@@ -56,6 +56,14 @@ from .setup_flow import (
 
 logger = logging.getLogger(__name__)
 
+#: The provider credentials the root-owned broker can be asked about. Google is
+#: absent: it uses provider-owned browser consent, not a stored key.
+BROKER_CREDENTIALS: Mapping[str, str] = {
+    "trello": "api_key",
+    "ghl": "private_token",
+    "rentcast": "api_key",
+}
+
 #: The content types Scotty may attach, keyed by the approved suffix.
 _ATTACHMENT_TYPES: Mapping[str, str] = {
     ".txt": "text/plain",
@@ -431,6 +439,17 @@ class Runtime:
         self._reporters: dict[tuple[str, str], ProgressReporter] = {}
         self._sends: dict[tuple[str, str], list[float]] = {}
 
+    def credential_store_status(self) -> dict[str, str]:
+        """What the root-owned broker holds, as fixed words and nothing more."""
+
+        broker = UnixSocketBroker(BROKER_SOCKET)
+        if not broker.available():
+            return dict.fromkeys(BROKER_CREDENTIALS, "unavailable")
+        status: dict[str, str] = {}
+        for provider, credential_class in BROKER_CREDENTIALS.items():
+            status[provider] = "present" if broker.status(provider, credential_class) else "absent"
+        return status
+
     def _google_access_token(self) -> str:
         """Return a valid Workspace access token, refreshing it when it expires."""
 
@@ -460,6 +479,7 @@ class Runtime:
                 "providers": {
                     provider: _guidance_json(provider, status[provider]) for provider in PROVIDERS
                 },
+                "credential_store": self.credential_store_status(),
                 "progress": [_progress_json(item) for item in progress],
                 "resume_at": resume.provider if resume is not None else None,
                 "next_action": (

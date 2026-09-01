@@ -25,6 +25,15 @@ services:
         target: /opt/data
         bind:
           create_host_path: false
+      # The broker's runtime directory, and nothing else on the host. The
+      # runtime connects to the socket inside it to ask whether a provider is
+      # connected; the credentials themselves stay in the broker's own
+      # root-only store, which is not mounted anywhere.
+      - type: bind
+        source: /run/scotty
+        target: /run/scotty
+        bind:
+          create_host_path: false
     networks:
       - scotty-egress
     labels:

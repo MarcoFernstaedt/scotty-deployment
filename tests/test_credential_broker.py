@@ -1,0 +1,678 @@
+from __future__ import annotations
+
+import json
+import os
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+from assistant.scotty_broker.broker import (
+    CREDENTIAL_CLASSES,
+    MAX_FRAME_BYTES,
+    MAX_MATERIAL_CHARS,
+    ROOT_OPERATIONS,
+    RUNTIME_OPERATIONS,
+    RUNTIME_UID,
+    Broker,
+    BrokerError,
+    CredentialStore,
+    Peer,
+    bind_socket,
+    serve_forever,
+)
+
+SECRET = "synthetic-provider-key-000000"  # noqa: S105 - synthetic fixture
+OTHER = "synthetic-provider-key-000001"  # noqa: S105 - synthetic fixture
+ROOT = Peer(pid=1, uid=0, gid=0)
+RUNTIME = Peer(pid=2, uid=RUNTIME_UID, gid=RUNTIME_UID)
+STRANGER = Peer(pid=3, uid=1234, gid=1234)
+
+
+class BrokerHarness(unittest.TestCase):
+    def broker(self, **kwargs):
+        directory = tempfile.TemporaryDirectory(prefix="scotty-broker-")
+        self.addCleanup(directory.cleanup)
+        store = CredentialStore(Path(directory.name) / "credentials.json")
+        return Broker(store, **kwargs), store
+
+    def commit(self, broker, provider="trello", credential_class="api_key", material=SECRET):
+        opened = broker.handle(
+            ROOT, {"op": "open", "provider": provider, "credential_class": credential_class}
+        )
+        return broker.handle(
+            ROOT,
+            {
+                "op": "commit",
+                "provider": provider,
+                "credential_class": credential_class,
+                "window": opened["window"],
+                "material": material,
+            },
+        )
+
+
+class AuthorizationTests(BrokerHarness):
+    """Authority comes from the kernel's peer credentials, not the message."""
+
+    def test_root_may_use_every_operation(self) -> None:
+        for operation in sorted(ROOT_OPERATIONS | RUNTIME_OPERATIONS):
+            with self.subTest(operation=operation):
+                self.assertTrue(ROOT.may(operation))
+
+    def test_the_runtime_may_only_ask_for_status(self) -> None:
+        self.assertEqual(
+            {operation for operation in ROOT_OPERATIONS if RUNTIME.may(operation)}, set()
+        )
+        self.assertTrue(RUNTIME.may("status"))
+
+    def test_an_unprivileged_caller_may_do_nothing_at_all(self) -> None:
+        for operation in sorted(ROOT_OPERATIONS | RUNTIME_OPERATIONS):
+            with self.subTest(operation=operation):
+                self.assertFalse(STRANGER.may(operation))
+
+    def test_the_runtime_cannot_commit_or_revoke_a_credential(self) -> None:
+        broker, store = self.broker()
+        self.commit(broker)
+        for request in (
+            {
+                "op": "commit",
+                "provider": "trello",
+                "credential_class": "api_key",
+                "window": "0" * 32,
+                "material": OTHER,
+            },
+            {"op": "revoke", "provider": "trello", "credential_class": "api_key"},
+            {"op": "open", "provider": "trello", "credential_class": "api_key"},
+            {
+                "op": "validate",
+                "provider": "trello",
+                "credential_class": "api_key",
+                "material": OTHER,
+            },
+        ):
+            with self.subTest(op=request["op"]), self.assertRaises(BrokerError) as caught:
+                broker.handle(RUNTIME, request)
+            self.assertEqual(str(caught.exception), "unauthorized")
+        self.assertTrue(store.present("trello", "api_key"))
+
+    def test_an_unknown_caller_is_refused_before_the_request_is_parsed(self) -> None:
+        broker, _ = self.broker()
+        with self.assertRaises(BrokerError):
+            broker.handle(
+                STRANGER, {"op": "status", "provider": "trello", "credential_class": "api_key"}
+            )
+
+
+class FixedOperationTests(BrokerHarness):
+    def test_a_committed_credential_reads_as_present_but_never_comes_back(self) -> None:
+        broker, store = self.broker()
+        outcome = self.commit(broker)
+        self.assertEqual(outcome, {"ok": True, "state": "credential present"})
+
+        status = broker.handle(
+            RUNTIME, {"op": "status", "provider": "trello", "credential_class": "api_key"}
+        )
+        self.assertEqual(status, {"ok": True, "state": "credential present"})
+        self.assertNotIn(SECRET, json.dumps(status))
+        self.assertNotIn(SECRET, repr(store))
+
+    def test_an_absent_credential_reports_absent(self) -> None:
+        broker, _ = self.broker()
+        self.assertEqual(
+            broker.handle(
+                RUNTIME, {"op": "status", "provider": "ghl", "credential_class": "private_token"}
+            ),
+            {"ok": False, "state": "credential absent"},
+        )
+
+    def test_revoking_removes_the_credential_and_is_idempotent(self) -> None:
+        broker, store = self.broker()
+        self.commit(broker)
+        first = broker.handle(
+            ROOT, {"op": "revoke", "provider": "trello", "credential_class": "api_key"}
+        )
+        second = broker.handle(
+            ROOT, {"op": "revoke", "provider": "trello", "credential_class": "api_key"}
+        )
+        self.assertEqual(first, {"ok": True, "state": "credential removed"})
+        self.assertEqual(second, {"ok": False, "state": "no credential"})
+        self.assertFalse(store.present("trello", "api_key"))
+
+    def test_validation_answers_without_storing_anything(self) -> None:
+        broker, store = self.broker()
+        outcome = broker.handle(
+            ROOT,
+            {
+                "op": "validate",
+                "provider": "trello",
+                "credential_class": "api_key",
+                "material": SECRET,
+            },
+        )
+        self.assertEqual(outcome, {"ok": True, "state": "validation passed"})
+        self.assertFalse(store.present("trello", "api_key"))
+
+    def test_a_provider_rejection_stores_nothing(self) -> None:
+        broker, store = self.broker(validator=lambda *_: False)
+        outcome = self.commit(broker)
+        self.assertEqual(outcome, {"ok": False, "state": "validation failed"})
+        self.assertFalse(store.present("trello", "api_key"))
+
+    def test_only_the_named_providers_and_classes_exist(self) -> None:
+        broker, _ = self.broker()
+        for provider, credential_class in (
+            ("zillow", "api_key"),
+            ("trello", "password"),
+            ("google_workspace", "refresh_token"),
+            ("", ""),
+            (None, None),
+            (7, 7),
+        ):
+            with self.subTest(provider=provider), self.assertRaises(BrokerError):
+                broker.handle(
+                    ROOT,
+                    {"op": "status", "provider": provider, "credential_class": credential_class},
+                )
+        self.assertNotIn("google_workspace", CREDENTIAL_CLASSES)
+
+
+class WindowTests(BrokerHarness):
+    def test_a_commit_without_an_open_window_is_refused(self) -> None:
+        broker, store = self.broker()
+        with self.assertRaises(BrokerError) as caught:
+            broker.handle(
+                ROOT,
+                {
+                    "op": "commit",
+                    "provider": "trello",
+                    "credential_class": "api_key",
+                    "window": "a" * 32,
+                    "material": SECRET,
+                },
+            )
+        self.assertEqual(str(caught.exception), "no open window")
+        self.assertFalse(store.present("trello", "api_key"))
+
+    def test_a_window_is_single_use_so_a_replay_is_refused(self) -> None:
+        broker, _ = self.broker()
+        opened = broker.handle(
+            ROOT, {"op": "open", "provider": "trello", "credential_class": "api_key"}
+        )
+        request = {
+            "op": "commit",
+            "provider": "trello",
+            "credential_class": "api_key",
+            "window": opened["window"],
+            "material": SECRET,
+        }
+        self.assertTrue(broker.handle(ROOT, request)["ok"])
+        with self.assertRaises(BrokerError):
+            broker.handle(ROOT, dict(request, material=OTHER))
+
+    def test_a_failed_commit_still_consumes_its_window(self) -> None:
+        broker, _ = self.broker(validator=lambda *_: False)
+        opened = broker.handle(
+            ROOT, {"op": "open", "provider": "trello", "credential_class": "api_key"}
+        )
+        request = {
+            "op": "commit",
+            "provider": "trello",
+            "credential_class": "api_key",
+            "window": opened["window"],
+            "material": SECRET,
+        }
+        self.assertFalse(broker.handle(ROOT, request)["ok"])
+        with self.assertRaises(BrokerError):
+            broker.handle(ROOT, request)
+
+    def test_an_expired_window_is_refused(self) -> None:
+        now = [1000.0]
+        broker, store = self.broker(clock=lambda: now[0], window_seconds=300)
+        opened = broker.handle(
+            ROOT, {"op": "open", "provider": "trello", "credential_class": "api_key"}
+        )
+        now[0] += 301
+        with self.assertRaises(BrokerError):
+            broker.handle(
+                ROOT,
+                {
+                    "op": "commit",
+                    "provider": "trello",
+                    "credential_class": "api_key",
+                    "window": opened["window"],
+                    "material": SECRET,
+                },
+            )
+        self.assertFalse(store.present("trello", "api_key"))
+
+    def test_a_window_never_satisfies_a_different_credential(self) -> None:
+        broker, store = self.broker()
+        opened = broker.handle(
+            ROOT, {"op": "open", "provider": "trello", "credential_class": "api_key"}
+        )
+        with self.assertRaises(BrokerError):
+            broker.handle(
+                ROOT,
+                {
+                    "op": "commit",
+                    "provider": "ghl",
+                    "credential_class": "private_token",
+                    "window": opened["window"],
+                    "material": SECRET,
+                },
+            )
+        self.assertFalse(store.present("ghl", "private_token"))
+
+    def test_a_malformed_window_identifier_is_refused(self) -> None:
+        broker, _ = self.broker()
+        for window in ("", "not-hex", "A" * 32, "0" * 31, None, 7):
+            with self.subTest(window=window), self.assertRaises(BrokerError):
+                broker.handle(
+                    ROOT,
+                    {
+                        "op": "commit",
+                        "provider": "trello",
+                        "credential_class": "api_key",
+                        "window": window,
+                        "material": SECRET,
+                    },
+                )
+
+    def test_a_restart_invalidates_every_open_window(self) -> None:
+        broker, store = self.broker()
+        opened = broker.handle(
+            ROOT, {"op": "open", "provider": "trello", "credential_class": "api_key"}
+        )
+        restarted = Broker(store)
+        with self.assertRaises(BrokerError):
+            restarted.handle(
+                ROOT,
+                {
+                    "op": "commit",
+                    "provider": "trello",
+                    "credential_class": "api_key",
+                    "window": opened["window"],
+                    "material": SECRET,
+                },
+            )
+
+
+class MalformedInputTests(BrokerHarness):
+    def test_a_malformed_request_or_unknown_operation_is_refused(self) -> None:
+        broker, _ = self.broker()
+        for request in (None, [], "status", 7, {}, {"op": "read"}, {"op": ""}, {"op": 7}):
+            with self.subTest(request=request), self.assertRaises(BrokerError):
+                broker.handle(ROOT, request)
+
+    def test_oversized_or_malformed_material_is_refused(self) -> None:
+        broker, store = self.broker()
+        for material in (
+            "short",
+            "x" * (MAX_MATERIAL_CHARS + 1),
+            "has spaces",
+            "line\nbreak",
+            None,
+            7,
+        ):
+            with self.subTest(material=str(material)[:20]), self.assertRaises(BrokerError):
+                broker.handle(
+                    ROOT,
+                    {
+                        "op": "validate",
+                        "provider": "trello",
+                        "credential_class": "api_key",
+                        "material": material,
+                    },
+                )
+        self.assertFalse(store.present("trello", "api_key"))
+
+
+class StoreSafetyTests(BrokerHarness):
+    def test_the_store_is_written_owner_only(self) -> None:
+        broker, store = self.broker()
+        self.commit(broker)
+        self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
+
+    def test_a_group_readable_store_is_refused_rather_than_trusted(self) -> None:
+        broker, store = self.broker()
+        self.commit(broker)
+        store.path.chmod(0o644)
+        with self.assertRaises(BrokerError):
+            store.present("trello", "api_key")
+
+    def test_a_symlinked_store_path_is_never_followed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-broker-link-") as directory:
+            root = Path(directory)
+            target = root / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            link = root / "store.json"
+            link.symlink_to(target)
+            store = CredentialStore(link)
+            self.assertFalse(store.present("trello", "api_key"))
+            with self.assertRaises(BrokerError):
+                store.put("trello", "api_key", SECRET)
+            self.assertEqual(target.read_text(encoding="utf-8"), "{}")
+
+    def test_a_corrupt_store_is_refused_rather_than_guessed_at(self) -> None:
+        broker, store = self.broker()
+        store.path.write_text("not json", encoding="utf-8")
+        store.path.chmod(0o600)
+        with self.assertRaises(BrokerError):
+            store.present("trello", "api_key")
+
+
+class InstalledSocketTests(unittest.TestCase):
+    """The real artefact over a real socket, not a mock of one."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory(prefix="scotty-broker-socket-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.socket_path = self.root / "credential-broker.sock"
+        self.store = CredentialStore(self.root / "credentials.json")
+        self.broker = Broker(self.store)
+        self.server = bind_socket(self.socket_path, group=os.getgid())
+        self.addCleanup(self.server.close)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(
+            target=serve_forever,
+            args=(self.broker, self.server),
+            kwargs={"should_stop": self.stop.is_set},
+            daemon=True,
+        )
+        self.thread.start()
+        self.addCleanup(self.thread.join, 3.0)
+        self.addCleanup(self.stop.set)
+
+    def call(self, request, *, raw: bytes | None = None):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5.0)
+        client.connect(str(self.socket_path))
+        with client:
+            payload = raw if raw is not None else json.dumps(request).encode("utf-8") + b"\n"
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            return json.loads(client.recv(4096).decode("utf-8"))
+
+    def test_the_socket_is_reachable_and_answers_the_fixed_operations(self) -> None:
+        opened = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
+        self.assertTrue(opened["ok"])
+        committed = self.call(
+            {
+                "op": "commit",
+                "provider": "trello",
+                "credential_class": "api_key",
+                "window": opened["window"],
+                "material": SECRET,
+            }
+        )
+        self.assertEqual(committed["state"], "credential present")
+        status = self.call({"op": "status", "provider": "trello", "credential_class": "api_key"})
+        self.assertEqual(status, {"ok": True, "state": "credential present"})
+
+    def test_the_socket_is_owner_and_group_only(self) -> None:
+        mode = self.socket_path.stat().st_mode
+        self.assertTrue(stat.S_ISSOCK(mode))
+        self.assertEqual(mode & 0o777, 0o660)
+        self.assertEqual(mode & stat.S_IRWXO, 0)
+
+    def test_no_reply_ever_carries_credential_material(self) -> None:
+        opened = self.call({"op": "open", "provider": "ghl", "credential_class": "private_token"})
+        replies = [
+            opened,
+            self.call(
+                {
+                    "op": "commit",
+                    "provider": "ghl",
+                    "credential_class": "private_token",
+                    "window": opened["window"],
+                    "material": SECRET,
+                }
+            ),
+            self.call({"op": "status", "provider": "ghl", "credential_class": "private_token"}),
+            self.call(
+                {
+                    "op": "validate",
+                    "provider": "ghl",
+                    "credential_class": "private_token",
+                    "material": SECRET,
+                }
+            ),
+        ]
+        rendered = json.dumps(replies)
+        self.assertNotIn(SECRET, rendered)
+        self.assertNotIn(SECRET[:12], rendered)
+
+    def test_a_malformed_or_oversized_frame_is_refused_without_crashing(self) -> None:
+        for raw in (
+            b"\n",
+            b"not json\n",
+            b"[]\n",
+            b'{"op":"read"}\n',
+            b"x" * (MAX_FRAME_BYTES + 10) + b"\n",
+        ):
+            with self.subTest(raw=raw[:20]):
+                reply = self.call(None, raw=raw)
+                self.assertFalse(reply["ok"])
+        # The server is still serving afterwards.
+        self.assertFalse(
+            self.call({"op": "status", "provider": "trello", "credential_class": "api_key"})["ok"]
+        )
+
+    def test_an_unavailable_broker_is_reported_rather_than_assumed_present(self) -> None:
+        from assistant.scotty_business.credential_intake import UnixSocketBroker
+
+        client = UnixSocketBroker(self.socket_path)
+        self.assertTrue(client.available())
+        self.stop.set()
+        self.thread.join(3.0)
+        self.server.close()
+        self.socket_path.unlink(missing_ok=True)
+        self.assertFalse(client.available())
+        self.assertFalse(client.validate("trello", "api_key", SECRET))
+        self.assertFalse(client.commit("trello", "api_key", SECRET))
+
+    def test_the_client_talks_to_the_real_socket(self) -> None:
+        from assistant.scotty_business.credential_intake import UnixSocketBroker
+
+        client = UnixSocketBroker(self.socket_path)
+        # The runtime account may only ask status; this test process is the
+        # owner, so a validate succeeds here and proves the wire format matches.
+        self.assertTrue(client.validate("trello", "api_key", SECRET))
+
+    def test_a_restarted_broker_keeps_credentials_but_drops_windows(self) -> None:
+        opened = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
+        self.call(
+            {
+                "op": "commit",
+                "provider": "trello",
+                "credential_class": "api_key",
+                "window": opened["window"],
+                "material": SECRET,
+            }
+        )
+        stale = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
+
+        self.stop.set()
+        self.thread.join(3.0)
+        self.server.close()
+        self.server = bind_socket(self.socket_path, group=os.getgid())
+        self.stop = threading.Event()
+        self.thread = threading.Thread(
+            target=serve_forever,
+            args=(Broker(self.store), self.server),
+            kwargs={"should_stop": self.stop.is_set},
+            daemon=True,
+        )
+        self.thread.start()
+
+        self.assertTrue(
+            self.call({"op": "status", "provider": "trello", "credential_class": "api_key"})["ok"]
+        )
+        replayed = self.call(
+            {
+                "op": "commit",
+                "provider": "trello",
+                "credential_class": "api_key",
+                "window": stale["window"],
+                "material": OTHER,
+            }
+        )
+        self.assertEqual(replayed, {"ok": False, "state": "no open window"})
+
+    def test_a_symlinked_socket_path_is_refused(self) -> None:
+        target = self.root / "elsewhere.sock"
+        link = self.root / "link.sock"
+        link.symlink_to(target)
+        with self.assertRaises(BrokerError):
+            bind_socket(link)
+
+
+class RuntimeBrokerStatusTests(unittest.TestCase):
+    """Guided setup reports what the broker holds, never what it stores."""
+
+    def test_an_unavailable_broker_reports_unavailable_for_every_provider(self) -> None:
+        import synthetic  # noqa: F401 - shared synthetic identifiers
+        from test_provider_connection import runtime
+
+        from assistant.scotty_business.runtime import BROKER_CREDENTIALS
+
+        with runtime(DISCORD_BOT_TOKEN="synthetic-discord") as live:
+            status = live.credential_store_status()
+        self.assertEqual(set(status), set(BROKER_CREDENTIALS))
+        self.assertEqual(set(status.values()), {"unavailable"})
+
+    def test_google_is_never_asked_of_the_broker(self) -> None:
+        from assistant.scotty_business.runtime import BROKER_CREDENTIALS
+
+        self.assertNotIn("google_workspace", BROKER_CREDENTIALS)
+        self.assertNotIn("discord", BROKER_CREDENTIALS)
+
+    def test_the_status_reply_carries_no_material(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-broker-status-") as directory:
+            root = Path(directory)
+            store = CredentialStore(root / "credentials.json")
+            broker = Broker(store)
+            opened = broker.handle(
+                ROOT, {"op": "open", "provider": "rentcast", "credential_class": "api_key"}
+            )
+            broker.handle(
+                ROOT,
+                {
+                    "op": "commit",
+                    "provider": "rentcast",
+                    "credential_class": "api_key",
+                    "window": opened["window"],
+                    "material": SECRET,
+                },
+            )
+            reply = broker.handle(
+                RUNTIME, {"op": "status", "provider": "rentcast", "credential_class": "api_key"}
+            )
+            self.assertEqual(reply, {"ok": True, "state": "credential present"})
+            self.assertNotIn(SECRET, json.dumps(reply))
+
+
+class PackagedArtefactTests(unittest.TestCase):
+    """The installed executable, run as a real process against a real socket."""
+
+    def test_the_broker_executable_refuses_to_run_unprivileged(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "scotty-credential-broker"],
+            cwd=Path.cwd(),
+            env={"PATH": "/usr/bin:/bin", "SCOTTY_TEST_EUID": "1000"},
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if os.geteuid() == 0:
+            # Running as root here, so the guard cannot trigger; the import
+            # path is still exercised below.
+            self.skipTest("this process is root")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must run as root", result.stderr)
+
+    def test_the_packaged_module_serves_a_real_client(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-broker-pkg-") as directory:
+            root = Path(directory)
+            staged = root / "plugins" / "scotty_broker"
+            staged.mkdir(parents=True)
+            for name in ("__init__.py", "broker.py"):
+                (staged / name).write_bytes(Path("assistant/scotty_broker", name).read_bytes())
+            socket_path = root / "broker.sock"
+            store_path = root / "credentials.json"
+            script = (
+                "import sys, threading, time\n"
+                f"sys.path.insert(0, {str(root / 'plugins')!r})\n"
+                "from scotty_broker.broker import (Broker, CredentialStore,"
+                " bind_socket, serve_forever)\n"
+                f"server = bind_socket({str(socket_path)!r}, group={os.getgid()})\n"
+                f"serve_forever(Broker(CredentialStore({str(store_path)!r})), server)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.addCleanup(process.kill)
+            deadline = time.monotonic() + 10
+            while not socket_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(socket_path.exists(), "the staged broker never bound its socket")
+
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(str(socket_path))
+            with client:
+                client.sendall(
+                    json.dumps(
+                        {"op": "status", "provider": "trello", "credential_class": "api_key"}
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                client.shutdown(socket.SHUT_WR)
+                reply = json.loads(client.recv(4096).decode("utf-8"))
+            self.assertEqual(reply, {"ok": False, "state": "credential absent"})
+
+    def test_the_broker_is_never_staged_into_a_client_profile(self) -> None:
+        installer = Path("install.sh").read_text(encoding="utf-8")
+        self.assertIn("readonly BROKER_DIR=/srv/Scotty/data/plugins/scotty_broker", installer)
+        self.assertIn("scotty-credential-broker.service", installer)
+        self.assertIn("install_broker_file", installer)
+        self.assertIn("-o root -g root -m 0600", installer)
+        self.assertNotIn('install_broker_file "$broker_file" "${PROFILES_DIR}', installer)
+        self.assertIn("a client profile must never carry the broker", installer)
+
+    def test_the_unit_keeps_the_broker_bounded(self) -> None:
+        unit = Path("broker/scotty-credential-broker.service").read_text(encoding="utf-8")
+        for directive in (
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "ProtectHome=true",
+            "RestrictAddressFamilies=AF_UNIX",
+            "ReadWritePaths=/run/scotty /var/lib/scotty",
+            "StateDirectoryMode=0700",
+        ):
+            with self.subTest(directive=directive):
+                self.assertIn(directive, unit)
+        self.assertNotIn("PrivateNetwork=false", unit)
+
+    def test_the_container_mounts_only_the_broker_runtime_directory(self) -> None:
+        compose = Path("compose.yaml").read_text(encoding="utf-8")
+        self.assertIn("source: /run/scotty", compose)
+        self.assertIn("target: /run/scotty", compose)
+        # The store itself is never mounted anywhere.
+        self.assertNotIn("/var/lib/scotty", compose)
+        self.assertEqual(compose.count("create_host_path: false"), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -187,21 +187,19 @@ class UnixSocketBroker:
         except OSError:
             return False
 
-    def _call(self, operation: str, provider: str, credential_class: str, material: str) -> bool:
+    def _call(
+        self, operation: str, provider: str, credential_class: str, material: str | None
+    ) -> bool:
         if not self.available():
             return False
-        request = (
-            json.dumps(
-                {
-                    "op": operation,
-                    "provider": provider,
-                    "credential_class": credential_class,
-                    "material": material,
-                },
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
+        frame: dict[str, object] = {
+            "op": operation,
+            "provider": provider,
+            "credential_class": credential_class,
+        }
+        if material is not None:
+            frame["material"] = material
+        request = json.dumps(frame, separators=(",", ":")) + "\n"
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(self.timeout)
@@ -222,6 +220,11 @@ class UnixSocketBroker:
 
     def commit(self, provider: str, credential_class: str, material: str) -> bool:
         return self._call("commit", provider, credential_class, material)
+
+    def status(self, provider: str, credential_class: str) -> bool:
+        """Whether the broker holds this credential. Never returns the value."""
+
+        return self._call("status", provider, credential_class, None)
 
 
 class SourceMessageDeleter(Protocol):
