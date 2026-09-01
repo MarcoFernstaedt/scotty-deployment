@@ -102,6 +102,7 @@ readonly -a PLUGIN_FILES=(
   "setup.py"
   "setup_flow.py"
   "wizard.py"
+  "workflows.py"
   "adapters/__init__.py"
   "adapters/discord.py"
   "adapters/ghl.py"

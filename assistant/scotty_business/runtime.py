@@ -75,6 +75,7 @@ from .setup_flow import (
     first_unfinished,
     setup_progress,
 )
+from .workflows import WorkflowState, WorkflowStore, parse_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +481,7 @@ class Runtime:
         self.reminders.initialize()
         self.setup_staging = SetupStagingStore(state_dir / "setup-staging.json")
         self.personas = PersonaStore(state_dir / "personas.json")
+        self.workflows = WorkflowStore(state_dir / "workflows.json")
         self.property_effects = EffectLog(state_dir / "property-effects.db")
         self.property_effects.initialize()
         self.property_cards: PropertyCardEngine | None = (
@@ -634,6 +636,34 @@ class Runtime:
             ).as_json()
         raise ValueError("property-card operation is not permitted")
 
+    def _workflow(self, principal: Principal, args: Mapping[str, object]) -> object:
+        """Build, review, and run this user's own workflows. Only their own."""
+
+        action = _text(args, "workflow_action", optional=True) or "list"
+        owner = principal.role
+        if action == "list":
+            return [item.preview() for item in self.workflows.list(owner)]
+        if action == "save":
+            workflow = parse_workflow(_object(args, "definition"), owner=owner)
+            saved = self.workflows.save(workflow)
+            return {"workflow_id": saved.workflow_id, **saved.preview()}
+        workflow_id = _text(args, "workflow_id")
+        if action in {"get", "preview"}:
+            return self.workflows.get(workflow_id, owner).preview()
+        if action == "revise":
+            revision = parse_workflow(_object(args, "definition"), owner=owner)
+            revised = self.workflows.revise(workflow_id, owner, revision)
+            return {"workflow_id": revised.workflow_id, **revised.preview()}
+        states = {
+            "activate": WorkflowState.ACTIVE,
+            "pause": WorkflowState.PAUSED,
+            "retire": WorkflowState.RETIRED,
+        }
+        if action not in states:
+            raise ValueError("workflow action is not permitted")
+        moved = self.workflows.transition(workflow_id, owner, states[action])
+        return {"workflow_id": moved.workflow_id, **moved.preview()}
+
     def actor_connection_status(self, principal: Principal) -> dict[str, bool]:
         """What this exact user is connected to, not what the deployment has."""
 
@@ -744,6 +774,8 @@ class Runtime:
             return self._persona(principal, args)
         if operation == "property_card":
             return self._property_card(principal, args)
+        if operation == "workflow":
+            return self._workflow(principal, args)
         if operation == "provider_setup":
             return self._provider_setup(principal, args)
         if operation == "discord":
