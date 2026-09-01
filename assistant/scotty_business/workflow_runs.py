@@ -41,6 +41,14 @@ from typing import NamedTuple
 from .policy import Principal, Role
 from .workflows import Workflow
 
+#: What actually delivers a trigger, and therefore what a definition may name.
+#:
+#: `manual` is somebody asking; `schedule` is the supervision pass firing a
+#: window. Held here beside the code that fires them, and asserted equal to the
+#: schema's own set, so a trigger kind cannot be advertised without something
+#: to deliver it.
+DELIVERABLE_TRIGGERS = frozenset({"manual", "schedule"})
+
 #: How long a run may take before it stops rather than carrying on. A workflow
 #: still going a day after its trigger is not working, and the effects it would
 #: produce are no longer the ones anybody asked for.
@@ -175,6 +183,9 @@ class Run:
     attempts_allowed: int
     stop_rule: str
     reason: str = ""
+    #: Where this run sits in the ledger's own order. Paging continues from it,
+    #: so a page of runs that cannot move does not hide the ones that can.
+    cursor: str = ""
 
     def preview(self) -> dict[str, object]:
         return {
@@ -336,6 +347,7 @@ class RunLedger:
             attempts_allowed=int(row["attempts_allowed"]),
             stop_rule=str(row["stop_rule"]),
             reason=str(row["reason"]),
+            cursor=f"{row['started_at']}|{row['run_id']}",
         )
 
     def get(self, run_id: str, owner: Role) -> Run:
@@ -361,29 +373,93 @@ class RunLedger:
         finally:
             connection.close()
 
-    def open_runs(self, owner: Role, *, limit: int = 50) -> tuple[Run, ...]:
-        """Runs that still have somewhere to go, oldest first.
+    def open_runs(self, owner: Role, *, after: str = "", limit: int = 50) -> tuple[Run, ...]:
+        """Runs that still have somewhere to go, oldest first, one page at a time.
 
-        Separate from `list` because that one is a recent-activity view: a run
-        stuck behind twenty-five newer ones would never be carried forward by a
-        pass that only looked at the newest page.
+        `after` is the cursor from the last run of the previous page, so a pass
+        walks the whole ledger rather than asking for the oldest fifty forever.
+        Without it, fifty runs that cannot move are fifty runs returned every
+        time, and the fifty-first -- which could have run -- is never looked at.
         """
 
+        bounded = max(1, min(limit, 200))
         connection = self._connect()
         try:
-            rows = connection.execute(
-                """SELECT * FROM runs WHERE owner = ? AND state IN (?, ?)
-                   ORDER BY started_at LIMIT ?""",
-                (
-                    owner.value,
-                    RunState.PENDING.value,
-                    RunState.RUNNING.value,
-                    max(1, min(limit, 200)),
-                ),
-            ).fetchall()
+            if after:
+                started, _, run_id = after.partition("|")
+                rows = connection.execute(
+                    """SELECT * FROM runs WHERE owner = ? AND state IN (?, ?)
+                       AND (started_at > ? OR (started_at = ? AND run_id > ?))
+                       ORDER BY started_at, run_id LIMIT ?""",
+                    (
+                        owner.value,
+                        RunState.PENDING.value,
+                        RunState.RUNNING.value,
+                        started,
+                        started,
+                        run_id,
+                        bounded,
+                    ),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM runs WHERE owner = ? AND state IN (?, ?)
+                       ORDER BY started_at, run_id LIMIT ?""",
+                    (owner.value, RunState.PENDING.value, RunState.RUNNING.value, bounded),
+                ).fetchall()
             return tuple(self._run(connection, row) for row in rows)
         finally:
             connection.close()
+
+    # -- approvals a run is waiting on -----------------------------------
+
+    def awaiting(self, approval_id: str) -> tuple[str, int] | None:
+        """The run and step waiting on that exact approval, if one is.
+
+        This is the link that was missing. A consequence step raised a
+        proposal, somebody approved it, the effect happened -- and nothing
+        could find its way back to the run, so the work was done and the
+        workflow never knew.
+        """
+
+        if not approval_id:
+            return None
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT run_id, step_index FROM run_steps
+                   WHERE approval_id = ? AND state = ?""",
+                (approval_id, StepState.AWAITING_APPROVAL.value),
+            ).fetchone()
+            return None if row is None else (str(row["run_id"]), int(row["step_index"]))
+        finally:
+            connection.close()
+
+    def settle_approval(
+        self, approval_id: str, outcome: StepState, *, detail: str = ""
+    ) -> str | None:
+        """Record what became of an approved step, and let its run carry on.
+
+        Returns the run it belonged to, or nothing when no run is waiting on
+        that approval -- which is the answer for an approval that was never a
+        workflow's, and for one that has already been settled.
+        """
+
+        if outcome not in {StepState.DONE, StepState.FAILED, StepState.UNKNOWN}:
+            raise RunError("an approved step ends done, failed, or unknown")
+        found = self.awaiting(approval_id)
+        if found is None:
+            return None
+        run_id, index = found
+        self.record(run_id, index, outcome, detail=detail)
+        if outcome is StepState.DONE:
+            # Back to pending rather than straight to succeeded: the run may
+            # have more steps, and the pass that carries it forward decides.
+            self._set_state(run_id, RunState.PENDING, "")
+        elif outcome is StepState.FAILED:
+            self._set_state(run_id, RunState.FAILED, f"step {index} was not carried out")
+        # `record` already moved the run to unknown for an unknown outcome.
+        return run_id
 
     # -- starting --------------------------------------------------------
 
@@ -865,6 +941,7 @@ __all__ = [
     "RunState",
     "RunStep",
     "Runner",
+    "DELIVERABLE_TRIGGERS",
     "due_trigger",
     "StepOutcome",
     "StepState",

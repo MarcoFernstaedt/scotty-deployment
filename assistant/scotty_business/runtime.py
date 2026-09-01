@@ -28,7 +28,7 @@ from .adapters import (
     TrelloAdapter,
 )
 from .adapters.discord_admin import DiscordAdminAdapter
-from .approvals import ApprovalError, ApprovalStore, Proposal
+from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
 from .backup import backup_state, restorable, rollback_guidance, verify_backup
 from .brokered_transport import BrokeredTransport
 from .budgets import BudgetLedger, BudgetPolicy
@@ -89,6 +89,7 @@ from .setup_flow import (
 )
 from .supervisor import ConsumerLease, HealthState, IncidentLog, Supervisor
 from .workflow_runs import (
+    Run,
     RunError,
     RunLedger,
     Runner,
@@ -105,6 +106,12 @@ from .workflows import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: How much of the run ledger one supervision pass walks, and in what pages.
+#: Bounded so a very large ledger cannot make one pass take forever, and paged
+#: so a page of blocked runs cannot hide the ones behind it.
+OPEN_RUN_PAGE = 50
+MAX_RUNS_PER_PASS = 500
 
 #: Exactly the property-card operations this tool serves. An operation absent
 #: from here is refused for being absent, whatever else is or is not connected.
@@ -1058,13 +1065,46 @@ class Runtime:
                     continue
                 started += 1
                 self._advance_quietly(run.run_id, workflow, principal)
-            for run in self.workflow_runs.open_runs(role):
+            for run in self._open_runs(role):
                 try:
                     workflow = self.workflows.get(run.workflow_id, role)
                 except WorkflowError:
                     continue
                 advanced += int(self._advance_quietly(run.run_id, workflow, principal))
         return {"started": started, "advanced": advanced}
+
+    def _open_runs(self, role: Role) -> list[Run]:
+        """Every run with somewhere to go, walked a page at a time.
+
+        Asking for the oldest page each pass would mean a page of runs that
+        cannot move hides every run behind it forever. The cursor is what makes
+        this a walk rather than a repeated look at the same fifty.
+        """
+
+        collected: list[Run] = []
+        cursor = ""
+        while len(collected) < MAX_RUNS_PER_PASS:
+            page = self.workflow_runs.open_runs(role, after=cursor, limit=OPEN_RUN_PAGE)
+            if not page:
+                break
+            collected.extend(page)
+            cursor = page[-1].cursor
+        return collected[:MAX_RUNS_PER_PASS]
+
+    def settle_workflow_approval(
+        self, approval_id: str, outcome: StepState, *, detail: str = ""
+    ) -> str | None:
+        """Tell the run what became of the step it was waiting on.
+
+        Without this the link was missing entirely: a consequence step raised a
+        proposal, somebody approved it, the effect happened, and the run stayed
+        parked forever because nothing carried the answer back.
+        """
+
+        try:
+            return self.workflow_runs.settle_approval(approval_id, outcome, detail=detail)
+        except RunError:
+            return None
 
     def _advance_quietly(self, run_id: str, workflow: Workflow, principal: Principal) -> bool:
         """Carry one run forward, letting a failure stay in the ledger."""
@@ -1622,7 +1662,27 @@ class Runtime:
             )
         else:
             raise ValueError("approval action is not permitted")
+        # A proposal a workflow raised is a step some run is parked on. Carrying
+        # the outcome back is what lets that run finish; without it the effect
+        # happened and the workflow waited forever.
+        self._settle_waiting_step(result)
         return _proposal_json(result)
+
+    def _settle_waiting_step(self, proposal: Proposal) -> None:
+        """Tell whatever run raised this proposal what became of it."""
+
+        outcome = {
+            ProposalStatus.VERIFIED: StepState.DONE,
+            ProposalStatus.DENIED: StepState.FAILED,
+            ProposalStatus.FAILED: StepState.FAILED,
+            ProposalStatus.EXPIRED: StepState.FAILED,
+            ProposalStatus.UNKNOWN: StepState.UNKNOWN,
+        }.get(proposal.status)
+        if outcome is None:
+            # Still proposed or approved but not executed: the run is still
+            # waiting, and correctly so.
+            return
+        self.settle_workflow_approval(proposal.proposal_id, outcome, detail=proposal.status.value)
 
     def handle_reminder(self, principal: Principal, args: Mapping[str, object]) -> object:
         action = _text(args, "action")

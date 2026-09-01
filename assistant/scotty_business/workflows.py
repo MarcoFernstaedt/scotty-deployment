@@ -128,7 +128,14 @@ MAX_LIMIT = 1_000
 MAX_RETENTION_DAYS = 3_650
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 '\-.,()]{0,79}")
-_TRIGGER_KINDS = frozenset({"manual", "schedule", "new_lead", "card_moved", "message"})
+#: Exactly the triggers something in this deployment actually delivers.
+#:
+#: `manual` is a person or a tool call asking for a run; `schedule` is the
+#: supervision pass firing a window. `new_lead` and `card_moved` were also
+#: accepted here, and nothing anywhere delivered them -- a workflow written
+#: against one was validated, saved, activated, and then simply never ran.
+#: They come back when there is ingress for them, not before.
+_TRIGGER_KINDS = frozenset({"manual", "schedule"})
 
 
 def _text(value: object, label: str, *, limit: int = MAX_TEXT_CHARS) -> str:

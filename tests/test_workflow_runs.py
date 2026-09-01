@@ -38,7 +38,7 @@ def definition(*, steps: list[dict[str, object]], approval: str = "routine") -> 
     return {
         "name": "New lead intake",
         "purpose": "open a card and remind me when a lead arrives",
-        "trigger": {"kind": "new_lead"},
+        "trigger": {"kind": "manual"},
         "steps": steps,
         "limits": {"cards_per_run": 5, "runs_per_day": 20, "recipients": 0},
         "approval_class": approval,
