@@ -129,7 +129,7 @@ class ScottyService:
         discord_admin: DiscordAdminAdapter | None = None,
         google_workspace: GoogleWorkspacePort
         | None
-        | Callable[[Role], GoogleWorkspacePort | None] = None,
+        | Callable[[Principal], GoogleWorkspacePort | None] = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
@@ -167,7 +167,9 @@ class ScottyService:
 
         workspace = self.google_workspace
         if callable(workspace):
-            return workspace(actor.role)
+            # The whole actor, not just their role: the adapter it builds
+            # carries a token minted against this person's own citation.
+            return workspace(actor)
         return workspace
 
     def _now(self) -> datetime:

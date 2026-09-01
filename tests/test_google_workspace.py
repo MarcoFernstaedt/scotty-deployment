@@ -450,14 +450,13 @@ class GoogleAdapterPayloadTests(AdapterHarness):
 
 class GoogleTokenSafetyTests(unittest.TestCase):
     def test_token_store_is_owner_only_account_bound_and_never_renders_secrets(self) -> None:
-        from assistant.scotty_business.google_oauth import GoogleTokenStore, OAuthToken
+        from assistant.scotty_business.google_oauth import AccountBinding, GoogleTokenStore
 
         with tempfile.TemporaryDirectory(prefix="scotty-google-token-") as directory:
             path = Path(directory) / "google-oauth.json"
             store = GoogleTokenStore(path, owner_uid=os.getuid(), owner_gid=os.getgid())
-            token = OAuthToken(
+            token = AccountBinding(
                 access_token="synthetic-access-secret",
-                refresh_token="synthetic-refresh-secret",
                 expires_at=4102444800,
                 scopes=tuple(GOOGLE_SCOPE["oauth_scopes"]),
                 account_email=GOOGLE_SCOPE["account_email"],
@@ -756,7 +755,7 @@ class GoogleScopeNormalizationTests(unittest.TestCase):
         self.assertNotEqual(canonical_scopes(GOOGLE_OAUTH_SCOPES), narrowed)
 
     def test_a_stored_token_in_the_expanded_form_still_reads_as_ready(self) -> None:
-        from assistant.scotty_business.google_oauth import GoogleTokenStore, OAuthToken
+        from assistant.scotty_business.google_oauth import AccountBinding, GoogleTokenStore
 
         expanded = tuple(
             "https://www.googleapis.com/auth/userinfo.email" if scope == "email" else scope
@@ -766,14 +765,11 @@ class GoogleScopeNormalizationTests(unittest.TestCase):
             path = Path(directory) / "google-oauth.json"
             store = GoogleTokenStore(path, owner_uid=os.getuid(), owner_gid=os.getgid())
             store.write(
-                OAuthToken(
+                AccountBinding(
                     access_token="synthetic-access",
-                    refresh_token="synthetic-refresh",
                     expires_at=4102444800,
                     scopes=expanded,
                     account_email=GOOGLE_SCOPE["account_email"],
-                    client_id="synthetic-client-id",
-                    client_secret="synthetic-client-secret",
                 )
             )
             self.assertTrue(store.ready(GOOGLE_OAUTH_SCOPES, GOOGLE_SCOPE["account_email"]))
@@ -1262,53 +1258,54 @@ class ReadbackNormalizationTests(unittest.TestCase):
 
 
 class GoogleTokenRefreshTests(unittest.TestCase):
-    """A one-hour access token must refresh without a second browser consent."""
+    """A one-hour access token must renew without a second browser consent.
+
+    It renews by asking the privileged side, not by refreshing here: the
+    refresh token and the client secret that would do it are held by the
+    root-owned broker and are not in this process at all. So what these check
+    is the container half -- that a live token is reused, that a stale one is
+    replaced from what the broker minted, and that every failure leaves the
+    account binding exactly as it was.
+    """
 
     def store(self, directory: str, *, expires_at: int):
-        from assistant.scotty_business.google_oauth import GoogleTokenStore, OAuthToken
+        from assistant.scotty_business.google_oauth import AccountBinding, GoogleTokenStore
 
         path = Path(directory) / "google-oauth.json"
         store = GoogleTokenStore(path, owner_uid=os.getuid(), owner_gid=os.getgid())
         store.write(
-            OAuthToken(
+            AccountBinding(
                 access_token="synthetic-access-old",
-                refresh_token="synthetic-refresh-secret",
                 expires_at=expires_at,
                 scopes=tuple(GOOGLE_SCOPE["oauth_scopes"]),
                 account_email=GOOGLE_SCOPE["account_email"],
-                client_id="synthetic-client-id",
-                client_secret="synthetic-client-secret",
             )
         )
         return store
 
-    def test_a_valid_access_token_is_reused_without_any_network_call(self) -> None:
+    def test_a_valid_access_token_is_reused_without_asking_for_another(self) -> None:
         from assistant.scotty_business.google_oauth import ensure_access_token
 
-        calls: list[object] = []
+        minted: list[object] = []
         with tempfile.TemporaryDirectory(prefix="scotty-google-refresh-") as directory:
             store = self.store(directory, expires_at=4102444800)
             token = ensure_access_token(
                 store,
                 tuple(GOOGLE_SCOPE["oauth_scopes"]),
                 GOOGLE_SCOPE["account_email"],
-                exchange=lambda **kwargs: calls.append(kwargs) or {},
+                mint=lambda scopes: minted.append(scopes) or ("unused", 0),
             )
         self.assertEqual(token, "synthetic-access-old")
-        self.assertEqual(calls, [])
+        self.assertEqual(minted, [])
 
-    def test_an_expired_access_token_refreshes_and_is_persisted_owner_only(self) -> None:
+    def test_a_stale_token_is_replaced_by_one_the_broker_minted(self) -> None:
         from assistant.scotty_business.google_oauth import ensure_access_token
 
-        seen: list[dict[str, object]] = []
+        asked: list[tuple[str, ...]] = []
 
-        def exchange(**kwargs: object) -> dict[str, object]:
-            seen.append(kwargs)
-            return {
-                "access_token": "synthetic-access-new",
-                "expires_in": 3600,
-                "scope": " ".join(GOOGLE_SCOPE["oauth_scopes"]),
-            }
+        def mint(scopes: tuple[str, ...]) -> tuple[str, int]:
+            asked.append(scopes)
+            return "synthetic-access-new", 4102444800
 
         with tempfile.TemporaryDirectory(prefix="scotty-google-refresh-") as directory:
             store = self.store(directory, expires_at=1)
@@ -1316,32 +1313,38 @@ class GoogleTokenRefreshTests(unittest.TestCase):
                 store,
                 tuple(GOOGLE_SCOPE["oauth_scopes"]),
                 GOOGLE_SCOPE["account_email"],
-                exchange=exchange,
+                mint=mint,
             )
             stored = store.read()
             self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
+            # The token is here, and nothing that could mint another is.
+            written = store.path.read_text(encoding="utf-8")
+            self.assertNotIn("refresh_token", written)
+            self.assertNotIn("client_secret", written)
 
         self.assertEqual(token, "synthetic-access-new")
         self.assertEqual(stored.access_token, "synthetic-access-new")
-        self.assertEqual(stored.refresh_token, "synthetic-refresh-secret")
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(asked, [tuple(GOOGLE_SCOPE["oauth_scopes"])])
         self.assertNotIn("synthetic-access-new", repr(stored))
 
-    def test_a_failed_or_out_of_scope_refresh_fails_closed_and_keeps_prior_state(self) -> None:
+    def test_a_mint_that_fails_or_comes_back_short_keeps_the_prior_binding(self) -> None:
         from assistant.scotty_business.google_oauth import GoogleOAuthError, ensure_access_token
 
-        def failing(**kwargs: object) -> dict[str, object]:
-            raise GoogleOAuthError("Google OAuth refresh failed")
+        def failing(scopes):
+            raise GoogleOAuthError("the privileged side would not mint a Google token")
 
-        def narrowed(**kwargs: object) -> dict[str, object]:
-            return {"access_token": "narrow", "expires_in": 3600, "scope": "openid email"}
+        def malformed(scopes):
+            return ("", 4102444800)
 
-        def incomplete(**kwargs: object) -> dict[str, object]:
-            return {"expires_in": 3600}
+        def expired(scopes):
+            return ("synthetic-access-new", 1)
 
-        for exchange in (failing, narrowed, incomplete):
+        def wrong_shape(scopes):
+            return "synthetic-access-new"
+
+        for mint in (failing, malformed, expired, wrong_shape):
             with (
-                self.subTest(exchange=exchange.__name__),
+                self.subTest(mint=mint.__name__),
                 tempfile.TemporaryDirectory(prefix="scotty-google-refresh-") as directory,
             ):
                 store = self.store(directory, expires_at=1)
@@ -1350,13 +1353,14 @@ class GoogleTokenRefreshTests(unittest.TestCase):
                         store,
                         tuple(GOOGLE_SCOPE["oauth_scopes"]),
                         GOOGLE_SCOPE["account_email"],
-                        exchange=exchange,
+                        mint=mint,
                     )
                 self.assertEqual(store.read().access_token, "synthetic-access-old")
 
-    def test_a_token_bound_to_another_account_never_refreshes(self) -> None:
+    def test_a_binding_for_another_account_never_asks_for_a_token(self) -> None:
         from assistant.scotty_business.google_oauth import GoogleOAuthError, ensure_access_token
 
+        minted: list[object] = []
         with tempfile.TemporaryDirectory(prefix="scotty-google-refresh-") as directory:
             store = self.store(directory, expires_at=1)
             with self.assertRaises(GoogleOAuthError):
@@ -1364,8 +1368,9 @@ class GoogleTokenRefreshTests(unittest.TestCase):
                     store,
                     tuple(GOOGLE_SCOPE["oauth_scopes"]),
                     "someone-else@example.invalid",
-                    exchange=lambda **kwargs: {},
+                    mint=lambda scopes: minted.append(scopes) or ("x", 4102444800),
                 )
+        self.assertEqual(minted, [])
 
     def test_status_reports_expiry_without_revealing_any_secret(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-google-refresh-") as directory:
@@ -1373,7 +1378,9 @@ class GoogleTokenRefreshTests(unittest.TestCase):
             status = store.status()
             self.assertTrue(status["configured"])
             self.assertFalse(status["access_valid"])
-            self.assertTrue(status["refreshable"])
+            # There is no "refreshable" here any more, because this side cannot
+            # answer it: whether consent can be renewed is the broker's to know.
+            self.assertNotIn("refreshable", status)
             rendered = json.dumps(status)
             for secret in (
                 "synthetic-access-old",
@@ -1498,6 +1505,7 @@ class HeadlessConsentTests(unittest.TestCase):
         )
 
         seen: list[dict[str, object]] = []
+        committed: list[tuple[str, ...]] = []
 
         def exchange(**kwargs: object) -> dict[str, object]:
             seen.append(kwargs)
@@ -1522,9 +1530,25 @@ class HeadlessConsentTests(unittest.TestCase):
                 owner_uid=os.getuid(),
                 exchange=exchange,
                 verify_account=lambda token: "scotty.synthetic@example.invalid",
+                commit=lambda *material: committed.append(material),
             )
             self.assertEqual(account, "scotty.synthetic@example.invalid")
             self.assertTrue(store.ready(GOOGLE_OAUTH_SCOPES, "scotty.synthetic@example.invalid"))
+            # The long-lived half went to the privileged side, and the file the
+            # runtime can read has neither it nor the client secret in it.
+            self.assertEqual(
+                committed,
+                [
+                    (
+                        "synthetic-client-id.apps.googleusercontent.com",
+                        "synthetic-client-secret-0001",
+                        "synthetic-refresh",
+                    )
+                ],
+            )
+            written = store.path.read_text(encoding="utf-8")
+            self.assertNotIn("synthetic-refresh", written)
+            self.assertNotIn("synthetic-client-secret-0001", written)
         fields = seen[0]["fields"]
         self.assertEqual(fields["code"], "synthetic-code")
         self.assertEqual(fields["code_verifier"], request.verifier)
@@ -1575,6 +1599,7 @@ class HeadlessConsentTests(unittest.TestCase):
                     f"{request.redirect_uri}?state={request.state}&code=expired",
                     owner_uid=os.getuid(),
                     exchange=rejecting,
+                    commit=lambda *_material: None,
                 )
             self.assertFalse((root / "token.json").exists())
 
@@ -1607,6 +1632,7 @@ class HeadlessConsentTests(unittest.TestCase):
                     f"{request.redirect_uri}?state={request.state}&code=synthetic-code",
                     owner_uid=os.getuid(),
                     exchange=narrowed,
+                    commit=lambda *_material: None,
                 )
             self.assertFalse((root / "token.json").exists())
 
@@ -1787,8 +1813,8 @@ class HeadlessConsentTests(unittest.TestCase):
 
     def test_a_stale_prompt_is_cleared_once_the_account_is_connected(self) -> None:
         from assistant.scotty_business.google_oauth import (
+            AccountBinding,
             GoogleTokenStore,
-            OAuthToken,
             publish_consent_prompt,
             read_consent_prompt,
         )
@@ -1800,14 +1826,11 @@ class HeadlessConsentTests(unittest.TestCase):
             publish_consent_prompt(prompt_path, self.request(root), owner_uid=os.getuid())
             token_path = root / "token.json"
             GoogleTokenStore(token_path, owner_uid=os.getuid(), owner_gid=os.getgid()).write(
-                OAuthToken(
+                AccountBinding(
                     access_token="synthetic-access",
-                    refresh_token="synthetic-refresh",
                     expires_at=int(time.time()) + 3600,
                     scopes=GOOGLE_OAUTH_SCOPES,
                     account_email="scotty.synthetic@example.invalid",
-                    client_id="synthetic-client-id.apps.googleusercontent.com",
-                    client_secret="synthetic-client-secret-0001",
                 )
             )
             connect_google_workspace(
@@ -1916,7 +1939,11 @@ class PerUserWorkspaceAuthorityTests(unittest.TestCase):
         from assistant.scotty_business.policy import Role
 
         recorders = {role: Recorder() for role in (Role.MAIN_OPERATOR, Role.EMPLOYEE)}
-        runtime.google_adapters = dict(recorders)
+        # The runtime builds one adapter per person now, so what is replaced is
+        # the builder rather than a per-role dictionary. Handing back the
+        # recorder for the principal's own role is the whole point: if the
+        # runtime ever asked for somebody else's, these tests would see it.
+        runtime.google_workspace_for = lambda principal: recorders.get(principal.role)
         runtime.google_connected = dict.fromkeys(recorders, True)
         runtime.connected["google_workspace"] = True
         return recorders
@@ -1954,8 +1981,9 @@ class PerUserWorkspaceAuthorityTests(unittest.TestCase):
 
         with self.runtime() as runtime:
             recorders = self.connect(runtime)
-            # The employee has not completed consent, so they have no adapter.
-            del runtime.google_adapters[Role.EMPLOYEE]
+            # The employee has not completed consent, so no adapter is built
+            # for them at all -- not one borrowed from the other user.
+            del recorders[Role.EMPLOYEE]
             runtime.google_connected[Role.EMPLOYEE] = False
             with self.assertRaises(ProviderNotConnected):
                 runtime.handle_read(

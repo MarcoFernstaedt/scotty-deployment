@@ -34,7 +34,7 @@ import re
 import secrets
 import socket
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -322,6 +322,32 @@ class UnixSocketBroker:
             return "unavailable"
         state = reply.get("state")
         return state if isinstance(state, str) else "unavailable"
+
+    def google_token(
+        self, scopes: Sequence[str], *, provenance: Mapping[str, object] | None = None
+    ) -> tuple[str, int] | None:
+        """One short-lived Google access token for whoever wrote the cited message.
+
+        The refresh token and the client secret that mint it are held by the
+        broker and never travel. What comes back is good for about an hour and
+        cannot renew itself, so a copy taken out of this process expires on its
+        own rather than lasting until somebody notices.
+
+        None means the broker did not answer or refused; the caller keeps
+        whatever binding it had rather than treating that as a disconnection.
+        """
+
+        frame: dict[str, object] = {"op": "google_token", "scopes": list(scopes)}
+        if provenance is not None:
+            frame["provenance"] = dict(provenance)
+        reply = self._request(frame)
+        if reply is None or reply.get("ok") is not True:
+            return None
+        access = reply.get("access_token")
+        expires_at = reply.get("expires_at")
+        if type(access) is not str or not access or type(expires_at) is not int:
+            return None
+        return access, expires_at
 
     def execute(
         self,

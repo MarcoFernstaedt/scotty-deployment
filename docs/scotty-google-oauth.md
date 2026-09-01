@@ -77,23 +77,54 @@ Workspace account.
 
 ## Where the tokens live
 
-Consent is personal, so each client user has their own record:
+Consent produces two halves, and they are kept in two places.
+
+**The long-lived half — with root, outside every mount.** The OAuth client id,
+the client secret, and each user's refresh token go to the root-owned
+credential broker's store:
+
+    /var/lib/scotty/credentials.json                          0:0 0600
+
+The client id and secret belong to the deployment and are held once under the
+shared identity. A refresh token is one person's consent and is stored under
+that person, so no lookup from one user's slot reaches the other's. None of it
+is bind-mounted into the runtime container, and no broker operation returns any
+of it — the sweep in `tests/test_google_isolation.py` tries every operation on
+the runtime's own socket and reads every byte that comes back.
+
+**The short-lived half — in the container.** Each client user has their own
+record of who they connected as and the current hour's access token:
 
     /srv/Scotty/data/scotty/google-oauth.main_operator.json   10000:10000 0600
     /srv/Scotty/data/scotty/google-oauth.employee.json        10000:10000 0600
 
-Each holds that user's access token, refresh token, granted scopes, bound
-account, and the client identity needed to refresh. The file name is derived
-from the fixed role slug, never from anything a model or a message can
-influence, and a user with no record of their own is told to connect rather
-than falling through to the other user's. The runtime refuses to read a record
-that is group- or world-readable.
+Each holds the granted scopes, the bound account, and one access token. There
+is no field in that record for a refresh token or a client secret; a record
+written by an earlier version, which did carry them, is refused rather than
+read. The file name is derived from the fixed role slug, never from anything a
+model or a message can influence, and a user with no record of their own is
+told to connect rather than falling through to the other user's. The runtime
+refuses to read a record that is group- or world-readable.
 
-**Refresh.** The access token lasts about an hour and is refreshed in place
-from that file, a couple of minutes before it expires. A refresh never widens
-scope or rebinds the account, and a failed refresh leaves the previous state
-exactly as it was. Consent is a one-time step; expiry alone never means "not
-connected".
+Mode `0600` separates users; it does not separate a plugin, a tool call and a
+maintainer session that all run as the same account. That is why the material
+that outlives the hour is not there.
+
+**What the container can still do with what it holds.** An access token is a
+bearer credential and is good for about an hour. That is the remaining
+exposure, and it is stated rather than implied: a compromise of the runtime
+gets an hour of that user's Workspace, not a grant that outlives every password
+change. Closing the rest means every Google call becoming a declared broker
+operation, which is not done yet.
+
+**Refresh.** A couple of minutes before the access token expires, the runtime
+asks the broker for another, citing the Discord message it is acting on. The
+broker resolves who is asking from that citation, makes the exchange with the
+material it holds, and returns only the new token and its expiry. A refresh
+never widens scope or rebinds the account, and a failure leaves the previous
+binding exactly as it was. If Google rotates the refresh token, the broker
+keeps the new one; the runtime is not involved. Consent is a one-time step;
+expiry alone never means "not connected".
 
 **Revoke and reconnect.** Revoke access from that Google account's own security
 settings, then delete that user's token record and rerun local setup to consent

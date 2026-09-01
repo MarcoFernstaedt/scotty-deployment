@@ -1268,6 +1268,33 @@ def commit_to_broker(
     return tuple(stored)
 
 
+def commit_google_consent(
+    role: Role,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    *,
+    store_path: Path = Path("/var/lib/scotty/credentials.json"),
+    owner_uid: int = 0,
+) -> None:
+    """Put the half of Google consent that outlives the hour into root's store.
+
+    The OAuth client belongs to the deployment, so it is held once under the
+    shared identity. The refresh token is one person's consent and is stored
+    under that person, where no other actor's lookup reaches it.
+
+    Nothing here writes into the container's tree. What the runtime gets later
+    is an access token minted from this, an hour at a time.
+    """
+
+    if os.geteuid() != owner_uid:
+        raise SetupError("only root may commit Google consent to the broker store")
+    store = _broker_store(store_path)
+    store.put("google", "client_id", client_id, "shared")
+    store.put("google", "client_secret", client_secret, "shared")
+    store.put("google", "refresh_token", refresh_token, role.value)
+
+
 def _require_stopped_container() -> None:
     docker = shutil.which("docker")
     if not docker:
@@ -1378,6 +1405,7 @@ def connect_google_workspace(
     output: Callable[[str], None] = print,
     owner_uid: int = 0,
     runtime_uid: int = _RUNTIME_UID,
+    broker_store: Path = Path("/var/lib/scotty/credentials.json"),
 ) -> None:
     """Complete Google consent on a headless server, without a local browser.
 
@@ -1427,6 +1455,17 @@ def connect_google_workspace(
             request,
             hidden_fn("Paste the full redirect URL (hidden): "),
             owner_uid=owner_uid,
+            # The refresh token and the client secret go to root's own store,
+            # never into the container. Setup runs as root, so it writes there
+            # directly rather than talking to the broker over a socket.
+            commit=lambda client_id, client_secret, refresh: commit_google_consent(
+                role,
+                client_id,
+                client_secret,
+                refresh,
+                store_path=broker_store,
+                owner_uid=owner_uid,
+            ),
         )
     except GoogleOAuthError as exc:
         raise SetupError(
@@ -1504,6 +1543,7 @@ __all__ = [
     "discord_allowed_users",
     "ensure_profile_homes",
     "google_prompt_path",
+    "commit_google_consent",
     "google_token_path",
     "hermes_config_mapping",
     "import_google_client",

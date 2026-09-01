@@ -107,6 +107,10 @@ CREDENTIAL_CLASSES: Mapping[str, frozenset[str]] = {
     "ghl": frozenset({"private_token"}),
     "rentcast": frozenset({"api_key"}),
     "discord": frozenset({"bot_token"}),
+    # The OAuth client is the deployment's, held once under "shared". The
+    # refresh token is one person's consent and is stored under that person,
+    # so no lookup reaches from one user's slot into another's.
+    "google": frozenset({"client_id", "client_secret", "refresh_token"}),
 }
 
 #: Operations, and the smallest uid set each one needs.
@@ -119,7 +123,7 @@ ROOT_OPERATIONS = frozenset({"open", "validate", "commit", "revoke", "grant", "a
 
 #: What a worker may ask on its own actor socket. Nothing here writes a
 #: credential, a grant, or an approval.
-ACTOR_OPERATIONS = frozenset({"status", "execute"})
+ACTOR_OPERATIONS = frozenset({"status", "execute", "google_token"})
 OPERATIONS = ROOT_OPERATIONS | ACTOR_OPERATIONS
 
 #: Bounds. A frame past these is refused rather than parsed.
@@ -142,6 +146,7 @@ from .effects import (  # noqa: E402
     EffectLedger,
 )
 from .executor import ExecutionError, Executor  # noqa: E402
+from .google import GoogleTokenError, GoogleTokenMinter  # noqa: E402
 from .grants import Grant, GrantStore  # noqa: E402
 from .operations import APPLICATION_CREDENTIALS, known  # noqa: E402
 from .provenance import ProvenanceError, ProvenanceResolver  # noqa: E402
@@ -383,6 +388,7 @@ class Broker:
         grants: GrantStore | None = None,
         effects: EffectLedger | None = None,
         provenance: ProvenanceResolver | None = None,
+        google: GoogleTokenMinter | None = None,
         actor_uids: Mapping[str, int] | None = None,
     ) -> None:
         self.store = store
@@ -391,6 +397,10 @@ class Broker:
         self.executor = executor
         self.grants = grants
         self.effects = effects
+        # Turns one person's stored consent into an hour-long access token,
+        # here rather than in the container. Absent it, Google is refused
+        # rather than served from material the runtime could hold itself.
+        self.google = google
         # Who is asking, established from Discord rather than from the request.
         # Absent a resolver the socket's own actor stands alone, which is the
         # right answer on a topology that really does give each actor its own
@@ -440,6 +450,7 @@ class Broker:
             handlers: dict[str, Callable[[Mapping[str, Any], str], dict[str, object]]] = {
                 "status": self._status,
                 "execute": self._execute,
+                "google_token": self._google_token,
             }
             if operation == "status" and actor == RUNTIME_ACTOR and "provenance" not in request:
                 # "Does this deployment hold anything for that provider?" is a
@@ -630,6 +641,31 @@ class Broker:
             return {"ok": True, "state": "credential present"}
         # The shared credential exists. Its existing is not permission.
         return {"ok": False, "state": "not authorized"}
+
+    def _google_token(self, request: Mapping[str, Any], actor: str) -> dict[str, object]:
+        """Hand back one short-lived Google access token for this person.
+
+        What does not come back is the point: there is no reply shape here that
+        can carry a refresh token or the client secret, and neither is read
+        anywhere the reply is built. The runtime gets an hour of Google, bound
+        to the scopes it asked for, and has to come back for the next one.
+        """
+
+        if self.google is None:
+            raise BrokerError("Google is not configured")
+        scopes = request.get("scopes")
+        if not isinstance(scopes, list) or not scopes:
+            raise BrokerError("a token request names its scopes")
+        try:
+            minted = self.google.access_token(actor, tuple(scopes))
+        except GoogleTokenError as exc:
+            raise BrokerError(str(exc)) from None
+        return {
+            "ok": True,
+            "state": "token minted",
+            "access_token": minted.access_token,
+            "expires_at": minted.expires_at,
+        }
 
     def _execute(self, request: Mapping[str, Any], actor: str) -> dict[str, object]:
         """Run one declared provider operation as the actor on this socket.

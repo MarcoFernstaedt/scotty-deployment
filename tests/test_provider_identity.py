@@ -237,7 +237,9 @@ class ApprovalActorBindingTests(unittest.TestCase):
                 ghl=unused,
                 rentcast=None,
                 discord=unused,
-                google_workspace=workspaces.get,
+                # Chosen by the whole actor, not by a role handed in from
+                # somewhere: the adapter carries that person's own token.
+                google_workspace=lambda actor: workspaces.get(actor.role),
             ),
             store,
         )

@@ -55,6 +55,7 @@ readonly -a BROKER_FILES=(
   "broker.py"
   "effects.py"
   "executor.py"
+  "google.py"
   "grants.py"
   "operations.py"
   "provenance.py"

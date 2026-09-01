@@ -30,6 +30,11 @@ GOOGLE_USERINFO_URI = "https://openidconnect.googleapis.com/v1/userinfo"
 #: A form POST to a pinned Google endpoint. Injected so tests never use a socket.
 TokenExchange = Callable[..., dict[str, object]]
 
+#: Hands the material that outlives this hour to the privileged side: the OAuth
+#: client id, the client secret, and this person's refresh token. It returns
+#: nothing, and it raises rather than half-succeeding.
+Committer = Callable[[str, str, str], None]
+
 
 #: Refresh this many seconds before the access token actually expires.
 REFRESH_SKEW_SECONDS = 120
@@ -52,30 +57,40 @@ _TOKEN_FIELDS = frozenset(
     {
         "version",
         "access_token",
-        "refresh_token",
         "expires_at",
         "scopes",
         "account_email",
-        "client_id",
-        "client_secret",
     }
 )
 
+#: The version this deployment writes and the only one it will read. A file
+#: from the previous version carries a refresh token and a client secret in the
+#: container's own tree; it is refused rather than upgraded in place, because
+#: reading one is exactly the thing that was moved out.
+TOKEN_VERSION = 3
+
 
 @dataclass(frozen=True, slots=True, repr=False)
-class OAuthToken:
-    """Owner-only OAuth state. Never rendered, logged, or returned to a caller."""
+class AccountBinding:
+    """Which Google account this user connected, and an hour of access to it.
+
+    What this deliberately cannot hold is the refresh token and the client
+    secret. Those now live with the root-owned broker, outside every mount, and
+    the exchange that turns one into an access token happens there. There is no
+    field here to put them in, so no later change puts them back by habit.
+
+    An access token is still a bearer credential and still sits in the
+    container for up to an hour. That is the remaining exposure, and it is
+    written down rather than implied.
+    """
 
     access_token: str
-    refresh_token: str
     expires_at: int
     scopes: tuple[str, ...]
     account_email: str
-    client_id: str = ""
-    client_secret: str = ""
 
     def __repr__(self) -> str:
-        return "OAuthToken(<redacted>)"
+        return "AccountBinding(<redacted>)"
 
     def access_valid(self, *, now: int | None = None) -> bool:
         current = int(time.time()) if now is None else now
@@ -83,7 +98,12 @@ class OAuthToken:
 
 
 class GoogleTokenStore:
-    """Owner-only OAuth token state below the private Scotty data directory."""
+    """Owner-only account binding below the private Scotty data directory.
+
+    Holds the account this person consented as, the scopes they granted, and
+    the current access token. The long-lived material that would let anybody
+    mint a new one is not here and cannot be written here.
+    """
 
     def __init__(self, path: Path, *, owner_uid: int = 10000, owner_gid: int = 10000):
         self.path = path
@@ -93,22 +113,19 @@ class GoogleTokenStore:
     def __repr__(self) -> str:
         return f"GoogleTokenStore(path={self.path!s})"
 
-    def write(self, token: OAuthToken) -> None:
-        if not token.access_token or not token.refresh_token or not token.scopes:
-            raise GoogleOAuthError("Google OAuth token state is incomplete")
+    def write(self, binding: AccountBinding) -> None:
+        if not binding.access_token or not binding.scopes or "@" not in binding.account_email:
+            raise GoogleOAuthError("Google account binding is incomplete")
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():
             raise GoogleOAuthError("Google OAuth token path is unsafe")
         payload = json.dumps(
             {
-                "version": 2,
-                "access_token": token.access_token,
-                "refresh_token": token.refresh_token,
-                "expires_at": token.expires_at,
-                "scopes": list(token.scopes),
-                "account_email": token.account_email,
-                "client_id": token.client_id,
-                "client_secret": token.client_secret,
+                "version": TOKEN_VERSION,
+                "access_token": binding.access_token,
+                "expires_at": binding.expires_at,
+                "scopes": list(binding.scopes),
+                "account_email": binding.account_email,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -133,55 +150,58 @@ class GoogleTokenStore:
             with suppress(OSError):
                 temporary.unlink(missing_ok=True)
 
-    def read(self) -> OAuthToken:
+    def read(self) -> AccountBinding:
         if self.path.is_symlink() or not self.path.is_file():
             raise GoogleOAuthError("Google OAuth token state is unavailable")
         if self.path.stat().st_mode & 0o077:
             raise GoogleOAuthError("Google OAuth token state is not owner-only")
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict) or set(raw) != _TOKEN_FIELDS or raw["version"] != 2:
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != _TOKEN_FIELDS
+                or raw["version"] != TOKEN_VERSION
+            ):
+                # Includes the previous shape, which carried long-lived
+                # material here. Refusing it is what stops an upgrade from
+                # quietly going on spending the credential it was meant to move.
                 raise ValueError
             scopes = raw["scopes"]
             if not isinstance(scopes, list):
                 raise ValueError
-            token = OAuthToken(
+            binding = AccountBinding(
                 access_token=str(raw["access_token"]),
-                refresh_token=str(raw["refresh_token"]),
                 expires_at=int(raw["expires_at"]),
                 scopes=tuple(str(item) for item in scopes),
                 account_email=str(raw["account_email"]),
-                client_id=str(raw["client_id"]),
-                client_secret=str(raw["client_secret"]),
             )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise GoogleOAuthError("Google OAuth token state is malformed") from exc
-        if not token.access_token or not token.refresh_token or "@" not in token.account_email:
+        if not binding.access_token or "@" not in binding.account_email:
             raise GoogleOAuthError("Google OAuth token state is incomplete")
-        return token
+        return binding
 
     def ready(self, exact_scopes: tuple[str, ...], account_email: str) -> bool:
         try:
-            token = self.read()
+            binding = self.read()
         except GoogleOAuthError:
             return False
         # Expiry alone never means "not connected": an hour-old access token is
-        # refreshed from stored state instead of forcing a second browser consent.
-        return canonical_scopes(token.scopes) == canonical_scopes(
+        # replaced by asking the broker, not by a second browser consent.
+        return canonical_scopes(binding.scopes) == canonical_scopes(
             exact_scopes
-        ) and secrets.compare_digest(token.account_email.casefold(), account_email.casefold())
+        ) and secrets.compare_digest(binding.account_email.casefold(), account_email.casefold())
 
     def status(self) -> dict[str, object]:
         try:
-            token = self.read()
+            binding = self.read()
         except GoogleOAuthError:
             return {"configured": False, "scope_count": 0}
         return {
             "configured": True,
-            "scope_count": len(token.scopes),
-            "account_bound": bool(token.account_email),
-            "access_valid": token.access_valid(),
-            "refreshable": bool(token.refresh_token and token.client_id and token.client_secret),
+            "scope_count": len(binding.scopes),
+            "account_bound": bool(binding.account_email),
+            "access_valid": binding.access_valid(),
         }
 
 
@@ -254,18 +274,10 @@ def _post_form(url: str, fields: dict[str, str]) -> dict[str, object]:
     return body
 
 
-def _refresh(token: OAuthToken, exchange: TokenExchange) -> dict[str, object]:
-    if not token.refresh_token or not token.client_id or not token.client_secret:
-        raise GoogleOAuthError("Google OAuth state cannot refresh without a new browser consent")
-    return exchange(
-        url=GOOGLE_TOKEN_URI,
-        fields={
-            "client_id": token.client_id,
-            "client_secret": token.client_secret,
-            "refresh_token": token.refresh_token,
-            "grant_type": "refresh_token",
-        },
-    )
+#: Asks the privileged side for a token: given the exact scope set, it returns
+#: the access token and the second it stops being usable. Nothing that flows
+#: back through this can renew itself, which is the whole point of the shape.
+Minter = Callable[[tuple[str, ...]], tuple[str, int]]
 
 
 def ensure_access_token(
@@ -273,43 +285,47 @@ def ensure_access_token(
     exact_scopes: tuple[str, ...],
     account_email: str,
     *,
-    exchange: TokenExchange = _post_form,
+    mint: Minter,
     now: int | None = None,
 ) -> str:
-    """Return a currently valid access token, refreshing it in place if needed.
+    """Return a currently valid access token, asking the broker when it is stale.
 
-    The refresh never widens scope, never rebinds the account, and never
-    replaces stored state unless the provider returned a complete in-scope
-    response. Any failure leaves the previous state exactly as it was.
+    The refresh itself is not here any more. This holds the account binding and
+    the current hour's token; when that hour is nearly up it asks the privileged
+    side for another, and the material that mints it never enters this process.
+
+    A mint that fails, comes back incomplete, or is refused leaves the stored
+    binding exactly as it was, so a transient provider fault never disconnects
+    somebody who is still connected.
     """
 
-    token = store.read()
-    if canonical_scopes(token.scopes) != canonical_scopes(
+    binding = store.read()
+    if canonical_scopes(binding.scopes) != canonical_scopes(
         exact_scopes
-    ) or not secrets.compare_digest(token.account_email.casefold(), account_email.casefold()):
+    ) or not secrets.compare_digest(binding.account_email.casefold(), account_email.casefold()):
         raise GoogleOAuthError("Google OAuth state is bound to another account or scope set")
     current = int(time.time()) if now is None else now
-    if token.access_valid(now=current):
-        return token.access_token
+    if binding.access_valid(now=current):
+        return binding.access_token
 
-    body = _refresh(token, exchange)
-    access = body.get("access_token")
-    expires = body.get("expires_in")
-    if type(access) is not str or not access or type(expires) is not int or expires <= 0:
-        raise GoogleOAuthError("Google OAuth refresh response is incomplete")
-    granted = str(body.get("scope", "")).split()
-    if granted and canonical_scopes(granted) != canonical_scopes(exact_scopes):
-        raise GoogleOAuthError("Google OAuth refresh returned a different scope set")
-    rotated = body.get("refresh_token")
+    minted = mint(tuple(binding.scopes))
+    if (
+        not isinstance(minted, tuple)
+        or len(minted) != 2
+        or type(minted[0]) is not str
+        or not minted[0]
+        or type(minted[1]) is not int
+    ):
+        raise GoogleOAuthError("the privileged side returned no usable access token")
+    access, expires_at = minted
+    if expires_at <= current:
+        raise GoogleOAuthError("the privileged side returned an expired access token")
     store.write(
-        OAuthToken(
+        AccountBinding(
             access_token=access,
-            refresh_token=rotated if type(rotated) is str and rotated else token.refresh_token,
-            expires_at=current + expires,
-            scopes=token.scopes,
-            account_email=token.account_email,
-            client_id=token.client_id,
-            client_secret=token.client_secret,
+            expires_at=expires_at,
+            scopes=binding.scopes,
+            account_email=binding.account_email,
         )
     )
     return access
@@ -452,8 +468,18 @@ def complete_consent(
     owner_uid: int = 0,
     exchange: TokenExchange = _post_form,
     verify_account: Callable[[str], str] | None = None,
+    commit: Committer,
 ) -> str:
-    """Exchange the pasted redirect for tokens and bind them to the account.
+    """Exchange the pasted redirect and split what comes back in two.
+
+    Google hands over an access token and a refresh token in the same response.
+    They belong in different places: the refresh token and the client secret go
+    to the root-owned broker through `commit`, and only the hour-long access
+    token and the account binding are written where the runtime can read them.
+
+    The commit happens first. A refresh token that reached nowhere would leave a
+    binding that looks connected and cannot be renewed, so a failure here means
+    nothing is written and the operator is told consent did not complete.
 
     Returns the verified account email. Nothing else about the exchange leaves
     this function, and no code or token is logged, printed, or raised.
@@ -481,15 +507,15 @@ def complete_consent(
     if type(access) is not str or type(refresh) is not str or type(expires) is not int:
         raise GoogleOAuthError("Google OAuth token response is incomplete")
     account_email = (verify_account or _verify_account)(access)
+    # The privileged side takes the material that outlives this hour. Only once
+    # it has it does anything get written where the runtime can see it.
+    commit(client["client_id"], client["client_secret"], refresh)
     token_store.write(
-        OAuthToken(
+        AccountBinding(
             access_token=access,
-            refresh_token=refresh,
             expires_at=int(time.time()) + expires,
             scopes=granted,
             account_email=account_email,
-            client_id=client["client_id"],
-            client_secret=client["client_secret"],
         )
     )
     return account_email

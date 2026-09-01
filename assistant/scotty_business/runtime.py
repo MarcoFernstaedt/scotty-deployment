@@ -621,26 +621,19 @@ class Runtime:
             role: GoogleTokenStore(google_token_path(role, state_dir)) for role in CLIENT_ROLES
         }
         self.google_connected: dict[Role, bool] = {}
-        self.google_adapters: dict[Role, GoogleWorkspaceAdapter] = {}
+        # The transport every Workspace adapter is built on. The adapter itself
+        # is built per person rather than held here, because minting the token
+        # it carries needs that person's own citation.
+        self._workspace_transport = transport
         for role in CLIENT_ROLES:
             scope = self.config.google_for(role)
             # Connected means consent exists for this exact account and scope
-            # set. An hour-old access token refreshes in place; it never means
-            # "not connected".
-            linked = bool(
+            # set. An hour-old access token is replaced by asking the broker;
+            # it never means "not connected".
+            self.google_connected[role] = bool(
                 scope is not None
                 and self.google_stores[role].ready(scope.oauth_scopes, scope.account_email)
             )
-            self.google_connected[role] = linked
-            if linked and scope is not None:
-                # Counted on the way out, like every other provider. The
-                # guard is on the transport rather than the adapter so that
-                # the approval executor is counted too, not just routine work.
-                self.google_adapters[role] = GoogleWorkspaceAdapter(
-                    self._guarded(transport, self.config.principal_for(role)),
-                    self._google_token_provider(role),
-                    scope,
-                )
         self.connected["google_workspace"] = any(self.google_connected.values())
         self.state_dir = state_dir
         self.approvals = ApprovalStore(state_dir / "approvals.db")
@@ -708,23 +701,57 @@ class Runtime:
             status[provider] = "present" if broker.status(provider, credential_class) else "absent"
         return status
 
-    def _google_token_provider(self, role: Role) -> Callable[[], str]:
-        """A token provider bound to exactly one client user's own account."""
+    def _google_token_provider(self, principal: Principal) -> Callable[[], str]:
+        """A token provider bound to exactly one client user's own account.
+
+        The refresh that used to happen here is gone. This process holds an
+        account binding and an hour-long access token; when that hour is nearly
+        up it asks the root-owned broker for another, citing the message it is
+        acting on so the broker resolves who is asking rather than believing
+        this side. The material that mints the token is never in this process.
+        """
+
+        role = principal.role
+
+        def mint(scopes: tuple[str, ...]) -> tuple[str, int]:
+            minted = self.provider_broker.google_token(scopes, provenance=principal.citation())
+            if minted is None:
+                raise GoogleOAuthError("the privileged side would not mint a Google token")
+            return minted
 
         def provide() -> str:
             scope = self.config.google_for(role)
             if scope is None:
                 raise GoogleOAuthError("Google Workspace is not configured")
             return ensure_access_token(
-                self.google_stores[role], scope.oauth_scopes, scope.account_email
+                self.google_stores[role],
+                scope.oauth_scopes,
+                scope.account_email,
+                mint=mint,
             )
 
         return provide
 
-    def google_workspace_for(self, role: Role) -> GoogleWorkspaceAdapter | None:
-        """The Workspace adapter for exactly this client user, or none."""
+    def google_workspace_for(self, principal: Principal) -> GoogleWorkspaceAdapter | None:
+        """The Workspace adapter for exactly this person, or none.
 
-        return self.google_adapters.get(role)
+        Built per call rather than held per role. The adapter carries a token
+        provider that cites this person's own message, so two people's work
+        cannot share one even by accident -- which is how an employee's effect
+        could once leave through the main operator's connector.
+        """
+
+        scope = self.config.google_for(principal.role)
+        if scope is None or not self.google_connected.get(principal.role, False):
+            return None
+        # Counted on the way out, like every other provider. The guard is on
+        # the transport rather than the adapter so that the approval executor
+        # is counted too, not just routine work.
+        return GoogleWorkspaceAdapter(
+            self._guarded(self._workspace_transport, principal),
+            self._google_token_provider(principal),
+            scope,
+        )
 
     def _workspace(self, principal: Principal) -> GoogleWorkspaceReadPort:
         """This actor's own Workspace, or a provider that explains it is absent.
@@ -733,7 +760,7 @@ class Runtime:
         the other user's adapter; they are told to connect their own.
         """
 
-        adapter = self.google_adapters.get(principal.role)
+        adapter = self.google_workspace_for(principal)
         if adapter is None:
             return UnconnectedProvider("Google Workspace")
         return adapter
