@@ -1,8 +1,11 @@
 """One runtime, three people, and no upstream branding in front of any of them.
 
-The product is white-labelable: "Scotty" is Trent's assistant, Mikey names his
-own, and neither name is the product's. Nothing a client ever sees may advertise
-the framework, the model provider, or the infrastructure underneath.
+"Scotty" is Trent's assistant, Mikey names his own, and neither name is the
+product's. Nothing a client ever sees may advertise the framework, the model
+provider, or the infrastructure underneath.
+
+This is the naming surface this release ships. Renaming the product itself is
+not implemented; `tests/test_product_identity.py` holds that line.
 """
 
 from __future__ import annotations

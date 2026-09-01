@@ -1,9 +1,14 @@
 """Who the assistant is, for the one person it is talking to.
 
-This deployment is white-labelable. "Scotty" is Trent's assistant, not the
-product; Mikey names his own; the maintainer route is separate from both. So an
-assistant name is per client user, chosen by that user, bounded, and never
-allowed to advertise the framework or model provider underneath.
+"Scotty" is Trent's assistant, not the product; Mikey names his own; the
+maintainer route is separate from both. So an assistant name is per client
+user, chosen by that user, bounded, and never allowed to advertise the
+framework or model provider underneath.
+
+This is the whole of what this release lets an operator rename. The product's
+own identifiers -- packages, tools, profiles, paths, commands, container,
+network, environment variables -- are constants; see
+`docs/white-label-rename-plan.md`, which is a plan and not a feature.
 
 A name is only presentation. It carries no authority: renaming an assistant
 never changes a role, a route, a credential, or an approval.

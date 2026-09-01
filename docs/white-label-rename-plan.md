@@ -1,13 +1,21 @@
 # Renaming this product after acceptance
 
-This deployment is white-labelable. "Scotty" is the name of Trent's own
-assistant, and Mikey names his separately; neither is the product's name. The
-repository is still called `scotty-deployment` because renaming it before
+**This rename is not implemented.** Nothing in this document has been executed,
+and no part of it ships in this release. It is the plan to run once Marco has
+chosen a name and the candidate has been accepted. Do not read it as a
+description of a feature.
+
+What this release does support is persona-name customization: "Scotty" is the
+name of Trent's own assistant, Mikey names his separately, and neither is the
+product's name. That much is configurable and tested. Renaming the *product* is
+an operator migration — packages, tool names, profiles, installed paths,
+commands, container, network and credential environment variables are constants
+in the code, and `tests/test_product_identity.py` holds them so by trying to
+override each one through configuration and showing it does not move.
+
+The repository is still called `scotty-deployment` because renaming it before
 acceptance would break the operator's installed paths, the pinned smoke
 contract, and every checksum in `SHA256SUMS` for no benefit.
-
-Nothing here is executed by this mission. It is the plan to run once Marco has
-chosen a name and the candidate has been accepted.
 
 ## What is already neutral
 

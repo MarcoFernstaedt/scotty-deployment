@@ -10,7 +10,11 @@ paths:
 
 ## Product identity
 
-- This is a white-labelable managed wholesaling assistant.
+- This is a managed wholesaling assistant. This release supports persona-name
+  customization only: a client user names their own assistant, and no client-visible
+  string carries a product brand. Renaming the product itself is not implemented — the
+  packages, tool names, profiles, paths, commands, container, network and credential
+  environment variables are constants. Do not describe the rename plan as a feature.
 - “Scotty” is Trent’s personal assistant name, not the product name.
 - Mikey has an independent selectable name/persona.
 - Product-level identifiers must be neutral and migration-safe. Prepare repository/product rename guidance, but do not rename the repository before acceptance and Marco’s final name decision.

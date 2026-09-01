@@ -21,7 +21,8 @@ Do not work on `main`; reset, rebase, force-push, rewrite history, discard legit
 
 ## Product mission
 
-Build one white-labelable managed wholesaling assistant runtime with:
+Build one managed wholesaling assistant runtime, neutrally named at the product level and
+prepared for a post-acceptance rename, with:
 
 - Marco: private full-capability maintainer profile using native reasoning and broad tools;
 - Trent: independent personalized assistant named **Scotty**;
@@ -99,7 +100,8 @@ make oauth-probe
 make verify
 ```
 
-Add behavioral and installed-artifact tests for profile/actor/channel separation, per-user provider identity, cross-user denial, shared-resource safety, Trello formatting/dedup/merge/readback, approvals, broker/socket lifecycle, protected ingress, restart/crash/provider/OAuth failures, outbox recovery, backup/restore/rollback, singleton Discord consumption, Marco routing, functional Discord administration without `Administrator`, and white-label behavior.
+Add behavioral and installed-artifact tests for profile/actor/channel separation, per-user provider identity, cross-user denial, shared-resource safety, Trello formatting/dedup/merge/readback, approvals, broker/socket lifecycle, protected ingress, restart/crash/provider/OAuth failures, outbox recovery, backup/restore/rollback, singleton Discord consumption, Marco routing, functional Discord administration without `Administrator`, and the exact naming surface this
+release ships (persona names configurable; product identifiers constant).
 
 After implementation: inspect all tracked/staged/untracked/generated/package/dependency/mode changes; scan current tree and reachable history; freeze exact commit/tree; obtain fresh independent security/correctness PASS; fix and rerun on any finding; push without force; verify remote bytes. Do not merge or deploy.
 
