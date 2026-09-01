@@ -90,6 +90,8 @@ readonly -a PLUGIN_FILES=(
   "persona.py"
   "policy.py"
   "progress.py"
+  "property_cards.py"
+  "property_engine.py"
   "provider_identity.py"
   "provisioning.py"
   "reminders.py"

@@ -54,6 +54,14 @@ from .persona import (
 )
 from .policy import Principal, Role
 from .progress import ProgressReporter
+from .property_cards import (
+    compare,
+    find_duplicates,
+    merge_preview,
+    normalize_address,
+    parse_card,
+)
+from .property_engine import EffectLog, PropertyCardEngine
 from .provider_identity import reject_identity_override
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
@@ -472,6 +480,13 @@ class Runtime:
         self.reminders.initialize()
         self.setup_staging = SetupStagingStore(state_dir / "setup-staging.json")
         self.personas = PersonaStore(state_dir / "personas.json")
+        self.property_effects = EffectLog(state_dir / "property-effects.db")
+        self.property_effects.initialize()
+        self.property_cards: PropertyCardEngine | None = (
+            PropertyCardEngine(self.config, self.trello, self.property_effects)
+            if self.connected["trello"]
+            else None
+        )
         self.self_repair = SelfRepairManager(
             state_dir,
             state_dir / "private.json",
@@ -565,6 +580,59 @@ class Runtime:
         except PersonaError as exc:
             return {"accepted": False, "correction": str(exc)}
         return {"accepted": True, "assistant_name": chosen, "role": principal.role.value}
+
+    def _property_card(self, principal: Principal, args: Mapping[str, object]) -> object:
+        """One typed property-card operation, bound to the calling actor.
+
+        Reading, comparing and previewing never touch the provider. Creating
+        and changing do, and each is read back before it counts as done.
+        """
+
+        operation = _text(args, "card_operation")
+        if operation == "normalize_address":
+            return normalize_address(_text(args, "address")).as_json()
+        engine = self.property_cards
+        if engine is None:
+            raise ProviderNotConnected("Trello is not connected")
+        if operation == "duplicates":
+            candidate = parse_card(_object(args, "card"))
+            return [
+                {"card_id": match.card_id, **result.as_json()}
+                for match, result in find_duplicates(candidate, engine.existing())
+            ]
+        if operation in {"compare", "preview_merge"}:
+            left = parse_card(_object(args, "card"))
+            right = parse_card(_object(args, "other_card"))
+            if operation == "compare":
+                return compare(left, right).as_json()
+            return merge_preview(left, right).as_json()
+        if operation == "reformat":
+            return engine.reformat(parse_card(_object(args, "card"))).as_json()
+        if operation == "apply_template":
+            template = {str(name): str(value) for name, value in _object(args, "template").items()}
+            return engine.apply_template(parse_card(_object(args, "card")), template).as_json()
+        if operation == "dry_run":
+            identifiers = args.get("card_ids")
+            if not isinstance(identifiers, list) or not all(
+                type(item) is str for item in identifiers
+            ):
+                raise ValueError("a bulk review needs a list of card identifiers")
+            return engine.dry_run(
+                principal,
+                _text(args, "card_operation_target", optional=True) or "move",
+                identifiers,
+                _object(args, "payload", optional=True),
+            ).as_json()
+        if operation == "create":
+            return engine.create(principal, parse_card(_object(args, "card"))).as_json()
+        if operation == "update":
+            card = parse_card(_object(args, "card"))
+            return engine.update(principal, _text(args, "card_id"), card).as_json()
+        if operation == "move":
+            return engine.routine(
+                principal, "move", _text(args, "card_id"), _object(args, "payload")
+            ).as_json()
+        raise ValueError("property-card operation is not permitted")
 
     def actor_connection_status(self, principal: Principal) -> dict[str, bool]:
         """What this exact user is connected to, not what the deployment has."""
@@ -674,6 +742,8 @@ class Runtime:
             }
         if operation == "persona":
             return self._persona(principal, args)
+        if operation == "property_card":
+            return self._property_card(principal, args)
         if operation == "provider_setup":
             return self._provider_setup(principal, args)
         if operation == "discord":
