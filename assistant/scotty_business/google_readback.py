@@ -133,8 +133,10 @@ def applied_fully(operation: str, payload: Mapping[str, object], response: objec
     """Whether a batch applied every request, or None when not a batch.
 
     Google answers a batch with one reply per request. Fewer replies than
-    requests means part of the batch did not apply, which is a partial effect
-    and must never read as verified.
+    requests means part of the batch did not apply. An acknowledgement carrying
+    no replies at all proves nothing either, and the resource-level readback for
+    a batch only proves the document still exists — so a missing reply list is
+    reported as not-fully-applied rather than as "not a batch".
     """
 
     if operation not in {"docs_batch_update", "sheets_batch_update"}:
@@ -142,9 +144,12 @@ def applied_fully(operation: str, payload: Mapping[str, object], response: objec
     requests = payload.get("requests")
     if not _is_list(requests):
         return None
+    if not requests:
+        # A batch that asked for nothing changed nothing, which is consistent.
+        return True
     replies = _reply_count(response)
     if replies is None:
-        return None
+        return False
     return replies >= len(requests)
 
 
@@ -248,20 +253,26 @@ def plan(
         )
 
     if operation == "drive_change_permissions":
+        # The grantee is the whole point of a sharing change, so it is compared
+        # too. Without it, an unrelated pre-existing permission of the same type
+        # and role would satisfy a subset match and a grant that never landed —
+        # or landed on the wrong person — would read as verified.
+        grant = {
+            key: value
+            for key, value in payload.items()
+            if key in {"type", "role", "domain", "emailAddress"}
+        }
+        if not {"type", "role"} <= set(grant):
+            # A change that names neither who nor what cannot be proven at all.
+            return None
+        if grant.get("type") in {"user", "group"} and "emailAddress" not in grant:
+            return None
         return ReadbackPlan(
             ReadbackRequest(
                 f"{drive}/files/{resource_id}/permissions",
                 {"fields": "permissions(id,type,role,domain,emailAddress)"},
             ),
-            {
-                "permissions": [
-                    {
-                        key: value
-                        for key, value in payload.items()
-                        if key in {"type", "role", "domain"}
-                    }
-                ]
-            },
+            {"permissions": [grant]},
         )
 
     if operation in {"docs_create", "docs_batch_update"}:
@@ -301,16 +312,23 @@ def plan(
         if not ranges:
             return None
         expected_ranges = [
-            {"values": entry["values"]}
+            {"range": entry["range"], "values": entry["values"]}
             for entry in data
             if isinstance(entry, Mapping) and _is_list(entry.get("values"))
         ]
+        if len(expected_ranges) != len(data):
+            # An entry whose values could not be read is an entry this readback
+            # cannot prove, so the whole write stays unverified rather than
+            # being judged on the part that happened to parse.
+            return None
         return ReadbackPlan(
             ReadbackRequest(
                 f"{sheets}/spreadsheets/{resource_id}/values:batchGet",
                 {"ranges": ranges, "majorDimension": "ROWS"},
             ),
-            {"valueRanges": expected_ranges} if expected_ranges else {},
+            # The range travels with the values, so a write that landed in the
+            # wrong place no longer satisfies the comparison.
+            {"valueRanges": expected_ranges},
         )
 
     if operation in {"contacts_create", "contacts_update"}:

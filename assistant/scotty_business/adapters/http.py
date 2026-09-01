@@ -121,6 +121,14 @@ class HttpTransport:
                     body=_decode_text(raw) if text else _parse_json(raw),
                 )
         except urllib.error.HTTPError as exc:
+            if upper in _MUTATING_METHODS and _outcome_unknown(int(exc.code)):
+                # The request reached the provider and the provider did not say
+                # what it did with it. A 500 or a 429 on a write is not a
+                # definite failure, and telling the operator it is invites the
+                # retry that doubles the effect.
+                raise AmbiguousEffectError(
+                    "provider mutation outcome is unknown; reconcile before any retry"
+                ) from None
             raw = exc.read(self.max_response_bytes + 1)
             if len(raw) > self.max_response_bytes:
                 raise ProviderError(
@@ -128,11 +136,25 @@ class HttpTransport:
                 ) from None
             return HttpResponse(int(exc.code), {}, _parse_json(raw))
         except (TimeoutError, urllib.error.URLError):
-            if upper in {"POST", "PUT", "PATCH", "DELETE"}:
+            if upper in _MUTATING_METHODS:
                 raise AmbiguousEffectError(
                     "provider mutation outcome is unknown; reconcile before any retry"
                 ) from None
             raise ProviderError("provider read failed") from None
+
+
+#: Methods whose outcome matters when the provider stops answering clearly.
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _outcome_unknown(status: int) -> bool:
+    """Statuses that say the provider received the request but not what it did.
+
+    A 4xx other than 429 is a refusal: the provider decided, and the effect did
+    not happen. A 429 or any 5xx leaves the outcome genuinely open.
+    """
+
+    return status == 429 or 500 <= status <= 599
 
 
 def _decode_text(raw: bytes) -> str:

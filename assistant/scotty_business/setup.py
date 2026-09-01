@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from .adapters.http import HttpTransport, ProviderError, RedactedMapping
-from .config import GOOGLE_OAUTH_SCOPES
+from .config import CLIENT_ROLES, GOOGLE_OAUTH_SCOPES
 from .google_oauth import (
     GoogleOAuthError,
     GoogleTokenStore,
@@ -76,12 +76,22 @@ DISCORD_ALLOWED_USERS_ENV = "DISCORD_ALLOWED_USERS"
 
 #: Only Discord is required on day one. Every other provider connects later.
 REQUIRED_SECRETS = ("DISCORD_BOT_TOKEN",)
-OPTIONAL_SECRETS = (
+#: The deployment's shared business identities. Used by any client user who has
+#: not supplied their own, and marked shared so effects stay attributable.
+SHARED_SECRETS = (
     "SCOTTY_TRELLO_API_KEY",
     "SCOTTY_TRELLO_TOKEN",
     "SCOTTY_GHL_PRIVATE_TOKEN",
     "SCOTTY_RENTCAST_API_KEY",
 )
+
+#: A credential that belongs to exactly one client user. The runtime prefers
+#: these over the shared ones and never lets one user reach the other's.
+PER_ACTOR_SECRETS = tuple(
+    f"{name}_{role.value.upper()}" for name in SHARED_SECRETS for role in CLIENT_ROLES
+)
+
+OPTIONAL_SECRETS = (*SHARED_SECRETS, *PER_ACTOR_SECRETS)
 _SAFE_SECRET = re.compile(r"[A-Za-z0-9._:/+\-=]+")
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9._:/+\-]+")
 _ACCOUNT_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
@@ -443,6 +453,20 @@ def collect_inputs(
             "GoHighLevel Private Integration Token (hidden, blank to connect later): ",
         ),
         ("SCOTTY_RENTCAST_API_KEY", "RentCast API key (hidden, blank to connect later): "),
+        *(
+            (
+                f"{name}_{role.value.upper()}",
+                f"{label} for the {role.value.replace('_', ' ')} "
+                "(hidden, blank to share the business identity): ",
+            )
+            for name, label in (
+                ("SCOTTY_TRELLO_API_KEY", "Trello API key"),
+                ("SCOTTY_TRELLO_TOKEN", "Trello token"),
+                ("SCOTTY_GHL_PRIVATE_TOKEN", "GoHighLevel token"),
+                ("SCOTTY_RENTCAST_API_KEY", "RentCast API key"),
+            )
+            for role in CLIENT_ROLES
+        ),
     ):
         # A credential is read from hidden terminal input, or from the process
         # environment when the operator exported it. It is never read from argv.

@@ -423,7 +423,7 @@ def check_fixed_paths(runtime_config: RuntimeConfig) -> None:
     guard(
         SimpleNamespace(
             text=EMPLOYEE_SUMMARY_COMMAND,
-            source=source(operator.guild_id, operator.channel_id, operator.user_id),
+            source=source(employee.guild_id, employee.channel_id, employee.user_id),
         )
     )
     check(

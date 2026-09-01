@@ -13,6 +13,8 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import synthetic
+
 from assistant.scotty_business.supervisor import (
     CRASH_LOOP_THRESHOLD,
     ConsumerLease,
@@ -56,9 +58,16 @@ class ConsumerLeaseTests(unittest.TestCase):
         self.assertTrue(lease.release("process-a"))
         self.assertTrue(lease.claim("process-b", at=moment(1)))
 
-    def test_a_corrupt_lease_file_is_reclaimed_not_trusted(self) -> None:
+    def test_a_corrupt_lease_is_refused_rather_than_treated_as_free(self) -> None:
+        """An unreadable lease must not hand a second consumer the singleton."""
+
         lease = self.lease()
         lease.path.write_text("not json", encoding="utf-8")
+        self.assertFalse(lease.claim("process-a", at=moment()))
+        self.assertEqual(lease.holder(), "unreadable")
+        self.assertFalse(lease.release("process-a"))
+        # The operator clears the file; the lease is then claimable again.
+        lease.path.unlink()
         self.assertTrue(lease.claim("process-a", at=moment()))
 
 
@@ -142,3 +151,113 @@ class HealthStateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeWiringTests(unittest.TestCase):
+    """The supervisor, the breakers and the backups are used, not just built."""
+
+    def runtime(self):
+        from test_provider_connection import runtime
+
+        return runtime(DISCORD_BOT_TOKEN="synthetic-discord")
+
+    def maintainer(self, runtime):
+        from assistant.scotty_business.policy import Principal, Role
+
+        route = runtime.config.maintainer_route
+        return Principal(route.guild_id, route.channel_id, route.user_id, Role.MAINTAINER)
+
+    def test_a_failing_provider_opens_its_breaker_and_alerts_once(self) -> None:
+        from assistant.scotty_business.budgets import BudgetPolicy
+
+        with self.runtime() as runtime:
+            sent: list[tuple[str, str]] = []
+            runtime.discord = type(
+                "Recorder",
+                (),
+                {"send_message": lambda _self, channel, text: sent.append((channel, text))},
+            )()
+            runtime.connected["trello"] = True
+            for _ in range(BudgetPolicy.from_mapping({}).breaker_threshold):
+                runtime.record_provider_failure("trello")
+
+            first = runtime.watch_providers()
+            self.assertEqual(first["trello"], "blocked")
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0][0], runtime.config.maintainer_route.channel_id)
+
+            # Looking again does not tell Marco a second time.
+            runtime.watch_providers()
+            self.assertEqual(len(sent), 1)
+
+            runtime.record_provider_success("trello")
+            self.assertEqual(runtime.watch_providers()["trello"], "healthy")
+            self.assertEqual(len(sent), 2)
+            self.assertIn("answering again", sent[1][1])
+
+    def test_an_incident_alert_never_carries_a_credential_or_a_client_identifier(self) -> None:
+        from assistant.scotty_business.budgets import BudgetPolicy
+
+        with self.runtime() as runtime:
+            sent: list[tuple[str, str]] = []
+            runtime.discord = type(
+                "Recorder",
+                (),
+                {"send_message": lambda _self, channel, text: sent.append((channel, text))},
+            )()
+            runtime.connected["trello"] = True
+            for _ in range(BudgetPolicy.from_mapping({}).breaker_threshold):
+                runtime.record_provider_failure("trello")
+            runtime.watch_providers()
+            body = " ".join(text for _, text in sent)
+            for forbidden in ("token", "secret", synthetic.OPERATOR_USER, synthetic.EMPLOYEE_USER):
+                self.assertNotIn(forbidden, body)
+
+    def test_a_client_can_never_reach_the_maintenance_operations(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as runtime:
+            for role in (Role.MAIN_OPERATOR, Role.EMPLOYEE):
+                with self.subTest(role=role), self.assertRaises(PermissionError):
+                    runtime.handle_read(
+                        runtime.config.principal_for(role),
+                        {"operation": "maintenance", "maintenance_action": "backup"},
+                    )
+
+    def test_the_maintainer_takes_a_backup_and_verifies_it(self) -> None:
+        with self.runtime() as runtime:
+            from assistant.scotty_business.policy import Role
+
+            runtime.personas.set(Role.EMPLOYEE, "Nova")
+            taken = runtime.handle_read(
+                self.maintainer(runtime),
+                {"operation": "maintenance", "maintenance_action": "backup"},
+            )
+            self.assertIn("personas.json", taken["files"])
+            self.assertTrue(taken["intact"])
+            checked = runtime.handle_read(
+                self.maintainer(runtime),
+                {
+                    "operation": "maintenance",
+                    "maintenance_action": "verify_backup",
+                    "backup": taken["backup"],
+                },
+            )
+            self.assertTrue(checked["intact"])
+            self.assertEqual(checked["mismatched"], [])
+            # No credential state is ever carried into a backup.
+            self.assertFalse(
+                any("oauth" in name or "private" in name for name in checked["would_restore"])
+            )
+
+    def test_a_rollback_plan_is_returned_and_nothing_is_executed(self) -> None:
+        with self.runtime() as runtime:
+            plan = runtime.handle_read(
+                self.maintainer(runtime),
+                {"operation": "maintenance", "maintenance_action": "rollback_plan"},
+            )
+            # There is no release directory in a test root, so it reports that
+            # rather than inventing a target.
+            self.assertFalse(plan["available"])
+            self.assertTrue(plan["reason"])
+            self.assertEqual(plan["steps"], [])

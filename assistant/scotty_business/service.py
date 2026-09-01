@@ -16,9 +16,21 @@ from .discord_policy import (
     DiscordActionClass,
     announcement_is_safe,
     classify_discord_action,
+    protected_channels,
 )
 from .google_policy import GoogleActionClass, classify_google_action
 from .policy import Principal, Role
+
+
+def _optional_text(payload: Mapping[str, object], field: str) -> str:
+    """A payload string that may legitimately be absent."""
+
+    value = payload.get(field)
+    if value is None:
+        return ""
+    if type(value) is not str:
+        raise ApprovalError(f"proposal {field} is malformed")
+    return value
 
 
 def _utc_now() -> datetime:
@@ -94,8 +106,6 @@ _ADMIN_PAYLOAD_KEYS = frozenset(
         "overwrites",
         "user_id",
         "role_id",
-        "role",
-        "bot_role_position",
         "start",
         "description",
     }
@@ -370,7 +380,7 @@ class ScottyService:
         """
 
         guild_id = self.config.principals[0].guild_id
-        private = {principal.channel_id for principal in self.config.principals}
+        private = protected_channels(self.config)
         classified = classify_discord_action(
             operation,
             {**payload, "guild_id": guild_id},
@@ -472,7 +482,9 @@ class ScottyService:
             receipt = self._run_administration(operation, proposal.payload)
         except AmbiguousEffectError as exc:
             return self._unknown(executing, {"verified": False, "reason": str(exc)})
-        except (ProviderError, ValueError) as exc:
+        except (ProviderError, ValueError, ApprovalError) as exc:
+            # A malformed payload discovered after the claim still has to settle
+            # the proposal, or it stays executing until the next recovery pass.
             return self._failed(executing, str(exc))
         return self.approvals.complete_execution(
             executing.proposal_id,
@@ -488,13 +500,15 @@ class ScottyService:
 
         admin = self.discord_admin
         assert admin is not None  # noqa: S101 - guarded by the caller
-        channel_id = _payload_text(payload, "channel_id")
+        # Most administration names no existing channel, so this is read
+        # optionally: requiring it here would strand every approved creation.
+        channel_id = _optional_text(payload, "channel_id")
         if operation in {"create_channel", "create_category"}:
             created = admin.create_channel(
                 _payload_text(payload, "name"),
                 kind="category" if operation == "create_category" else "text",
-                parent_id=_payload_text(payload, "parent_id"),
-                topic=_payload_text(payload, "topic"),
+                parent_id=_optional_text(payload, "parent_id"),
+                topic=_optional_text(payload, "topic"),
                 overwrites=overwrites
                 if isinstance(overwrites := payload.get("overwrites"), list)
                 else None,
@@ -520,18 +534,16 @@ class ScottyService:
             role_id = _payload_text(payload, "role_id")
             if operation == "remove_role":
                 return admin.remove_role(user_id, role_id).as_json()
-            role = payload.get("role")
-            position = payload.get("bot_role_position")
-            if not isinstance(role, Mapping) or type(position) is not int:
-                raise ProviderError("a role assignment needs the role and the bot's position")
-            return admin.assign_role(user_id, role_id, bot_position=position, role=role).as_json()
+            # The role's own position, managed flag and permission bits are read
+            # from the guild inside the adapter, never taken from the proposal.
+            return admin.assign_role(user_id, role_id).as_json()
         if operation == "create_event":
             return dict(
                 admin.create_event(
                     _payload_text(payload, "name"),
                     _payload_text(payload, "start"),
                     channel_id=channel_id,
-                    description=_payload_text(payload, "description"),
+                    description=_optional_text(payload, "description"),
                 )
             )
         if operation == "create_webhook":

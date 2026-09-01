@@ -4,7 +4,11 @@ umask 077
 
 readonly CONTAINER=scotty
 readonly SETUP_COMMAND=${SCOTTY_SETUP_COMMAND:-/srv/Scotty/operator/setup-scotty}
-readonly GOOGLE_TOKEN=/srv/Scotty/data/scotty/google-oauth.json
+# Consent is personal, so each client user has their own token record. The
+# start path checks every account the configuration names, not one shared file.
+readonly GOOGLE_STATE_DIR=/srv/Scotty/data/scotty
+readonly PRIVATE_STATE=/srv/Scotty/data/scotty/private.json
+readonly -a GOOGLE_ROLES=(main_operator employee)
 readonly IMAGE_DIGEST='sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517'
 COMPLETED=0
 
@@ -12,15 +16,19 @@ COMPLETED=0
 readonly GOOGLE_CONSENT_CHECK='
 import json, pathlib, sys
 sys.path.insert(0, "/opt/data/plugins")
-from scotty_business.config import RuntimeConfig
-from scotty_business.google_oauth import GoogleTokenStore
+from scotty_business.config import CLIENT_ROLES, RuntimeConfig
+from scotty_business.google_oauth import GoogleTokenStore, google_token_path
 private = pathlib.Path("/opt/data/scotty/private.json")
 config = RuntimeConfig.from_mapping(json.loads(private.read_text(encoding="utf-8")))
-scope = config.google_workspace
-if scope is None:
-    sys.exit(0)
-store = GoogleTokenStore(pathlib.Path("/opt/data/scotty/google-oauth.json"))
-sys.exit(0 if store.ready(scope.oauth_scopes, scope.account_email) else 1)
+state = pathlib.Path("/opt/data/scotty")
+for role in CLIENT_ROLES:
+    scope = config.google_for(role)
+    if scope is None:
+        continue
+    store = GoogleTokenStore(google_token_path(role, state))
+    if not store.ready(scope.oauth_scopes, scope.account_email):
+        sys.exit(1)
+sys.exit(0)
 '
 
 fail() {
@@ -102,11 +110,22 @@ docker start "$CONTAINER" >/dev/null || fail 'Scotty did not start cleanly'
 docker exec -it "$CONTAINER" hermes auth add openai-codex
 
 GOOGLE_SELECTED=0
-if [[ -e /srv/Scotty/data/scotty/private.json ]] \
-  && grep -q '"google_workspace"' /srv/Scotty/data/scotty/private.json; then
+if [[ -e $PRIVATE_STATE ]] && grep -q '"google_workspace"' "$PRIVATE_STATE"; then
   GOOGLE_SELECTED=1
-  [[ -f $GOOGLE_TOKEN && ! -L $GOOGLE_TOKEN ]] || fail 'Google OAuth is selected but incomplete'
-  [[ $(stat -c '%a' "$GOOGLE_TOKEN") == 600 ]] || fail 'Google OAuth token state is not owner-only'
+  # Every configured client user must have completed their own consent, and
+  # each token record must be owner-only. One user's token never stands in for
+  # the other's.
+  google_records=0
+  for google_role in "${GOOGLE_ROLES[@]}"; do
+    google_token="${GOOGLE_STATE_DIR}/google-oauth.${google_role}.json"
+    grep -q "\"${google_role}\"" "$PRIVATE_STATE" || continue
+    [[ -f $google_token && ! -L $google_token ]] \
+      || fail "Google OAuth is selected but incomplete for ${google_role}"
+    [[ $(stat -c '%a' "$google_token") == 600 ]] \
+      || fail "Google OAuth token state is not owner-only for ${google_role}"
+    google_records=$(( google_records + 1 ))
+  done
+  (( google_records > 0 )) || fail 'Google OAuth is selected but no account is configured'
 fi
 
 # Credential-free, non-sending runtime checks only.

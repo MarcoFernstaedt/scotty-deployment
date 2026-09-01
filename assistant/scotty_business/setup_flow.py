@@ -110,7 +110,8 @@ REQUIRED_IDENTIFIERS: Mapping[str, tuple[IdentifierField, ...]] = {
             "google_workspace",
             "account_email",
             "the Google Workspace account email",
-            "The account you want Scotty to work in; consent must be completed as that account.",
+            "The account you want your assistant to work in; consent must be "
+            "completed as that account.",
         ),
     ),
 }
@@ -263,6 +264,19 @@ def _configured_identifiers(config: RuntimeConfig, role: Role) -> dict[str, tupl
     return present
 
 
+def _staged_for(provider: str, staged: Mapping[str, str], role: Role) -> frozenset[str]:
+    """Which identifier fields this exact user has already staged.
+
+    One user's staged Google account is not the other's progress, so the
+    employee's entry is read from its own key and the operator's is ignored.
+    """
+
+    if provider != "google_workspace":
+        return frozenset(staged)
+    own = "employee_account_email" if role is Role.EMPLOYEE else "account_email"
+    return frozenset({"account_email"} if staged.get(own) else set())
+
+
 def setup_progress(
     config: RuntimeConfig,
     connected: Mapping[str, bool],
@@ -277,7 +291,7 @@ def setup_progress(
     result: list[ProviderProgress] = []
     for provider in PROVIDERS:
         have = set(configured.get(provider, ()))
-        have.update(staged.get(provider, {}))
+        have.update(_staged_for(provider, staged.get(provider, {}), role))
         missing = tuple(
             item.label for item in REQUIRED_IDENTIFIERS[provider] if item.field not in have
         )
@@ -369,12 +383,26 @@ class SetupStagingStore:
                 staged.setdefault(provider, {})[field] = checked
         return staged
 
-    def stage(self, provider: object, field: object, value: object) -> dict[str, dict[str, str]]:
-        """Validate one identifier and persist it atomically, owner-only."""
+    def stage(
+        self,
+        provider: object,
+        field: object,
+        value: object,
+        *,
+        role: Role = Role.MAIN_OPERATOR,
+    ) -> dict[str, dict[str, str]]:
+        """Validate one identifier and persist it atomically, owner-only.
+
+        Google consent is personal, so the employee's account is staged under
+        its own key rather than overwriting the main operator's.
+        """
 
         checked = validate_identifier(provider, field, value)
         staged = self.read()
-        staged.setdefault(str(provider), {})[str(field)] = checked
+        stored_field = str(field)
+        if provider == "google_workspace" and role is Role.EMPLOYEE:
+            stored_field = "employee_account_email"
+        staged.setdefault(str(provider), {})[stored_field] = checked
         payload = json.dumps(staged, sort_keys=True, separators=(",", ":")).encode()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():

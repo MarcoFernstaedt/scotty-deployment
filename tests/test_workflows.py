@@ -303,3 +303,26 @@ class RuntimeWorkflowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoreIsolationTests(unittest.TestCase):
+    def test_saving_one_workflow_never_drops_an_entry_it_cannot_parse(self) -> None:
+        """Including the other user's, if a later version tightens validation."""
+
+        import json
+
+        with tempfile.TemporaryDirectory(prefix="scotty-workflows-") as directory:
+            path = Path(directory) / "workflows.json"
+            store = WorkflowStore(path, owner_uid=None)
+            store.save(parse_workflow(definition(), owner=Role.MAIN_OPERATOR))
+
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            stored["workflows"].append(
+                {"workflow_id": "future-1", "owner": "employee", "name": "From a later version"}
+            )
+            path.write_text(json.dumps(stored), encoding="utf-8")
+
+            # This version cannot parse the other entry, and must not lose it.
+            store.save(parse_workflow(definition(name="Second"), owner=Role.MAIN_OPERATOR))
+            after = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn("future-1", {entry.get("workflow_id") for entry in after["workflows"]})

@@ -285,3 +285,53 @@ class DiscordAdapterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmbiguousStatusTests(unittest.TestCase):
+    """A provider that received a write but did not say what it did."""
+
+    def transport(self, status: int):
+        import urllib.error
+
+        from assistant.scotty_business.adapters.http import HttpTransport
+
+        class Failing(HttpTransport):
+            def __init__(self) -> None:
+                super().__init__()
+
+                class Opener:
+                    @staticmethod
+                    def open(request, timeout=None):
+                        raise urllib.error.HTTPError(request.full_url, status, "provider", {}, None)
+
+                self._opener = Opener()
+
+        return Failing()
+
+    def test_a_5xx_or_429_on_a_write_is_unknown_not_a_definite_failure(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        for status in (429, 500, 502, 503, 504):
+            for method in ("POST", "PUT", "PATCH", "DELETE"):
+                with (
+                    self.subTest(status=status, method=method),
+                    self.assertRaises(AmbiguousEffectError),
+                ):
+                    self.transport(status).request(method, "https://example.invalid/thing")
+
+    def test_a_refusal_is_still_a_refusal_and_a_read_is_still_a_read(self) -> None:
+        from assistant.scotty_business.adapters.http import (
+            AmbiguousEffectError,
+            require_success,
+        )
+
+        # A 403 on a write is the provider deciding: the effect did not happen.
+        response = self.transport(403).request("POST", "https://example.invalid/thing")
+        self.assertEqual(response.status, 403)
+        with self.assertRaises(Exception) as caught:
+            require_success(response)
+        self.assertNotIsInstance(caught.exception, AmbiguousEffectError)
+        # A read that fails is a read that failed; nothing was mutated.
+        self.assertEqual(
+            self.transport(500).request("GET", "https://example.invalid/thing").status, 500
+        )

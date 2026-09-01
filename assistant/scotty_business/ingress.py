@@ -105,9 +105,12 @@ class IngressGuard:
             # principal gets no wizard, no reply, and no disclosure.
             return {"action": "skip", "reason": "fixed-wizard"}
         if stripped == EMPLOYEE_SUMMARY_COMMAND:
-            destination = next(
-                item.channel_id for item in self.config.principals if item.role == Role.EMPLOYEE
-            )
+            if principal.role is not Role.EMPLOYEE:
+                # It is delivered into the employee's own private channel, so
+                # only the employee may ask for it. Anyone else gets nothing,
+                # and learns nothing about the other channel.
+                return {"action": "skip", "reason": "fixed-employee-summary"}
+            destination = principal.channel_id
             self.enqueue(destination, employee_summary(self._assistant_name(Role.EMPLOYEE)))
             return {"action": "skip", "reason": "fixed-employee-summary"}
         return {"action": "allow"}

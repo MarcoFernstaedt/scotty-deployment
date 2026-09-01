@@ -200,7 +200,13 @@ class IngressRouteTests(unittest.TestCase):
         self.assertEqual(self.outbound, [], "no reply ever discloses the private route")
 
     def test_client_fixed_paths_never_target_the_private_route(self) -> None:
-        self.guard(synthetic.event(text=EMPLOYEE_SUMMARY_COMMAND))
+        self.guard(
+            synthetic.event(
+                channel=EMPLOYEE_CHANNEL,
+                user=EMPLOYEE_USER,
+                text=EMPLOYEE_SUMMARY_COMMAND,
+            )
+        )
         self.guard(synthetic.event(text="Please write code for an integration"))
         destinations = {channel for channel, _ in self.outbound}
         self.assertTrue(destinations)
@@ -305,7 +311,13 @@ class IngressRouteTests(unittest.TestCase):
         self.assertEqual(self.outbound, [])
 
     def test_the_employee_summary_still_works_alongside_the_wizard(self) -> None:
-        self.guard(synthetic.event(text=EMPLOYEE_SUMMARY_COMMAND))
+        self.guard(
+            synthetic.event(
+                channel=EMPLOYEE_CHANNEL,
+                user=EMPLOYEE_USER,
+                text=EMPLOYEE_SUMMARY_COMMAND,
+            )
+        )
         self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, employee_summary("Assistant"))])
 
 

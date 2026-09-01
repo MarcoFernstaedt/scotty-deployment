@@ -225,8 +225,14 @@ class SetupTests(unittest.TestCase):
         result = collect_inputs(
             input_fn=lambda prompt: next(visible_answers), hidden_fn=hidden, environ={}
         )
-        self.assertEqual(len(hidden_prompts), 6)
-        self.assertEqual(len(result.secrets), 6)
+        # Six shared prompts, plus one per-user prompt for each of the four
+        # provider credentials, for both client users.
+        self.assertEqual(len(hidden_prompts), 14)
+        self.assertEqual(len(result.secrets), 14)
+        self.assertTrue(
+            any("main operator" in prompt for prompt in hidden_prompts)
+            and any("employee" in prompt for prompt in hidden_prompts)
+        )
         self.assertTrue(all(value.startswith("secret-") for value in result.secrets.values()))
         self.assertIsNone(result.provision_channel_names)
         self.assertEqual(result.google_account_email, GOOGLE_ACCOUNT)

@@ -420,6 +420,26 @@ class WorkflowStore:
         self.path = path
         self.owner_uid = owner_uid
 
+    def _raw_entries(self) -> list[Mapping[str, object]]:
+        """Every stored entry, parseable or not.
+
+        Kept separate from `_read_all` so that writing one user's workflow can
+        never drop an entry this version happens not to understand — including
+        the other user's.
+        """
+
+        if self.path.is_symlink() or not self.path.is_file():
+            return []
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("workflows"), list):
+            return []
+        stored = raw["workflows"]
+        assert isinstance(stored, list)  # noqa: S101 - checked immediately above
+        return [entry for entry in stored if isinstance(entry, Mapping)]
+
     def _read_all(self) -> list[Workflow]:
         if self.path.is_symlink() or not self.path.is_file():
             return []
@@ -459,11 +479,14 @@ class WorkflowStore:
         return workflows
 
     def _write_all(self, workflows: Sequence[Workflow]) -> None:
+        self._write_entries([item.as_json() for item in workflows])
+
+    def _write_entries(self, entries: Sequence[Mapping[str, object]]) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if self.path.parent.is_symlink() or self.path.is_symlink():
             raise WorkflowError("the workflow state path is unsafe")
         payload = json.dumps(
-            {"workflows": [item.as_json() for item in workflows]},
+            {"workflows": [dict(entry) for entry in entries]},
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -502,11 +525,15 @@ class WorkflowStore:
         raise WorkflowError("no such workflow")
 
     def save(self, workflow: Workflow) -> Workflow:
-        workflows = self._read_all()
+        """Write one workflow, preserving every other entry byte for byte."""
+
         stored = replace(workflow, updated_at=datetime.now(UTC).isoformat())
-        workflows = [item for item in workflows if item.workflow_id != workflow.workflow_id]
-        workflows.append(stored)
-        self._write_all(workflows)
+        kept = [
+            entry
+            for entry in self._raw_entries()
+            if str(entry.get("workflow_id", "")) != workflow.workflow_id
+        ]
+        self._write_entries([*kept, stored.as_json()])
         return stored
 
     def transition(self, workflow_id: str, owner: Role, state: WorkflowState) -> Workflow:

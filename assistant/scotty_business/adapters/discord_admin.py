@@ -175,7 +175,7 @@ class DiscordAdminAdapter:
             raise ProviderError(f"a Discord topic is at most {MAX_TOPIC_CHARS} characters")
         body: dict[str, object] = {"name": _name(name), "type": CHANNEL_KINDS[kind]}
         if parent_id:
-            body["parent_id"] = fixed_id(parent_id, "category id")
+            body["parent_id"] = self.require_in_guild(parent_id)["id"]
         if topic:
             body["topic"] = topic
         if overwrites is not None:
@@ -197,7 +197,8 @@ class DiscordAdminAdapter:
     def edit_channel(self, channel_id: str, changes: Mapping[str, object]) -> dict[str, object]:
         """Rename, retopic, or reparent one channel, then prove it."""
 
-        channel = fixed_id(channel_id, "channel id")
+        channel = self.require_in_guild(channel_id)["id"]
+        assert type(channel) is str  # noqa: S101 - proven by the readback above
         allowed = {"name", "topic", "parent_id", "position"}
         if not changes or set(changes) - allowed:
             raise ProviderError("that Discord channel change is not permitted")
@@ -227,6 +228,7 @@ class DiscordAdminAdapter:
         """
 
         channel = fixed_id(channel_id, "channel id")
+        self.require_in_guild(channel)
         self._patch_channel(channel, {"archived": True, "locked": True})
         observed = self._read_channel(channel)
         if observed.get("archived") is not True:
@@ -248,6 +250,8 @@ class DiscordAdminAdapter:
             for entry in positions
             if isinstance(entry, Mapping)
         ]
+        for channel, _ in planned:
+            self.require_in_guild(channel)
         ordered: list[str] = []
         for channel, position in planned:
             # One channel at a time, each read back, so a partly applied
@@ -268,6 +272,7 @@ class DiscordAdminAdapter:
 
         channel = fixed_id(channel_id, "channel id")
         checked = _overwrites(list(overwrites))
+        self.require_in_guild(channel)
         for entry in checked:
             response = self.transport.request(
                 "PUT",
@@ -298,15 +303,60 @@ class DiscordAdminAdapter:
 
     # ---- roles, events, webhooks, moderation ---------------------------
 
-    def assign_role(
-        self, user_id: str, role_id: str, *, bot_position: int, role: Mapping[str, object]
-    ) -> MemberRoles:
-        """Give one member one role, only below the bot and never privileged."""
+    def guild_roles(self) -> dict[str, Mapping[str, object]]:
+        """Every role in the configured guild, as the guild reports them."""
+
+        body = require_success(
+            self.transport.request(
+                "GET", f"{_BASE}/guilds/{self.guild_id}/roles", headers=self._headers
+            )
+        )
+        if not isinstance(body, list):
+            raise ProviderError("Discord role list is malformed")
+        roles: dict[str, Mapping[str, object]] = {}
+        for entry in body:
+            if isinstance(entry, Mapping) and type(entry.get("id")) is str:
+                roles[str(entry["id"])] = entry
+        return roles
+
+    def bot_role_position(self, roles: Mapping[str, Mapping[str, object]]) -> int:
+        """The bot's own highest role position, read rather than supplied."""
+
+        identity = require_success(
+            self.transport.request(
+                "GET",
+                f"{_BASE}/guilds/{self.guild_id}/members/@me",
+                headers=self._headers,
+            )
+        )
+        if not isinstance(identity, Mapping):
+            raise ProviderError("Discord bot membership is malformed")
+        held = identity.get("roles")
+        positions = [
+            _int(roles[item].get("position", 0), "role position")
+            for item in (held if isinstance(held, list) else [])
+            if type(item) is str and item in roles
+        ]
+        if not positions:
+            raise ProviderError("the bot holds no role in the configured guild")
+        return max(positions)
+
+    def assign_role(self, user_id: str, role_id: str) -> MemberRoles:
+        """Give one member one role, only below the bot and never privileged.
+
+        The role's position, managed flag, and permission bits are read from the
+        guild rather than taken from the caller: a proposal that described a
+        privileged role as harmless would otherwise decide its own authority.
+        """
 
         member = fixed_id(user_id, "user id")
         target = fixed_id(role_id, "role id")
+        roles = self.guild_roles()
+        role = roles.get(target)
+        if role is None:
+            raise ProviderError("that role is not in the configured guild")
         if not role_is_assignable(
-            bot_position=bot_position,
+            bot_position=self.bot_role_position(roles),
             role_position=_int(role.get("position", 0), "role position"),
             managed=bool(role.get("managed", False)),
             permissions=_int(role.get("permissions", 0), "role permissions"),
@@ -386,6 +436,7 @@ class DiscordAdminAdapter:
         """Create a webhook and return its identity only, never its token."""
 
         channel = fixed_id(channel_id, "channel id")
+        self.require_in_guild(channel)
         response = self.transport.request(
             "POST",
             f"{_BASE}/channels/{channel}/webhooks",
@@ -457,7 +508,17 @@ class DiscordAdminAdapter:
         )
         if not isinstance(body, Mapping) or body.get("id") != channel:
             raise ProviderError("Discord channel readback identity mismatch")
+        if body.get("guild_id") != self.guild_id:
+            # The channel endpoint carries no guild in its path, so a snowflake
+            # from anywhere the bot has been invited would otherwise be
+            # reachable. The guild is proven from the channel itself.
+            raise ProviderError("that channel is not in the configured guild")
         return dict(body)
+
+    def require_in_guild(self, channel_id: str) -> dict[str, object]:
+        """Prove a channel belongs to the configured guild before touching it."""
+
+        return self._read_channel(fixed_id(channel_id, "channel id"))
 
     def _verify_channel(self, channel: str, intended: Mapping[str, object]) -> dict[str, object]:
         observed = self._read_channel(channel)

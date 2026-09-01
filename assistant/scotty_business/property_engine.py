@@ -461,13 +461,18 @@ class PropertyCardEngine:
             return EffectOutcome(
                 EffectStatus.VERIFIED, "", card_id=card_id, reason="nothing needed to change"
             )
-        record, _ = self.effects.claim(
+        record, claimed = self.effects.claim(
             operation="update",
             key=f"{card_id}:{card.payload_hash()}",
             actor=actor,
             payload_hash=card.payload_hash(),
             source_revision=self.source_revision,
         )
+        if not claimed and record.status is EffectStatus.UNKNOWN:
+            # This exact change was attempted and its outcome was never
+            # established. Repeating it is how an ambiguous effect becomes a
+            # doubled one, so it is reconciled against the card instead.
+            return self._reconcile_change(record, card_id, card, changed)
         try:
             self.trello.update_card(card_id, self._payload(card))  # type: ignore[attr-defined]
         except AmbiguousEffectError as exc:
@@ -483,6 +488,44 @@ class PropertyCardEngine:
             return EffectOutcome(EffectStatus.FAILED, record.effect_id, reason=str(exc))
         return self._verify(record, card_id, card, changed=changed)
 
+    def _reconcile_change(
+        self,
+        record: EffectRecord,
+        card_id: str,
+        intended: PropertyCard,
+        changed: tuple[str, ...],
+    ) -> EffectOutcome:
+        """Establish what an unresolved earlier change actually did."""
+
+        observed = self._read(card_id)
+        if observed is None:
+            return EffectOutcome(
+                EffectStatus.UNKNOWN,
+                record.effect_id,
+                card_id=card_id,
+                reason="the card still cannot be read; reconcile before retry",
+            )
+        diff = compare(intended, observed)
+        if diff.conflicts or diff.only_left:
+            return EffectOutcome(
+                EffectStatus.UNKNOWN,
+                record.effect_id,
+                card_id=card_id,
+                reason="an earlier change to this card is unresolved; reconcile before retry",
+            )
+        self.effects.settle(
+            record.effect_id,
+            EffectStatus.VERIFIED,
+            card_id=card_id,
+            receipt={
+                "changed_fields": list(changed),
+                "note": "reconciled a lost acknowledgement",
+            },
+        )
+        return EffectOutcome(
+            EffectStatus.VERIFIED, record.effect_id, card_id=card_id, reconciled=True
+        )
+
     def routine(
         self, actor: Principal, operation: str, card_id: str, arguments: Mapping[str, object]
     ) -> EffectOutcome:
@@ -496,13 +539,35 @@ class PropertyCardEngine:
             destination = arguments.get("list_id")
             if type(destination) is not str or not destination:
                 raise ValueError("a move needs a configured destination list")
-            record, _ = self.effects.claim(
+            record, claimed = self.effects.claim(
                 operation="move",
                 key=f"{card_id}:{destination}",
                 actor=actor,
                 payload_hash=destination,
                 source_revision=self.source_revision,
             )
+            if not claimed and record.status is EffectStatus.UNKNOWN:
+                observed = self.trello.get_card(card_id)  # type: ignore[attr-defined]
+                if observed.fields.get("idList") == destination:
+                    # The earlier attempt did land; only its reply was lost.
+                    self.effects.settle(
+                        record.effect_id,
+                        EffectStatus.VERIFIED,
+                        card_id=card_id,
+                        receipt={"note": "reconciled a lost acknowledgement"},
+                    )
+                    return EffectOutcome(
+                        EffectStatus.VERIFIED,
+                        record.effect_id,
+                        card_id=card_id,
+                        reconciled=True,
+                    )
+                return EffectOutcome(
+                    EffectStatus.UNKNOWN,
+                    record.effect_id,
+                    card_id=card_id,
+                    reason="an earlier move is unresolved; reconcile before retry",
+                )
             try:
                 self.trello.move_card(card_id, destination)  # type: ignore[attr-defined]
             except AmbiguousEffectError as exc:

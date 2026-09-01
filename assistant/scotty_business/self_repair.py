@@ -147,9 +147,12 @@ class SelfRepairManager:
             return False, "configuration is not an object"
         try:
             RuntimeConfig.from_mapping(raw)
-        except ConfigError as exc:
-            # ConfigError names a field, never a configured value.
-            return False, str(exc)[:200]
+        except ConfigError:
+            # A ConfigError names the field it rejected, and some of those
+            # fields are the maintainer route. Health is client-visible, so it
+            # reports that the configuration is unusable and nothing more; the
+            # exact reason is for the operator, at the terminal.
+            return False, "configuration is not usable; rerun local setup"
         return True, ""
 
     def _providers(self) -> dict[str, str]:
@@ -211,7 +214,14 @@ class SelfRepairManager:
         return self._repair_state_permissions()
 
     def _recover_workflows(self) -> dict[str, object]:
-        """Move interrupted work to `unknown`; never blindly retry an effect."""
+        """Move interrupted work to `unknown`; never blindly retry an effect.
+
+        This is deployment-wide rather than per user, because an interrupted
+        effect is a property of the process that died, not of whoever asked for
+        it. It only ever moves `executing` to `unknown` — it never executes,
+        retries, or reads anyone's payload — and it reports counts alone, so it
+        reveals nothing about the other user's work.
+        """
 
         try:
             approvals = self.approvals.recover_interrupted()

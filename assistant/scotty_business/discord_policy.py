@@ -111,6 +111,23 @@ _MASS_MENTION = re.compile(r"@(?:everyone|here)\b")
 _USER_MENTION = re.compile(r"<@[!&]?[0-9]{17,20}>")
 
 
+def protected_channels(config: RuntimeConfig) -> frozenset[str]:
+    """Channels no administrative action may ever touch, from any route.
+
+    Both client users' private channels, and the maintainer's. An approval that
+    could reach one of these would defeat the isolation it is meant to guard,
+    so they are refused outright rather than gated. The set is derived from
+    configuration here so no caller can pass a narrower one by mistake.
+    """
+
+    return frozenset(
+        {
+            *(principal.channel_id for principal in config.principals),
+            config.maintainer_route.channel_id,
+        }
+    )
+
+
 def permitted_destinations(config: RuntimeConfig, principal: Principal) -> frozenset[str]:
     """The channels this caller may act in routinely: their own, and only theirs.
 
@@ -193,8 +210,9 @@ def _classify_administration(
         if not targets:
             return DiscordActionClass.FORBIDDEN
         if targets & private_channels:
-            # A client user's private channel is not administrable by anyone,
-            # including through an approval: that is the isolation itself.
+            # A private channel — either client's, or the maintainer's — is not
+            # administrable by anyone, including through an approval: that is
+            # the isolation itself.
             return DiscordActionClass.FORBIDDEN
     if operation == "set_channel_permissions" and not _overwrites_are_safe(payload):
         return DiscordActionClass.FORBIDDEN

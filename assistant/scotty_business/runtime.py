@@ -6,8 +6,10 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime
+from contextlib import suppress
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, Protocol, overload
@@ -26,6 +28,7 @@ from .adapters import (
 )
 from .adapters.discord_admin import DiscordAdminAdapter
 from .approvals import ApprovalStore, Proposal
+from .backup import backup_state, restorable, rollback_plan, verify_backup
 from .budgets import BudgetLedger, BudgetPolicy
 from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
@@ -34,6 +37,7 @@ from .discord_policy import (
     DiscordActionClass,
     classify_discord_action,
     permitted_destinations,
+    protected_channels,
     redacted_refusal,
     shared_destinations,
 )
@@ -64,7 +68,11 @@ from .property_cards import (
     parse_card,
 )
 from .property_engine import EffectLog, PropertyCardEngine
-from .provider_identity import reject_identity_override
+from .provider_identity import (
+    ProviderIdentity,
+    ProviderIdentityResolver,
+    reject_identity_override,
+)
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
 from .service import GHLPort, GoogleWorkspacePort, RentCastPort, ScottyService, TrelloPort
@@ -77,7 +85,7 @@ from .setup_flow import (
     first_unfinished,
     setup_progress,
 )
-from .supervisor import ConsumerLease, IncidentLog, Supervisor
+from .supervisor import ConsumerLease, HealthState, IncidentLog, Supervisor
 from .workflows import WorkflowState, WorkflowStore, parse_workflow
 
 logger = logging.getLogger(__name__)
@@ -426,37 +434,62 @@ class Runtime:
         self.discord_admin = DiscordAdminAdapter(
             transport, bot_token, self.config.principals[0].guild_id
         )
-        trello_key = os.environ.get("SCOTTY_TRELLO_API_KEY")
-        trello_token = os.environ.get("SCOTTY_TRELLO_TOKEN")
-        ghl_token = os.environ.get("SCOTTY_GHL_PRIVATE_TOKEN")
-        rentcast_key = os.environ.get("SCOTTY_RENTCAST_API_KEY")
-        # A provider is connected only when both its credential and its
-        # configured resource scope are present. No placeholder ever counts.
-        self.connected = {
-            "discord": True,
-            "trello": bool(trello_key and trello_token and self.config.trello is not None),
-            "ghl": bool(ghl_token and self.config.ghl_location_id is not None),
-            "rentcast": bool(rentcast_key and self.config.rentcast_endpoints),
-            "google_workspace": False,
-        }
+        # Provider credentials are resolved per actor: a suffixed variable is
+        # that user's own, the unsuffixed one is the deployment's single shared
+        # business identity, and neither user can reach the other's.
+        self.identities = ProviderIdentityResolver(self.config)
         trello_scope = self.config.trello
         location_id = self.config.ghl_location_id
         endpoints = self.config.rentcast_endpoints
-        self.trello: TrelloReadPort = (
-            TrelloAdapter(transport, trello_key or "", trello_token or "", trello_scope)
-            if self.connected["trello"] and trello_scope is not None
-            else UnconnectedProvider("Trello")
-        )
-        self.ghl: GHLReadPort = (
-            GHLAdapter(transport, ghl_token or "", location_id)
-            if self.connected["ghl"] and location_id is not None
-            else UnconnectedProvider("GoHighLevel")
-        )
-        self.rentcast: RentCastPort = (
-            RentCastAdapter(transport, rentcast_key or "", endpoints)
-            if self.connected["rentcast"] and endpoints
-            else UnconnectedProvider("RentCast")
-        )
+        self.trello_adapters: dict[Role, TrelloReadPort] = {}
+        self.ghl_adapters: dict[Role, GHLReadPort] = {}
+        self.rentcast_adapters: dict[Role, RentCastPort] = {}
+        self.actor_connected: dict[Role, dict[str, bool]] = {}
+        for role in CLIENT_ROLES:
+            identity = self.identities.resolve(self.config.principal_for(role))
+            # A provider is connected for this user only when their credential
+            # and the configured resource scope are both present.
+            trello_ready = bool(identity.trello_connected and trello_scope is not None)
+            ghl_ready = bool(identity.ghl_token and location_id is not None)
+            rentcast_ready = bool(identity.rentcast_key and endpoints)
+            self.actor_connected[role] = {
+                "trello": trello_ready,
+                "ghl": ghl_ready,
+                "rentcast": rentcast_ready,
+            }
+            self.trello_adapters[role] = (
+                TrelloAdapter(
+                    transport,
+                    identity.trello_key or "",
+                    identity.trello_token or "",
+                    trello_scope,
+                )
+                if trello_ready and trello_scope is not None
+                else UnconnectedProvider("Trello")
+            )
+            self.ghl_adapters[role] = (
+                GHLAdapter(transport, identity.ghl_token or "", location_id)
+                if ghl_ready and location_id is not None
+                else UnconnectedProvider("GoHighLevel")
+            )
+            self.rentcast_adapters[role] = (
+                RentCastAdapter(transport, identity.rentcast_key or "", endpoints)
+                if rentcast_ready and endpoints
+                else UnconnectedProvider("RentCast")
+            )
+        self.connected = {
+            "discord": True,
+            "trello": any(item["trello"] for item in self.actor_connected.values()),
+            "ghl": any(item["ghl"] for item in self.actor_connected.values()),
+            "rentcast": any(item["rentcast"] for item in self.actor_connected.values()),
+            "google_workspace": False,
+        }
+        # The main operator's adapters back the deployment-level service and the
+        # shared property board; per-actor work resolves its own below.
+        operator = Role.MAIN_OPERATOR
+        self.trello: TrelloReadPort = self.trello_adapters[operator]
+        self.ghl: GHLReadPort = self.ghl_adapters[operator]
+        self.rentcast: RentCastPort = self.rentcast_adapters[operator]
         state_dir = home / "scotty"
         # Consent is personal, so each client user has their own token record
         # and their own adapter. Nothing here is shared between the two.
@@ -681,8 +714,113 @@ class Runtime:
         """What this exact user is connected to, not what the deployment has."""
 
         connected = dict(self.connected)
+        connected.update(self.actor_connected.get(principal.role, {}))
         connected["google_workspace"] = self.google_connected.get(principal.role, False)
         return provider_status(connected)
+
+    def _maintenance(self, principal: Principal, args: Mapping[str, object]) -> object:
+        """Backup, restore-preview, rollback-plan and health. Maintainer only.
+
+        These reach the deployment's own state rather than any one user's work,
+        so they are not client operations. Rollback is planned here and run by a
+        person: nothing in this process stops or starts a container.
+        """
+
+        if principal.role is not Role.MAINTAINER:
+            raise PermissionError("that operation is not available on this route")
+        action = _text(args, "maintenance_action")
+        backups = self.state_dir / "backups"
+        if action == "backup":
+            destination = backups / datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+            backup_state(self.state_dir, destination)
+            return {
+                "backup": destination.name,
+                "files": list(restorable(destination)),
+                "intact": not verify_backup(destination),
+            }
+        if action in {"verify_backup", "restorable"}:
+            destination = backups / _text(args, "backup")
+            mismatched = verify_backup(destination)
+            return {
+                "backup": destination.name,
+                "intact": not mismatched,
+                "mismatched": list(mismatched),
+                "would_restore": list(restorable(destination)),
+            }
+        if action == "rollback_plan":
+            return rollback_plan(
+                Path("/srv/Scotty/releases"), current=_text(args, "release", optional=True) or ""
+            ).as_json()
+        if action == "provider_watch":
+            return self.watch_providers()
+        if action == "supervision":
+            return {
+                "consumer_lease_holder": self.consumer_lease.holder(),
+                "open_incidents": list(self.incidents.open_incidents()),
+                "restart_allowed": self.supervisor.should_restart().allowed,
+            }
+        raise ValueError("maintenance action is not permitted")
+
+    def watch_providers(self) -> dict[str, str]:
+        """Check each provider, open or close its breaker, and alert once.
+
+        The supervisor does this rather than the model, so a provider that goes
+        away is noticed whether or not anyone happens to be talking to Scotty.
+        """
+
+        report: dict[str, str] = {}
+        for provider, connected in self.provider_connection_status().items():
+            if not connected:
+                report[provider] = HealthState.NOT_CONFIGURED.value
+                continue
+            state = self.budgets.breaker(provider)
+            if state.open:
+                report[provider] = HealthState.BLOCKED.value
+                if self.incidents.should_alert(f"{provider}_unavailable"):
+                    self._alert_maintainer(
+                        f"{provider} is failing repeatedly and is being left to recover."
+                    )
+                continue
+            report[provider] = HealthState.HEALTHY.value
+            if self.incidents.should_alert_recovery(f"{provider}_unavailable"):
+                self._alert_maintainer(f"{provider} is answering again.")
+        return report
+
+    def record_provider_failure(self, provider: str) -> None:
+        """One failed provider call, counted toward that provider's breaker."""
+
+        self.budgets.record_failure(provider)
+
+    def record_provider_success(self, provider: str) -> None:
+        self.budgets.record_success(provider)
+
+    def _alert_maintainer(self, message: str) -> None:
+        """One redacted line to the maintainer's own channel, budget-bound."""
+
+        maintainer = Principal(
+            guild_id=self.config.maintainer_route.guild_id,
+            channel_id=self.config.maintainer_route.channel_id,
+            user_id=self.config.maintainer_route.user_id,
+            role=Role.MAINTAINER,
+        )
+        if not self.budgets.spend(maintainer, "incident_alert").allowed:
+            return
+        with suppress(Exception):
+            self.discord.send_message(self.config.maintainer_route.channel_id, message)
+
+    def identity_for(self, principal: Principal) -> ProviderIdentity:
+        """This caller's provider identity, for attribution on every effect."""
+
+        return self.identities.resolve(principal)
+
+    def _trello(self, principal: Principal) -> TrelloReadPort:
+        return self.trello_adapters.get(principal.role, UnconnectedProvider("Trello"))
+
+    def _ghl(self, principal: Principal) -> GHLReadPort:
+        return self.ghl_adapters.get(principal.role, UnconnectedProvider("GoHighLevel"))
+
+    def _rentcast(self, principal: Principal) -> RentCastPort:
+        return self.rentcast_adapters.get(principal.role, UnconnectedProvider("RentCast"))
 
     def _provider_setup(
         self, principal: Principal, args: Mapping[str, object]
@@ -726,14 +864,15 @@ class Runtime:
         field = _text(args, "setup_field", optional=True)
         raw = _text(args, "raw", optional=True)
         if field is not None and raw is not None:
-            if principal.role not in _WORKSPACE_WRITE_ROLES:
-                # Staged values become root setup's prefill, so only the operator
-                # may supply one. Everyone may still read guidance and status.
+            if name != "google_workspace" and principal.role not in _WORKSPACE_WRITE_ROLES:
+                # Staged values become root setup's prefill, so shared
+                # deployment identifiers stay with the operator. A user's own
+                # Workspace account is theirs to give.
                 raise PermissionError("only the main operator may supply a setup identifier")
             # Only non-secret identifiers are ever collected here, and they are
             # staged for local setup rather than applied to live configuration.
             try:
-                staged = self.setup_staging.stage(name, field, raw)
+                staged = self.setup_staging.stage(name, field, raw, role=principal.role)
             except SetupFlowError as exc:
                 return {"provider": name, "accepted": False, "correction": str(exc)}
             refreshed = setup_progress(self.config, status, staged, role=principal.role)
@@ -764,7 +903,12 @@ class Runtime:
         # The actor is the authorized Discord origin, resolved before any
         # provider is touched.
         reject_identity_override(args)
+        # Every provider this call may touch is chosen by the authenticated
+        # actor, so one user's session can never reach another's identity.
         workspace = self._workspace(principal)
+        trello = self._trello(principal)
+        ghl = self._ghl(principal)
+        rentcast = self._rentcast(principal)
         operation = _text(args, "operation")
         if operation == "self_health":
             return self.self_repair.health()
@@ -789,6 +933,8 @@ class Runtime:
             return self._property_card(principal, args)
         if operation == "workflow":
             return self._workflow(principal, args)
+        if operation == "maintenance":
+            return self._maintenance(principal, args)
         if operation == "provider_setup":
             return self._provider_setup(principal, args)
         if operation == "discord":
@@ -872,19 +1018,18 @@ class Runtime:
                     "reason": str(exc),
                 }
         if operation == "trello_card":
-            return _record_json(self.trello.get_card(_text(args, "card_id")))
+            return _record_json(trello.get_card(_text(args, "card_id")))
         if operation == "trello_cards":
-            return [_record_json(item) for item in self.trello.list_cards()]
+            return [_record_json(item) for item in trello.list_cards()]
         if operation == "ghl_contact":
-            return _record_json(self.ghl.get_contact(_text(args, "contact_id")))
+            return _record_json(ghl.get_contact(_text(args, "contact_id")))
         if operation == "ghl_conversations":
             return [
-                _record_json(item)
-                for item in self.ghl.search_conversations(_text(args, "contact_id"))
+                _record_json(item) for item in ghl.search_conversations(_text(args, "contact_id"))
             ]
         if operation == "ghl_message":
             return _record_json(
-                self.ghl.get_message(
+                ghl.get_message(
                     _text(args, "conversation_id"),
                     _text(args, "message_id"),
                     _text(args, "contact_id"),
@@ -892,7 +1037,7 @@ class Runtime:
             )
         if operation == "rentcast":
             endpoint = _text(args, "endpoint")
-            return _record_json(self.rentcast.fetch(endpoint, _object(args, "query")))
+            return _record_json(rentcast.fetch(endpoint, _object(args, "query")))
         if operation == "google_gmail_message":
             return _record_json(workspace.get_gmail_message(_text(args, "message_id")))
         if operation == "google_gmail_draft":
@@ -961,7 +1106,7 @@ class Runtime:
             destinations=destinations,
             shared=shared_destinations(self.config),
             guild_id=self.config.principals[0].guild_id,
-            private_channels={item.channel_id for item in self.config.principals},
+            private_channels=protected_channels(self.config),
         )
         if classified is not DiscordActionClass.ROUTINE:
             # Consequence work goes through a proposal; everything else is absent.
@@ -1148,6 +1293,9 @@ class Controller:
 
     def __init__(self) -> None:
         self.home = _home_path()
+        # Identifies this process to the consumer lease. Not a secret and not
+        # an identity: it says which process holds the singleton, nothing more.
+        self._process_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._runtime: Runtime | None = None
         self._intake: CredentialIntake | None = None
         self._lock = threading.RLock()
@@ -1163,6 +1311,9 @@ class Controller:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=2.0)
+        with suppress(Exception):
+            if self._runtime is not None:
+                self._runtime.consumer_lease.release(self._process_id)
 
     def runtime(self) -> Runtime:
         with self._lock:
@@ -1228,11 +1379,21 @@ class Controller:
             )
 
     def _serve(self) -> None:
+        first_pass = True
         while not self._stop.wait(1.0):
             try:
                 runtime = self.runtime()
             except Exception:  # noqa: S112 - setup may not have published state yet
                 # Setup may not have published private state yet.
+                continue
+            if first_pass:
+                # One process consumes Discord. A restart that overlaps its
+                # predecessor, or a second container, is refused the lease and
+                # is told so rather than quietly doubling every message.
+                runtime.supervisor.record_restart()
+                first_pass = False
+            if not runtime.consumer_lease.claim(self._process_id):
+                logger.warning("Another consumer holds the Discord lease; standing down.")
                 continue
             for _ in range(20):
                 try:
@@ -1247,3 +1408,7 @@ class Controller:
                 runtime.reminder_worker.run_once()
             except Exception as exc:
                 logger.warning("Reminder poll failed: %s", type(exc).__name__)
+            try:
+                runtime.watch_providers()
+            except Exception as exc:
+                logger.warning("Provider watch failed: %s", type(exc).__name__)

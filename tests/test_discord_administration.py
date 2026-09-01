@@ -221,6 +221,29 @@ class SyntheticGuild:
         self.permissions = permissions
         self.channels: dict[str, dict] = {}
         self.members: dict[str, dict] = {"390000000000000001": {"roles": []}}
+        # The bot's own role sits above the assignable one and below nothing.
+        self.roles: dict[str, dict] = {
+            "240000000000000001": {
+                "id": "240000000000000001",
+                "position": 2,
+                "managed": False,
+                "permissions": "0",
+            },
+            "241000000000000001": {
+                "id": "241000000000000001",
+                "position": 9,
+                "managed": False,
+                "permissions": "0",
+            },
+            "242000000000000001": {
+                "id": "242000000000000001",
+                "position": 1,
+                "managed": False,
+                "permissions": str(ADMINISTRATOR),
+            },
+        }
+        self.bot_roles: list[str] = ["241000000000000001"]
+        self.foreign_channels: set[str] = set()
         self.events: dict[str, dict] = {}
         self.bans: set[str] = set()
         self.calls: list[tuple[str, str]] = []
@@ -234,23 +257,35 @@ class SyntheticGuild:
         path = url.split("discord.com/api/v10", 1)[1]
         if path == "/users/@me/guilds":
             return self._ok([{"id": synthetic.CLIENT_GUILD, "permissions": self.permissions}])
+        if path.endswith("/members/@me"):
+            return self._ok({"roles": list(self.bot_roles)})
+        if path.endswith("/roles"):
+            return self._ok(list(self.roles.values()))
         if method == "POST" and path.endswith("/channels"):
             channel_id = f"23000000000000000{self.next_id}"
             self.next_id += 1
             self.channels[channel_id] = {
                 "id": channel_id,
+                "guild_id": synthetic.CLIENT_GUILD,
                 "permission_overwrites": list(json_body.get("permission_overwrites", [])),
                 **{k: v for k, v in json_body.items() if k != "permission_overwrites"},
             }
             return self._ok(dict(self.channels[channel_id]), status=201)
         if method == "PATCH" and path.startswith("/channels/"):
             channel_id = path.split("/")[2]
-            self.channels.setdefault(channel_id, {"id": channel_id}).update(json_body or {})
+            self.channels.setdefault(
+                channel_id, {"id": channel_id, "guild_id": synthetic.CLIENT_GUILD}
+            ).update(json_body or {})
             return self._ok(dict(self.channels[channel_id]))
         if method == "PUT" and "/permissions/" in path:
             channel_id, overwrite_id = path.split("/")[2], path.split("/")[4]
             channel = self.channels.setdefault(
-                channel_id, {"id": channel_id, "permission_overwrites": []}
+                channel_id,
+                {
+                    "id": channel_id,
+                    "guild_id": synthetic.CLIENT_GUILD,
+                    "permission_overwrites": [],
+                },
             )
             existing = [
                 item
@@ -262,8 +297,15 @@ class SyntheticGuild:
             return self._ok(None, status=204)
         if method == "GET" and path.startswith("/channels/"):
             channel_id = path.split("/")[2]
+            if channel_id in self.foreign_channels:
+                # A channel in another guild the bot has also been invited to.
+                return self._ok({"id": channel_id, "guild_id": "999000000000000009"})
             if channel_id not in self.channels:
-                return self._ok(None, status=404)
+                self.channels[channel_id] = {
+                    "id": channel_id,
+                    "guild_id": synthetic.CLIENT_GUILD,
+                    "permission_overwrites": [],
+                }
             return self._ok(dict(self.channels[channel_id]))
         if "/members/" in path and "/roles/" in path:
             member_id, role_id = path.split("/")[4], path.split("/")[6]
@@ -363,27 +405,46 @@ class AdminAdapterTests(unittest.TestCase):
         by_id = {item["id"]: item for item in observed["permission_overwrites"]}
         self.assertEqual(by_id[synthetic.EMPLOYEE_USER]["allow"], "1024")
 
-    def test_a_role_at_or_above_the_bot_is_refused_before_the_call(self) -> None:
+    def test_a_role_at_or_above_the_bot_is_refused_from_the_guilds_own_answer(self) -> None:
+        """The role's properties are read, never taken from the caller."""
+
         from assistant.scotty_business.adapters.http import ProviderError
 
         adapter, guild = self.adapter()
+        # 241… sits at the bot's own position; 242… is privileged.
+        for role_id in ("241000000000000001", "242000000000000001"):
+            with self.subTest(role=role_id), self.assertRaises(ProviderError):
+                adapter.assign_role("390000000000000001", role_id)
+        self.assertNotIn("PUT", {method for method, _ in guild.calls})
+
+    def test_a_role_that_is_not_in_the_configured_guild_is_refused(self) -> None:
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        adapter, _ = self.adapter()
         with self.assertRaises(ProviderError):
-            adapter.assign_role(
-                "390000000000000001",
-                "240000000000000001",
-                bot_position=3,
-                role={"position": 9, "managed": False, "permissions": 0},
-            )
-        self.assertEqual(guild.calls, [])
+            adapter.assign_role("390000000000000001", "249000000000000009")
+
+    def test_a_channel_in_another_guild_is_refused_by_the_adapter(self) -> None:
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        adapter, guild = self.adapter()
+        guild.foreign_channels.add("230000000000000099")
+        for call in (
+            lambda: adapter.edit_channel("230000000000000099", {"name": "renamed"}),
+            lambda: adapter.archive_channel("230000000000000099"),
+            lambda: adapter.create_webhook("230000000000000099", "updates"),
+            lambda: adapter.set_channel_permissions(
+                "230000000000000099",
+                [{"id": synthetic.EMPLOYEE_USER, "allow": "1024", "deny": "0"}],
+            ),
+        ):
+            with self.subTest(call=call), self.assertRaises(ProviderError):
+                call()
+        self.assertNotIn("PATCH", {method for method, _ in guild.calls})
 
     def test_an_assigned_role_is_confirmed_on_the_member(self) -> None:
         adapter, _ = self.adapter()
-        observed = adapter.assign_role(
-            "390000000000000001",
-            "240000000000000001",
-            bot_position=9,
-            role={"position": 2, "managed": False, "permissions": 0},
-        )
+        observed = adapter.assign_role("390000000000000001", "240000000000000001")
         self.assertIn("240000000000000001", observed.roles)
         removed = adapter.remove_role("390000000000000001", "240000000000000001")
         self.assertNotIn("240000000000000001", removed.roles)

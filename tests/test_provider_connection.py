@@ -20,6 +20,18 @@ _ALL_SECRETS = {
     "SCOTTY_TRELLO_TOKEN": "synthetic-trello-token",
     "SCOTTY_GHL_PRIVATE_TOKEN": "synthetic-ghl",
     "SCOTTY_RENTCAST_API_KEY": "synthetic-rentcast",
+    # The per-actor variables are saved and cleared too, so one test's
+    # per-user credential can never leak into another test's runtime.
+    **{
+        f"{name}_{role}": f"synthetic-{name.lower()}-{role.lower()}"
+        for name in (
+            "SCOTTY_TRELLO_API_KEY",
+            "SCOTTY_TRELLO_TOKEN",
+            "SCOTTY_GHL_PRIVATE_TOKEN",
+            "SCOTTY_RENTCAST_API_KEY",
+        )
+        for role in ("MAIN_OPERATOR", "EMPLOYEE")
+    },
 }
 
 

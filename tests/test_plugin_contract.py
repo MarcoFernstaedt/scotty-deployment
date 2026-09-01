@@ -58,10 +58,18 @@ class IngressTests(unittest.TestCase):
         self.assertEqual(self.guard(event()), {"action": "allow"})
         self.assertEqual(self.outbound, [])
 
-    def test_employee_summary_has_separate_fixed_request_and_destination(self) -> None:
-        result = self.guard(event(text=EMPLOYEE_SUMMARY_COMMAND))
+    def test_employee_summary_reaches_only_the_employee_who_asked(self) -> None:
+        result = self.guard(
+            event(channel=EMPLOYEE_CHANNEL, user=EMPLOYEE_USER, text=EMPLOYEE_SUMMARY_COMMAND)
+        )
         self.assertEqual(result["action"], "skip")
         self.assertEqual(self.outbound, [(EMPLOYEE_CHANNEL, employee_summary("Assistant"))])
+
+    def test_nobody_else_can_post_into_the_employees_channel(self) -> None:
+        self.outbound.clear()
+        result = self.guard(event(text=EMPLOYEE_SUMMARY_COMMAND))
+        self.assertEqual(result["action"], "skip")
+        self.assertEqual(self.outbound, [])
 
     def test_fixed_paths_only_ever_reach_configured_client_destinations(self) -> None:
         allowed = set(synthetic.config().client_discord_destinations())

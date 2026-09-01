@@ -929,6 +929,108 @@ class AuthoritativeReadbackTests(unittest.TestCase):
         # would report a false mismatch on a draft that was stored correctly.
         self.assertEqual([method for method, _ in google.calls], ["POST", "GET"])
 
+    def test_a_batch_acknowledgement_with_no_replies_is_never_verified(self) -> None:
+        """The resource-level readback only proves the document still exists."""
+
+        from assistant.scotty_business.google_readback import (
+            ReadbackStatus,
+            applied_fully,
+            plan,
+            verify,
+        )
+
+        endpoints = dict.fromkeys(
+            ("gmail", "calendar", "drive", "docs", "sheets", "people"),
+            "https://example.invalid",
+        )
+        payload = {"requests": [{"insertText": {}}, {"insertText": {}}]}
+        for operation, resource, body in (
+            ("docs_batch_update", "document-1", {"documentId": "document-1"}),
+            ("sheets_batch_update", "sheet-1", {"spreadsheetId": "sheet-1"}),
+        ):
+            with self.subTest(operation=operation):
+                self.assertIs(applied_fully(operation, payload, body), False)
+                plan_ = plan(operation, resource, payload, body, endpoints)
+                self.assertEqual(
+                    verify(plan_, 200, body, fully_applied=False), ReadbackStatus.PARTIAL
+                )
+
+    def test_a_values_write_must_land_in_the_range_it_named(self) -> None:
+        from assistant.scotty_business.google_readback import (
+            ReadbackStatus,
+            plan,
+            verify,
+        )
+
+        endpoints = dict.fromkeys(
+            ("gmail", "calendar", "drive", "docs", "sheets", "people"),
+            "https://example.invalid",
+        )
+        payload = {"data": [{"range": "Sheet1!A1:B1", "values": [["a", "b"]]}]}
+        plan_ = plan("sheets_update_values", "sheet-1", payload, {}, endpoints)
+        assert plan_ is not None
+        elsewhere = {"valueRanges": [{"range": "Sheet2!A1:B1", "values": [["a", "b"]]}]}
+        self.assertEqual(verify(plan_, 200, elsewhere, fully_applied=None), ReadbackStatus.MISMATCH)
+        landed = {"valueRanges": [{"range": "Sheet1!A1:B1", "values": [["a", "b"]]}]}
+        self.assertEqual(verify(plan_, 200, landed, fully_applied=None), ReadbackStatus.VERIFIED)
+        # An entry whose values cannot be read leaves the write unprovable.
+        self.assertIsNone(
+            plan(
+                "sheets_update_values",
+                "sheet-1",
+                {"data": [{"range": "Sheet1!A1", "values": "not a list"}]},
+                {},
+                endpoints,
+            )
+        )
+
+    def test_a_sharing_change_is_verified_only_against_its_own_grantee(self) -> None:
+        """A pre-existing permission of the same shape must not satisfy it."""
+
+        from assistant.scotty_business.google_readback import (
+            ReadbackStatus,
+            plan,
+            verify,
+        )
+
+        endpoints = {
+            "gmail": "https://gmail.example.invalid",
+            "calendar": "https://calendar.example.invalid",
+            "drive": "https://drive.example.invalid",
+            "docs": "https://docs.example.invalid",
+            "sheets": "https://sheets.example.invalid",
+            "people": "https://people.example.invalid",
+        }
+        intent = {
+            "type": "user",
+            "role": "writer",
+            "emailAddress": "new.grantee@example.invalid",
+        }
+        plan_ = plan("drive_change_permissions", "file-1", intent, {}, endpoints)
+        assert plan_ is not None
+        observed = {
+            "permissions": [
+                {"id": "1", "type": "user", "role": "owner", "emailAddress": "owner@x.invalid"},
+                {"id": "2", "type": "user", "role": "writer", "emailAddress": "other@x.invalid"},
+            ]
+        }
+        self.assertEqual(verify(plan_, 200, observed, fully_applied=None), ReadbackStatus.MISMATCH)
+        landed = {"permissions": [*observed["permissions"], {"id": "3", **intent}]}
+        self.assertEqual(verify(plan_, 200, landed, fully_applied=None), ReadbackStatus.VERIFIED)
+
+    def test_a_sharing_change_that_names_no_grantee_has_no_readback(self) -> None:
+        from assistant.scotty_business.google_readback import plan
+
+        endpoints = dict.fromkeys(
+            ("gmail", "calendar", "drive", "docs", "sheets", "people"),
+            "https://example.invalid",
+        )
+        for payload in ({}, {"role": "writer"}, {"type": "user", "role": "writer"}):
+            with self.subTest(payload=payload):
+                self.assertIsNone(
+                    plan("drive_change_permissions", "file-1", payload, {}, endpoints)
+                )
+
     def test_every_readback_asks_for_the_fields_it_intends_to_compare(self) -> None:
         """A field mask narrower than the comparison can never verify."""
 
@@ -949,7 +1051,7 @@ class AuthoritativeReadbackTests(unittest.TestCase):
             (
                 "drive_change_permissions",
                 "file-1",
-                {"type": "user", "role": "reader"},
+                {"type": "user", "role": "reader", "emailAddress": "a@example.invalid"},
                 {},
             ),
             ("docs_create", "", {"title": "Synthetic"}, {"documentId": "document-1"}),

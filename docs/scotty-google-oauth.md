@@ -9,7 +9,9 @@ authorization code, client file, or account identifier belongs in Git.
 
 ## What Google needs first
 
-1. A Google Cloud project for this deployment.
+1. A Google Cloud project for this deployment. One project and one Desktop
+   client serve both client users; each user consents separately with their own
+   Google account.
 2. These APIs enabled on it: Gmail, Google Calendar, Google Drive, Google Docs,
    Google Sheets, People.
 3. An OAuth consent screen. While it is in testing, the Workspace account must
@@ -43,7 +45,7 @@ file to import a different client.
 Local setup prints the exact authorization URL and publishes the same
 non-secret URL for Scotty to show Trent in his own private channel:
 
-    /srv/Scotty/data/scotty/google-consent.json      10000:10000 0600
+    /srv/Scotty/data/scotty/google-consent.<role>.json   10000:10000 0600
 
 That file holds only the authorization URL, the redirect address, and the
 scopes. The client secret and the PKCE verifier stay in the root-owned files,
@@ -54,7 +56,7 @@ consent succeeded, failed, or was abandoned — the file is removed, because its
 verifier is gone and the URL can no longer be completed by anyone. Scotty
 therefore never shows a stale link that looks live.
 
-Trent opens the URL as the configured Workspace account and approves it. The
+The user whose account it is opens the URL as that Workspace account and approves it. The
 browser then redirects to
 
     http://localhost:8765/oauth2/callback?state=...&code=...
@@ -73,13 +75,19 @@ Setup then exchanges it, checks the granted scopes match exactly, verifies
 which account actually consented, and refuses if that is not the configured
 Workspace account.
 
-## Where the token lives
+## Where the tokens live
 
-    /srv/Scotty/data/scotty/google-oauth.json        10000:10000 0600
+Consent is personal, so each client user has their own record:
 
-It holds the access token, the refresh token, the granted scopes, the bound
-account, and the client identity needed to refresh. Scotty refuses to read it
-if it is group- or world-readable.
+    /srv/Scotty/data/scotty/google-oauth.main_operator.json   10000:10000 0600
+    /srv/Scotty/data/scotty/google-oauth.employee.json        10000:10000 0600
+
+Each holds that user's access token, refresh token, granted scopes, bound
+account, and the client identity needed to refresh. The file name is derived
+from the fixed role slug, never from anything a model or a message can
+influence, and a user with no record of their own is told to connect rather
+than falling through to the other user's. The runtime refuses to read a record
+that is group- or world-readable.
 
 **Refresh.** The access token lasts about an hour and is refreshed in place
 from that file, a couple of minutes before it expires. A refresh never widens
@@ -87,9 +95,10 @@ scope or rebinds the account, and a failed refresh leaves the previous state
 exactly as it was. Consent is a one-time step; expiry alone never means "not
 connected".
 
-**Revoke and reconnect.** Revoke Scotty's access from the Google account's
-security settings, then delete the token file and rerun local setup to consent
-again. Deleting the token file alone leaves the grant live on Google's side.
+**Revoke and reconnect.** Revoke access from that Google account's own security
+settings, then delete that user's token record and rerun local setup to consent
+again. Deleting the record alone leaves the grant live on Google's side, and
+revoking one user's access never affects the other's.
 
 ## When it goes wrong
 

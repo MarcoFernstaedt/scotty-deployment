@@ -8,6 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import synthetic
+
+from assistant.scotty_business.config import GOOGLE_OAUTH_SCOPES
 from assistant.scotty_business.policy import SETUP_WIZARD
 from assistant.scotty_business.setup import SetupError, collect_inputs_from_prefill, load_prefill
 
@@ -258,7 +261,10 @@ class StartCommandContractTests(unittest.TestCase):
         self.assertIn("EUID", source)
         self.assertIn("/srv/Scotty/operator/setup-scotty", source)
         self.assertIn("hermes auth add openai-codex", source)
-        self.assertIn("google-oauth.json", source)
+        # Consent is personal, so the start path checks one token record per
+        # client user and never a single shared file.
+        self.assertIn("google-oauth.${google_role}.json", source)
+        self.assertNotIn("/scotty/google-oauth.json", source)
         self.assertIn("docker stop", source)
         self.assertIn("docker start", source)
         self.assertNotIn("docker run", source)
@@ -272,8 +278,57 @@ class StartCommandContractTests(unittest.TestCase):
         check = source.split("GOOGLE_CONSENT_CHECK='", 1)[1].split("'", 1)[0]
         self.assertIn("/opt/data/plugins", check)
         self.assertNotIn("/srv/Scotty", check)
+        # It must use the per-user configuration API that actually exists.
+        self.assertIn("config.google_for(role)", check)
+        self.assertIn("google_token_path(role, state)", check)
+        self.assertNotIn("config.google_workspace", check)
         self.assertNotIn("send_message", source)
         self.assertNotIn("SETUP_WIZARD", source)
+
+    def test_the_consent_check_runs_against_the_real_per_user_configuration(self) -> None:
+        """The embedded check is executed here, not merely grepped for."""
+
+        import subprocess
+        import sys
+
+        source = Path("scotty-start").read_text(encoding="utf-8")
+        check = source.split("GOOGLE_CONSENT_CHECK='", 1)[1].split("'", 1)[0]
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-check-") as directory:
+            root = Path(directory)
+            (root / "plugins").mkdir()
+            (root / "scotty").mkdir()
+            (root / "scotty" / "private.json").write_text(
+                json.dumps(
+                    synthetic.private_mapping(
+                        google_workspace={
+                            "main_operator": {
+                                "account_email": "operator.synthetic@example.invalid",
+                                "oauth_scopes": list(GOOGLE_OAUTH_SCOPES),
+                            }
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            # Run the container's own code against the real modules, with the
+            # container paths redirected into the temporary root.
+            plugins = str(Path("assistant").resolve())
+            adapted = check.replace(
+                'sys.path.insert(0, "/opt/data/plugins")',
+                f"sys.path.insert(0, {plugins!r})",
+            ).replace("/opt/data", str(root))
+            completed = subprocess.run(  # noqa: S603 - fixed interpreter, local source
+                [sys.executable, "-c", adapted],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=str(Path.cwd()),
+            )
+            # No token file exists, so the configured account is not ready: the
+            # check must exit non-zero rather than raise AttributeError.
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertNotIn("AttributeError", completed.stderr)
+            self.assertNotIn("Traceback", completed.stderr)
 
     def test_partial_failure_stops_the_prepared_container_and_prints_one_recovery_line(
         self,

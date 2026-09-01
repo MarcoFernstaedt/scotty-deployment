@@ -303,5 +303,78 @@ class PerUserSetupProgressTests(unittest.TestCase):
         self.assertTrue(google[Role.EMPLOYEE].missing)
 
 
+class RuntimeWiringTests(unittest.TestCase):
+    """The resolver is what the running system actually uses, not a library."""
+
+    def runtime(self, **environment):
+        from test_provider_connection import runtime
+
+        return runtime(DISCORD_BOT_TOKEN="synthetic-discord", **environment)
+
+    def test_each_user_gets_an_adapter_built_from_their_own_credential(self) -> None:
+        with self.runtime(
+            SCOTTY_TRELLO_API_KEY="shared-key",
+            SCOTTY_TRELLO_TOKEN="shared-token",  # noqa: S106 - synthetic
+            SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
+        ) as runtime:
+            operator = runtime.config.principal_for(Role.MAIN_OPERATOR)
+            employee = runtime.config.principal_for(Role.EMPLOYEE)
+            self.assertIsNot(runtime._trello(operator), runtime._trello(employee))
+            self.assertEqual(runtime.identity_for(operator).trello_token, "operator-token")
+            self.assertEqual(runtime.identity_for(employee).trello_token, "shared-token")
+            self.assertTrue(runtime.identity_for(employee).trello_shared)
+            self.assertFalse(runtime.identity_for(operator).trello_shared)
+
+    def test_a_user_without_a_credential_is_not_connected_to_that_provider(self) -> None:
+        from assistant.scotty_business.runtime import ProviderNotConnected
+
+        with self.runtime(
+            SCOTTY_TRELLO_API_KEY_MAIN_OPERATOR="operator-key",
+            SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
+        ) as runtime:
+            operator = runtime.config.principal_for(Role.MAIN_OPERATOR)
+            employee = runtime.config.principal_for(Role.EMPLOYEE)
+            self.assertTrue(runtime.actor_connection_status(operator)["trello"])
+            self.assertFalse(runtime.actor_connection_status(employee)["trello"])
+            with self.assertRaises(ProviderNotConnected):
+                runtime.handle_read(employee, {"operation": "trello_cards"})
+
+    def test_one_users_read_never_runs_on_the_others_adapter(self) -> None:
+        with self.runtime(
+            SCOTTY_TRELLO_API_KEY="shared-key",
+            SCOTTY_TRELLO_TOKEN="shared-token",  # noqa: S106 - synthetic
+        ) as runtime:
+            calls: list[str] = []
+
+            class Recorder:
+                def __init__(self, label: str) -> None:
+                    self.label = label
+
+                def list_cards(self):
+                    calls.append(self.label)
+                    return ()
+
+            runtime.trello_adapters[Role.MAIN_OPERATOR] = Recorder("operator")
+            runtime.trello_adapters[Role.EMPLOYEE] = Recorder("employee")
+            runtime.handle_read(
+                runtime.config.principal_for(Role.EMPLOYEE), {"operation": "trello_cards"}
+            )
+            self.assertEqual(calls, ["employee"])
+
+    def test_local_setup_collects_a_credential_for_each_user(self) -> None:
+        from assistant.scotty_business.setup import OPTIONAL_SECRETS, PER_ACTOR_SECRETS
+
+        for role in ("MAIN_OPERATOR", "EMPLOYEE"):
+            for provider in (
+                "SCOTTY_TRELLO_API_KEY",
+                "SCOTTY_TRELLO_TOKEN",
+                "SCOTTY_GHL_PRIVATE_TOKEN",
+                "SCOTTY_RENTCAST_API_KEY",
+            ):
+                name = f"{provider}_{role}"
+                self.assertIn(name, PER_ACTOR_SECRETS)
+                self.assertIn(name, OPTIONAL_SECRETS)
+
+
 if __name__ == "__main__":
     unittest.main()

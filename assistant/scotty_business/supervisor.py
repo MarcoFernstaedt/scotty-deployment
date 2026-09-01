@@ -68,16 +68,31 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _read_json(path: Path) -> dict[str, object]:
+class UnreadableState(RuntimeError):
+    """A state file exists but cannot be read, so nothing is assumed about it."""
+
+
+def _read_json(path: Path, *, strict: bool = False) -> dict[str, object]:
+    """Read one small state file.
+
+    `strict` is for state whose absence is permissive. A corrupt lease that read
+    as "unheld" would hand a second consumer the singleton, so an unreadable
+    file is raised rather than treated as empty.
+    """
+
     if path.is_symlink() or not path.is_file():
         return {}
     try:
         body = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        # A corrupt state file is state nobody can rely on. It is replaced
-        # rather than trusted, which is why every claim below rewrites it.
+    except (OSError, json.JSONDecodeError) as exc:
+        if strict:
+            raise UnreadableState(str(path.name)) from exc
         return {}
-    return dict(body) if isinstance(body, Mapping) else {}
+    if not isinstance(body, Mapping):
+        if strict:
+            raise UnreadableState(str(path.name))
+        return {}
+    return dict(body)
 
 
 class ConsumerLease:
@@ -94,7 +109,7 @@ class ConsumerLease:
         self.ttl = timedelta(seconds=ttl_seconds)
 
     def _current(self) -> tuple[str, datetime | None]:
-        body = _read_json(self.path)
+        body = _read_json(self.path, strict=True)
         holder = body.get("holder")
         renewed = body.get("renewed_at")
         if type(holder) is not str or type(renewed) is not str:
@@ -108,7 +123,12 @@ class ConsumerLease:
         """Take or renew the lease. False means someone else holds it."""
 
         moment = (at or datetime.now(UTC)).astimezone(UTC)
-        holder, renewed = self._current()
+        try:
+            holder, renewed = self._current()
+        except UnreadableState:
+            # An unreadable lease is not an unheld one. Refusing keeps the
+            # singleton; the operator clears the file to recover.
+            return False
         held_by_other = holder and holder != process_id and renewed is not None
         if held_by_other and moment - renewed < self.ttl:  # type: ignore[operator]
             return False
@@ -116,12 +136,18 @@ class ConsumerLease:
         return True
 
     def holder(self) -> str:
-        return self._current()[0]
+        try:
+            return self._current()[0]
+        except UnreadableState:
+            return "unreadable"
 
     def release(self, process_id: str) -> bool:
         """Give up the lease. Only its own holder may."""
 
-        holder, _ = self._current()
+        try:
+            holder, _ = self._current()
+        except UnreadableState:
+            return False
         if holder != process_id:
             return False
         with suppress(OSError):
@@ -258,4 +284,5 @@ __all__ = [
     "RestartDecision",
     "RestartState",
     "Supervisor",
+    "UnreadableState",
 ]

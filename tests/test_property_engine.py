@@ -303,3 +303,53 @@ class RuntimeSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmbiguousRetryTests(EngineHarness):
+    """An unresolved change is reconciled, never repeated."""
+
+    def test_an_unresolved_update_reconciles_instead_of_writing_again(self) -> None:
+        engine, trello, _ = self.engine()
+        engine.create(self.actor(), card())
+        card_id = next(iter(trello.cards))
+        target = card(card_id, asking_price="125000")
+        before = card(card_id)
+
+        trello.readback = {"name": "88 Maple Ave, Dayton, OH 45402"}
+        first = engine.update(self.actor(), card_id, target, existing=before)
+        self.assertEqual(first.status, EffectStatus.UNKNOWN)
+        writes = [call for call in trello.calls if call[0] == "update"]
+
+        # The card actually did take the change; only the answer was lost.
+        trello.readback = None
+        second = engine.update(self.actor(), card_id, target, existing=before)
+        self.assertEqual(second.status, EffectStatus.VERIFIED)
+        self.assertTrue(second.reconciled)
+        self.assertEqual([call for call in trello.calls if call[0] == "update"], writes)
+
+    def test_an_unresolved_move_reconciles_instead_of_moving_again(self) -> None:
+        engine, trello, log = self.engine()
+        engine.create(self.actor(), card())
+        card_id = next(iter(trello.cards))
+
+        record, _ = log.claim(
+            operation="move",
+            key=f"{card_id}:list-2",
+            actor=self.actor(),
+            payload_hash="list-2",
+            source_revision="property-card-v2",
+        )
+        self.assertEqual(record.status, EffectStatus.UNKNOWN)
+        trello.calls.clear()
+
+        # The list still says list-1, so the earlier move is still unresolved.
+        pending = engine.routine(self.actor(), "move", card_id, {"list_id": "list-2"})
+        self.assertEqual(pending.status, EffectStatus.UNKNOWN)
+        self.assertNotIn("move", {kind for kind, _ in trello.calls})
+
+        # Once the card reads back in the destination, it reconciles verified.
+        trello.cards[card_id]["idList"] = "list-2"
+        settled = engine.routine(self.actor(), "move", card_id, {"list_id": "list-2"})
+        self.assertEqual(settled.status, EffectStatus.VERIFIED)
+        self.assertTrue(settled.reconciled)
+        self.assertNotIn("move", {kind for kind, _ in trello.calls})
