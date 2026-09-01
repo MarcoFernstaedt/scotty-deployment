@@ -27,6 +27,7 @@ from collections.abc import Iterable, Mapping
 from enum import StrEnum
 
 from .config import RuntimeConfig
+from .discord_permissions import DANGEROUS_PERMISSIONS
 from .policy import Principal
 
 
@@ -57,6 +58,41 @@ ROUTINE_DISCORD_OPERATIONS = frozenset(
 
 #: Wider audience or high-impact volume: allowed, but only through approval.
 CONSEQUENCE_DISCORD_OPERATIONS = frozenset({"announce", "bulk_message"})
+
+#: Functional guild administration. Every one of these is reachable with named
+#: permissions rather than the `Administrator` bit, and every one of them is a
+#: consequence: useful, reversible where it can be, and never silent.
+ADMINISTRATION_DISCORD_OPERATIONS = frozenset(
+    {
+        "create_channel",
+        "edit_channel",
+        "archive_channel",
+        "create_category",
+        "reorder_channels",
+        "set_channel_permissions",
+        "create_forum_post",
+        "assign_role",
+        "remove_role",
+        "create_event",
+        "create_webhook",
+        "kick_member",
+        "ban_member",
+        "read_member_permissions",
+    }
+)
+
+#: Operations that name a channel that already exists, and so can be pointed at
+#: someone else's private channel if nothing checks.
+_CHANNEL_SCOPED_ADMINISTRATION = frozenset(
+    {
+        "edit_channel",
+        "archive_channel",
+        "set_channel_permissions",
+        "create_forum_post",
+        "create_webhook",
+        "reorder_channels",
+    }
+)
 
 #: The file types Scotty may attach, and the size it may attach.
 APPROVED_ATTACHMENT_SUFFIXES = frozenset({".txt", ".md", ".csv", ".json", ".pdf", ".png", ".jpg"})
@@ -114,17 +150,89 @@ def _attachment_ok(payload: Mapping[str, object]) -> bool:
     return type(size) is int and 0 < size <= MAX_ATTACHMENT_BYTES
 
 
+def _overwrites_are_safe(payload: Mapping[str, object]) -> bool:
+    """Whether a permission change grants only things it may grant."""
+
+    overwrites = payload.get("overwrites")
+    if not isinstance(overwrites, list):
+        return False
+    for entry in overwrites:
+        if not isinstance(entry, Mapping):
+            return False
+        allow = entry.get("allow", "0")
+        try:
+            granted = int(allow)
+        except (TypeError, ValueError):
+            return False
+        if granted & DANGEROUS_PERMISSIONS:
+            # Granting Administrator, role management, webhooks or a mass
+            # mention through an overwrite would undo the isolation this
+            # deployment exists to keep.
+            return False
+    return True
+
+
+def _classify_administration(
+    operation: str,
+    payload: Mapping[str, object],
+    *,
+    guild_id: str,
+    private_channels: frozenset[str],
+) -> DiscordActionClass:
+    """Administration is consequence-gated, in-guild, and never private-touching."""
+
+    if not guild_id or _text(payload, "guild_id") != guild_id:
+        # Nothing outside the one configured guild, ever.
+        return DiscordActionClass.FORBIDDEN
+    if operation in _CHANNEL_SCOPED_ADMINISTRATION:
+        targets = {_text(payload, "channel_id")}
+        listed = payload.get("channel_ids")
+        if isinstance(listed, list):
+            targets.update(item for item in listed if type(item) is str)
+        targets.discard("")
+        if not targets:
+            return DiscordActionClass.FORBIDDEN
+        if targets & private_channels:
+            # A client user's private channel is not administrable by anyone,
+            # including through an approval: that is the isolation itself.
+            return DiscordActionClass.FORBIDDEN
+    if operation == "set_channel_permissions" and not _overwrites_are_safe(payload):
+        return DiscordActionClass.FORBIDDEN
+    if operation in {"assign_role", "remove_role"} and not _text(payload, "role_id"):
+        return DiscordActionClass.FORBIDDEN
+    if operation in {"kick_member", "ban_member"}:
+        subject = _text(payload, "user_id")
+        protected = payload.get("protected_user_ids")
+        guarded = (
+            {item for item in protected if type(item) is str}
+            if isinstance(protected, list)
+            else set()
+        )
+        if not subject or subject in guarded:
+            return DiscordActionClass.FORBIDDEN
+    return DiscordActionClass.CONSEQUENCE
+
+
 def classify_discord_action(
     operation: object,
     payload: object,
     *,
     destinations: Iterable[str],
     shared: Iterable[str] = (),
+    guild_id: str = "",
+    private_channels: Iterable[str] = (),
 ) -> DiscordActionClass:
     """Classify one exact Discord action before any provider call."""
 
     if type(operation) is not str or not isinstance(payload, Mapping):
         return DiscordActionClass.FORBIDDEN
+    if operation in ADMINISTRATION_DISCORD_OPERATIONS:
+        return _classify_administration(
+            operation,
+            payload,
+            guild_id=guild_id,
+            private_channels=frozenset(private_channels),
+        )
     known = operation in ROUTINE_DISCORD_OPERATIONS or operation in CONSEQUENCE_DISCORD_OPERATIONS
     if not known:
         return DiscordActionClass.FORBIDDEN

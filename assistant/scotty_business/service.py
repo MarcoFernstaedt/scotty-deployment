@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Protocol
 
 from .adapters import AmbiguousEffectError, ProviderError, ProviderRecord
+from .adapters.discord_admin import DiscordAdminAdapter
 from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
 from .calculations import preliminary_analysis
 from .config import RuntimeConfig, TrelloScope
@@ -80,6 +81,27 @@ class GoogleWorkspacePort(Protocol):
     ) -> ProviderRecord: ...
 
 
+#: The payload keys an administration proposal is allowed to carry, so an
+#: approval records exactly what it authorizes and nothing else.
+_ADMIN_PAYLOAD_KEYS = frozenset(
+    {
+        "channel_id",
+        "channel_ids",
+        "name",
+        "topic",
+        "parent_id",
+        "changes",
+        "overwrites",
+        "user_id",
+        "role_id",
+        "role",
+        "bot_role_position",
+        "start",
+        "description",
+    }
+)
+
+
 class ScottyService:
     """Bounded business orchestration over typed provider adapters."""
 
@@ -92,6 +114,7 @@ class ScottyService:
         ghl: GHLPort,
         rentcast: RentCastPort | None,
         discord: DiscordPort,
+        discord_admin: DiscordAdminAdapter | None = None,
         google_workspace: GoogleWorkspacePort
         | None
         | Callable[[Role], GoogleWorkspacePort | None] = None,
@@ -103,6 +126,7 @@ class ScottyService:
         self.ghl = ghl
         self.rentcast = rentcast
         self.discord = discord
+        self.discord_admin = discord_admin
         self.google_workspace = google_workspace
         self.clock = clock
 
@@ -335,6 +359,48 @@ class ScottyService:
             expires_at=self._now() + timedelta(minutes=10),
         )
 
+    def propose_discord_administration(
+        self, requester: Principal, operation: str, payload: Mapping[str, object]
+    ) -> Proposal:
+        """Propose one guild administration action. Never executed here.
+
+        The guild, the private channels, and the classification are all decided
+        from configuration, so an approval can only ever authorize something the
+        deployment already considers administrable.
+        """
+
+        guild_id = self.config.principals[0].guild_id
+        private = {principal.channel_id for principal in self.config.principals}
+        classified = classify_discord_action(
+            operation,
+            {**payload, "guild_id": guild_id},
+            destinations=(),
+            guild_id=guild_id,
+            private_channels=private,
+        )
+        if classified is not DiscordActionClass.CONSEQUENCE:
+            raise ProviderError("that Discord administration action is not permitted")
+        target = next(
+            (
+                value
+                for key in ("channel_id", "user_id")
+                if type(value := payload.get(key)) is str and value
+            ),
+            "",
+        )
+        return self.approvals.propose(
+            requester=requester,
+            approver=self._approver_for(requester),
+            action_class="discord_administration",
+            target_ids=(guild_id, target or operation),
+            payload={
+                "operation": operation,
+                **{key: value for key, value in payload.items() if key in _ADMIN_PAYLOAD_KEYS},
+            },
+            source_revision="configured-guild-v1",
+            expires_at=self._now() + timedelta(minutes=10),
+        )
+
     def propose_google_workspace_write(
         self,
         requester: Principal,
@@ -381,9 +447,102 @@ class ScottyService:
             return self._execute_announcement(
                 principal, proposal, expected_version, execution_nonce
             )
+        if proposal.action_class == "discord_administration":
+            return self._execute_discord_administration(
+                principal, proposal, expected_version, execution_nonce
+            )
         if proposal.action_class == "google_workspace_consequence":
             return self._execute_google(principal, proposal, expected_version, execution_nonce)
         raise ApprovalError("proposal action class is unsupported")
+
+    def _execute_discord_administration(
+        self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
+    ) -> Proposal:
+        """Run one approved administration action against the configured guild."""
+
+        if self.discord_admin is None:
+            raise ApprovalError("Discord administration is not available")
+        operation = _payload_text(proposal.payload, "operation")
+        guild_id = self.config.principals[0].guild_id
+        if guild_id not in proposal.target_ids:
+            raise ApprovalError("this proposal is bound to another guild")
+        executing = self._claim(principal, proposal, expected_version, nonce, "configured-guild-v1")
+        try:
+            self.discord_admin.require_permission(operation)
+            receipt = self._run_administration(operation, proposal.payload)
+        except AmbiguousEffectError as exc:
+            return self._unknown(executing, {"verified": False, "reason": str(exc)})
+        except (ProviderError, ValueError) as exc:
+            return self._failed(executing, str(exc))
+        return self.approvals.complete_execution(
+            executing.proposal_id,
+            ProposalStatus.VERIFIED,
+            expected_version=executing.version,
+            receipt={"verified": True, **receipt},
+        )
+
+    def _run_administration(
+        self, operation: str, payload: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Dispatch one administration operation to its typed adapter call."""
+
+        admin = self.discord_admin
+        assert admin is not None  # noqa: S101 - guarded by the caller
+        channel_id = _payload_text(payload, "channel_id")
+        if operation in {"create_channel", "create_category"}:
+            created = admin.create_channel(
+                _payload_text(payload, "name"),
+                kind="category" if operation == "create_category" else "text",
+                parent_id=_payload_text(payload, "parent_id"),
+                topic=_payload_text(payload, "topic"),
+                overwrites=overwrites
+                if isinstance(overwrites := payload.get("overwrites"), list)
+                else None,
+            )
+            return {"channel_id": str(created.get("id", ""))}
+        if operation == "edit_channel":
+            changes = payload.get("changes")
+            if not isinstance(changes, Mapping):
+                raise ProviderError("a channel edit needs the changes to make")
+            admin.edit_channel(channel_id, changes)
+            return {"channel_id": channel_id}
+        if operation == "archive_channel":
+            admin.archive_channel(channel_id)
+            return {"channel_id": channel_id, "archived": True}
+        if operation == "set_channel_permissions":
+            overwrites = payload.get("overwrites")
+            if not isinstance(overwrites, list):
+                raise ProviderError("a permission change needs its overwrites")
+            admin.set_channel_permissions(channel_id, overwrites)
+            return {"channel_id": channel_id}
+        if operation in {"assign_role", "remove_role"}:
+            user_id = _payload_text(payload, "user_id")
+            role_id = _payload_text(payload, "role_id")
+            if operation == "remove_role":
+                return admin.remove_role(user_id, role_id).as_json()
+            role = payload.get("role")
+            position = payload.get("bot_role_position")
+            if not isinstance(role, Mapping) or type(position) is not int:
+                raise ProviderError("a role assignment needs the role and the bot's position")
+            return admin.assign_role(user_id, role_id, bot_position=position, role=role).as_json()
+        if operation == "create_event":
+            return dict(
+                admin.create_event(
+                    _payload_text(payload, "name"),
+                    _payload_text(payload, "start"),
+                    channel_id=channel_id,
+                    description=_payload_text(payload, "description"),
+                )
+            )
+        if operation == "create_webhook":
+            return dict(admin.create_webhook(channel_id, _payload_text(payload, "name")))
+        if operation == "kick_member":
+            return dict(admin.kick_member(_payload_text(payload, "user_id")))
+        if operation == "ban_member":
+            return dict(admin.ban_member(_payload_text(payload, "user_id")))
+        if operation == "read_member_permissions":
+            return admin.member_permissions(_payload_text(payload, "user_id")).as_json()
+        raise ProviderError("that Discord administration action is not permitted")
 
     def _execute_google(
         self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str

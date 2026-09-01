@@ -24,6 +24,7 @@ from .adapters import (
     RentCastAdapter,
     TrelloAdapter,
 )
+from .adapters.discord_admin import DiscordAdminAdapter
 from .approvals import ApprovalStore, Proposal
 from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
@@ -416,8 +417,12 @@ class Runtime:
         # Client-visible tools may only ever reach configured client destinations.
         # The private full-profile route is deliberately absent from this allowlist.
         client_channels = self.config.client_discord_destinations()
-        self.discord = DiscordAdapter(
-            transport, _required_env("DISCORD_BOT_TOKEN"), client_channels
+        bot_token = _required_env("DISCORD_BOT_TOKEN")
+        self.discord = DiscordAdapter(transport, bot_token, client_channels)
+        # Guild administration is a separate adapter bound to the one configured
+        # guild. It is reachable only through an approved proposal.
+        self.discord_admin = DiscordAdminAdapter(
+            transport, bot_token, self.config.principals[0].guild_id
         )
         trello_key = os.environ.get("SCOTTY_TRELLO_API_KEY")
         trello_token = os.environ.get("SCOTTY_TRELLO_TOKEN")
@@ -504,6 +509,7 @@ class Runtime:
             ghl=self.ghl,
             rentcast=self.rentcast,
             discord=self.discord,
+            discord_admin=self.discord_admin,
             google_workspace=self.google_workspace_for,
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
@@ -947,6 +953,8 @@ class Runtime:
             },
             destinations=destinations,
             shared=shared_destinations(self.config),
+            guild_id=self.config.principals[0].guild_id,
+            private_channels={item.channel_id for item in self.config.principals},
         )
         if classified is not DiscordActionClass.ROUTINE:
             # Consequence work goes through a proposal; everything else is absent.
@@ -1039,6 +1047,12 @@ class Runtime:
                 principal,
                 _text(args, "list_id"),
                 _object(args, "fields"),
+            )
+        elif operation == "discord_administration":
+            proposal = self.service.propose_discord_administration(
+                principal,
+                _text(args, "discord_operation"),
+                _object(args, "payload", optional=True),
             )
         elif operation in {"trello_update", "trello_move", "trello_archive"}:
             proposal = self.service.propose_trello_action(

@@ -65,7 +65,13 @@ class Principal:
 
 
 _APPROVAL_ACTIONS = frozenset(
-    {"trello_write", "ghl_sms", "discord_announcement", "google_workspace_consequence"}
+    {
+        "trello_write",
+        "ghl_sms",
+        "discord_announcement",
+        "discord_administration",
+        "google_workspace_consequence",
+    }
 )
 
 

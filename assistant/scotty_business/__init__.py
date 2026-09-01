@@ -224,6 +224,7 @@ _PROPOSE_SCHEMA = _schema(
                 "trello_merge",
                 "ghl_sms",
                 "discord_announcement",
+                "discord_administration",
                 "google_workspace_write",
             ],
         },

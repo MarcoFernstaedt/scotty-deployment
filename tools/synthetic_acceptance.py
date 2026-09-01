@@ -23,7 +23,19 @@ sys.path.insert(0, str(ROOT))
 
 from assistant.scotty_business import client_tool_schemas, identity_prompt  # noqa: E402
 from assistant.scotty_business.approvals import ApprovalStore  # noqa: E402
-from assistant.scotty_business.config import RuntimeConfig  # noqa: E402
+from assistant.scotty_business.config import CLIENT_ROLES, RuntimeConfig  # noqa: E402
+from assistant.scotty_business.discord_permissions import (  # noqa: E402
+    ADMINISTRATOR,
+    OPERATION_PERMISSIONS,
+    PERMISSION_BITS,
+    isolation_overwrites,
+    required_permissions,
+)
+from assistant.scotty_business.discord_policy import (  # noqa: E402
+    ADMINISTRATION_DISCORD_OPERATIONS,
+    DiscordActionClass,
+    classify_discord_action,
+)
 from assistant.scotty_business.guidance import (  # noqa: E402
     NOT_CONNECTED,
     PROVIDERS,
@@ -750,6 +762,86 @@ def check_white_label(runtime_config: RuntimeConfig) -> None:
     )
 
 
+def check_discord_administration(runtime_config: RuntimeConfig) -> None:
+    """The required workflows run on named permissions, and isolation survives."""
+
+    required = required_permissions()
+    check("the bot never requests the Administrator bit", not required & ADMINISTRATOR)
+    check(
+        "ADMINISTRATOR is not even in the permission table", "ADMINISTRATOR" not in PERMISSION_BITS
+    )
+
+    guild_id = runtime_config.principals[0].guild_id
+    private = {principal.channel_id for principal in runtime_config.principals}
+    payloads: dict[str, dict[str, object]] = {
+        "create_channel": {"name": "deal-flow"},
+        "edit_channel": {"channel_id": "230000000000000001", "name": "deal-flow"},
+        "archive_channel": {"channel_id": "230000000000000001"},
+        "create_category": {"name": "Deals"},
+        "reorder_channels": {"channel_ids": ["230000000000000001"]},
+        "set_channel_permissions": {
+            "channel_id": "230000000000000001",
+            "overwrites": [{"id": "1", "allow": "1024", "deny": "0"}],
+        },
+        "create_forum_post": {"channel_id": "230000000000000001", "name": "lead"},
+        "assign_role": {"user_id": "390000000000000001", "role_id": "240000000000000001"},
+        "remove_role": {"user_id": "390000000000000001", "role_id": "240000000000000001"},
+        "create_event": {"name": "Livestream", "start": "2026-10-01T18:00:00Z"},
+        "create_webhook": {"channel_id": "230000000000000001", "name": "updates"},
+        "kick_member": {"user_id": "390000000000000001"},
+        "ban_member": {"user_id": "390000000000000001"},
+        "read_member_permissions": {"user_id": "390000000000000001"},
+    }
+    for operation in sorted(ADMINISTRATION_DISCORD_OPERATIONS):
+        needed = OPERATION_PERMISSIONS.get(operation, 0)
+        check(
+            f"{operation} runs on named permissions the invite already asks for",
+            bool(needed) and not needed & ADMINISTRATOR and needed & required == needed,
+        )
+        check(
+            f"{operation} is consequence-gated rather than routine",
+            classify_discord_action(
+                operation,
+                {"guild_id": guild_id, **payloads[operation]},
+                destinations=(),
+                guild_id=guild_id,
+                private_channels=private,
+            )
+            is DiscordActionClass.CONSEQUENCE,
+        )
+
+    for operation in ("edit_channel", "archive_channel", "set_channel_permissions"):
+        check(
+            f"{operation} can never be pointed at a private channel",
+            classify_discord_action(
+                operation,
+                {
+                    "guild_id": guild_id,
+                    "channel_id": next(iter(private)),
+                    "name": "renamed",
+                    "overwrites": [],
+                },
+                destinations=(),
+                guild_id=guild_id,
+                private_channels=private,
+            )
+            is DiscordActionClass.FORBIDDEN,
+        )
+
+    for role in CLIENT_ROLES:
+        overwrites = {item["id"]: item for item in isolation_overwrites(runtime_config, role)}
+        principal = runtime_config.principal_for(role)
+        other = next(item for item in runtime_config.principals if item.role != role)
+        check(
+            f"the {role.value} channel denies everyone by default",
+            overwrites[guild_id]["allow"] == "0" and int(overwrites[guild_id]["deny"]) > 0,
+        )
+        check(
+            f"only the {role.value} is allowed into their own channel",
+            principal.user_id in overwrites and other.user_id not in overwrites,
+        )
+
+
 def check_secrecy(runtime_config: RuntimeConfig) -> None:
     route = runtime_config.maintainer_route
     identifiers = (route.guild_id, route.channel_id, route.user_id)
@@ -788,6 +880,7 @@ def main() -> int:
     check_google_read_bounds()
     check_codex_and_optional_providers(runtime_config)
     check_provisioning(runtime_config)
+    check_discord_administration(runtime_config)
     check_white_label(runtime_config)
     check_secrecy(runtime_config)
     for label in CHECKS:
