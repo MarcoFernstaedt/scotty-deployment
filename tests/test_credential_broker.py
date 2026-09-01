@@ -642,12 +642,30 @@ class PackagedArtefactTests(unittest.TestCase):
                 reply = json.loads(client.recv(4096).decode("utf-8"))
             self.assertEqual(reply, {"ok": False, "state": "credential absent"})
 
+    def test_the_broker_lives_outside_every_container_writable_path(self) -> None:
+        """The container owns /srv/Scotty/data, so root must not import from it."""
+
+        installer = Path("install.sh").read_text(encoding="utf-8")
+        executable = Path("scotty-credential-broker").read_text(encoding="utf-8")
+
+        self.assertIn("readonly BROKER_DIR=/usr/local/lib/scotty/scotty_broker", installer)
+        self.assertIn('sys.path.insert(0, "/usr/local/lib/scotty")', executable)
+        self.assertNotIn("/srv/Scotty/data", executable)
+        self.assertIn(
+            "the broker must never sit inside the container-writable data mount", installer
+        )
+
+    def test_the_runtime_directory_survives_a_broker_restart(self) -> None:
+        """Removing /run/scotty would pin the container's mount to a dead inode."""
+
+        unit = Path("broker/scotty-credential-broker.service").read_text(encoding="utf-8")
+        self.assertIn("RuntimeDirectoryPreserve=yes", unit)
+
     def test_the_broker_is_never_staged_into_a_client_profile(self) -> None:
         installer = Path("install.sh").read_text(encoding="utf-8")
-        self.assertIn("readonly BROKER_DIR=/srv/Scotty/data/plugins/scotty_broker", installer)
         self.assertIn("scotty-credential-broker.service", installer)
         self.assertIn("install_broker_file", installer)
-        self.assertIn("-o root -g root -m 0600", installer)
+        self.assertIn("-o root -g root -m 0644", installer)
         self.assertNotIn('install_broker_file "$broker_file" "${PROFILES_DIR}', installer)
         self.assertIn("a client profile must never carry the broker", installer)
 

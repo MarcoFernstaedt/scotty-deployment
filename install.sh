@@ -30,7 +30,11 @@ readonly GUARD_BIN=/usr/local/libexec/scotty-egress-guard
 readonly GUARD_UNIT=/etc/systemd/system/scotty-egress-guard.service
 readonly BROKER_BIN=/usr/local/sbin/scotty-credential-broker
 readonly BROKER_UNIT=/etc/systemd/system/scotty-credential-broker.service
-readonly BROKER_DIR=/srv/Scotty/data/plugins/scotty_broker
+# Deliberately outside /srv/Scotty/data: that tree is owned by the container
+# account and bind-mounted read-write, so anything root imports from it could be
+# replaced from inside the container.
+readonly BROKER_ROOT=/usr/local/lib/scotty
+readonly BROKER_DIR=/usr/local/lib/scotty/scotty_broker
 # The broker runs as root outside the container and holds provider credentials.
 # The runtime may only ask it whether a provider is connected.
 readonly -a BROKER_FILES=(
@@ -60,6 +64,7 @@ INSTALLED_UNIT=0
 INSTALLED_BROKER=0
 INSTALLED_BROKER_UNIT=0
 CREATED_BROKER_DIR=0
+CREATED_BROKER_ROOT=0
 ENABLED_BROKER=0
 RELOADED_SYSTEMD=0
 ENABLED_GUARD=0
@@ -240,7 +245,7 @@ install_broker_file() {
   require_safe_ancestors "$target"
   require_absent_destination "$target"
   explicit_status_begin
-  install -o root -g root -m 0600 "$source" "$target"
+  install -o root -g root -m 0644 "$source" "$target"
   install_rc=$?
   explicit_status_end
   if [[ -f $target && ! -L $target ]]; then
@@ -439,6 +444,15 @@ cleanup() {
       (( remove_rc == 0 )) || rc=1
     fi
   fi
+  if (( CREATED_BROKER_ROOT )); then
+    if [[ -L $BROKER_ROOT ]]; then
+      rc=1
+    else
+      rmdir -- "$BROKER_ROOT"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
   if (( CREATED_PLUGIN_ADAPTERS )); then
     if [[ -L $PLUGIN_ADAPTERS_DIR ]]; then
       rc=1
@@ -573,6 +587,7 @@ preflight() {
   for destination in "${protected_destinations[@]}"; do
     require_absent_destination "$destination"
   done
+  require_absent_destination "$BROKER_ROOT"
   require_safe_ancestors "$TARGET_ROOT"
   require_safe_ancestors "$GUARD_BIN"
   require_safe_ancestors "$START_BIN"
@@ -661,7 +676,9 @@ verify_install() {
   command_output actual stat -c '%u:%g:%a' /run/scotty/credential-broker.sock
   [[ $actual == '0:10000:660' ]] || die "broker socket ownership/mode mismatch: ${actual}"
   command_output actual stat -c '%u:%g:%a' "$BROKER_BIN" "$BROKER_UNIT" "$BROKER_DIR"
-  [[ $actual == $'0:0:755\n0:0:644\n0:0:700' ]] || die "broker artefact ownership/mode mismatch: ${actual}"
+  [[ $actual == $'0:0:755\n0:0:644\n0:0:755' ]] || die "broker artefact ownership/mode mismatch: ${actual}"
+  [[ ! -e /srv/Scotty/data/plugins/scotty_broker ]] \
+    || die 'the broker must never sit inside the container-writable data mount'
   [[ ! -e /srv/Scotty/data/profiles/scotty-main-operator/plugins/scotty_broker ]] \
     || die 'a client profile must never carry the broker'
 
@@ -700,7 +717,8 @@ install_profile_dir "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
 for guard_file in "${GUARD_FILES[@]}"; do
   install_guard_file "$guard_file" "${PROFILES_DIR}/${MAINTAINER_PROFILE}/plugins/scotty_guard"
 done
-install_owned CREATED_BROKER_DIR "$BROKER_DIR" -d -o root -g root -m 0700 "$BROKER_DIR"
+install_owned CREATED_BROKER_ROOT "$BROKER_ROOT" -d -o root -g root -m 0755 "$BROKER_ROOT"
+install_owned CREATED_BROKER_DIR "$BROKER_DIR" -d -o root -g root -m 0755 "$BROKER_DIR"
 for broker_file in "${BROKER_FILES[@]}"; do
   install_broker_file "$broker_file"
 done

@@ -172,7 +172,7 @@ class UnixSocketBroker:
     a single boolean, and no response is ever logged or rendered.
     """
 
-    def __init__(self, socket_path: str | os.PathLike[str], *, timeout: float = 10.0) -> None:
+    def __init__(self, socket_path: str | os.PathLike[str], *, timeout: float = 2.0) -> None:
         self.socket_path = Path(socket_path)
         self.timeout = timeout
 
@@ -187,19 +187,12 @@ class UnixSocketBroker:
         except OSError:
             return False
 
-    def _call(
-        self, operation: str, provider: str, credential_class: str, material: str | None
-    ) -> bool:
+    def _request(self, frame: Mapping[str, object]) -> Mapping[str, object] | None:
+        """Send one frame and return the broker's reply, or None if unreachable."""
+
         if not self.available():
-            return False
-        frame: dict[str, object] = {
-            "op": operation,
-            "provider": provider,
-            "credential_class": credential_class,
-        }
-        if material is not None:
-            frame["material"] = material
-        request = json.dumps(frame, separators=(",", ":")) + "\n"
+            return None
+        request = json.dumps(dict(frame), separators=(",", ":")) + "\n"
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(self.timeout)
@@ -208,18 +201,55 @@ class UnixSocketBroker:
                 client.shutdown(socket.SHUT_WR)
                 raw = client.recv(4096)
         except (OSError, ValueError):
-            return False
+            return None
         try:
             reply = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return False
-        return isinstance(reply, dict) and reply.get("ok") is True
+            return None
+        return reply if isinstance(reply, Mapping) else None
+
+    def _call(
+        self, operation: str, provider: str, credential_class: str, material: str | None
+    ) -> bool:
+        frame: dict[str, object] = {
+            "op": operation,
+            "provider": provider,
+            "credential_class": credential_class,
+        }
+        if material is not None:
+            frame["material"] = material
+        reply = self._request(frame)
+        return reply is not None and reply.get("ok") is True
 
     def validate(self, provider: str, credential_class: str, material: str) -> bool:
         return self._call("validate", provider, credential_class, material)
 
     def commit(self, provider: str, credential_class: str, material: str) -> bool:
-        return self._call("commit", provider, credential_class, material)
+        """Open a single-use window and commit into it, as the broker requires.
+
+        Only a privileged caller can do this; the runtime account is permitted
+        `status` alone, so a commit attempted from the container is refused by
+        the broker rather than half-completed here.
+        """
+
+        opened = self._request(
+            {"op": "open", "provider": provider, "credential_class": credential_class}
+        )
+        if opened is None or opened.get("ok") is not True:
+            return False
+        window = opened.get("window")
+        if type(window) is not str or not window:
+            return False
+        reply = self._request(
+            {
+                "op": "commit",
+                "provider": provider,
+                "credential_class": credential_class,
+                "window": window,
+                "material": material,
+            }
+        )
+        return reply is not None and reply.get("ok") is True
 
     def status(self, provider: str, credential_class: str) -> bool:
         """Whether the broker holds this credential. Never returns the value."""
