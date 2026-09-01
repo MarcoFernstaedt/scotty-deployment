@@ -301,6 +301,229 @@ class RuntimeWorkflowTests(unittest.TestCase):
             )
 
 
+class RuntimeRunTests(RuntimeWorkflowTests):
+    """A workflow that actually runs, through the runtime a client reaches."""
+
+    def active(self, runtime, operator, **overrides):
+        saved = runtime.handle_read(
+            operator,
+            {
+                "operation": "workflow",
+                "workflow_action": "save",
+                "definition": definition(**overrides),
+            },
+        )
+        runtime.handle_read(
+            operator,
+            {
+                "operation": "workflow",
+                "workflow_action": "activate",
+                "workflow_id": saved["workflow_id"],
+            },
+        )
+        return saved["workflow_id"]
+
+    def start(self, runtime, operator, workflow_id, trigger=None):
+        return runtime.handle_read(
+            operator,
+            {
+                "operation": "workflow",
+                "workflow_action": "run",
+                "workflow_id": workflow_id,
+                "trigger": trigger or {"property_address": "44 Maple St"},
+            },
+        )
+
+    def test_running_a_workflow_carries_out_its_steps_and_records_each_one(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            workflow_id = self.active(
+                runtime,
+                operator,
+                steps=[
+                    {
+                        "operation": "reminder.create",
+                        "arguments": {
+                            "text": "call the seller",
+                            "due_at": "2027-01-01T09:00:00+00:00",
+                        },
+                    }
+                ],
+            )
+            run = self.start(runtime, operator, workflow_id)
+            self.assertEqual(run["state"], "succeeded")
+            self.assertEqual([step["state"] for step in run["steps"]], ["done"])
+            # The reminder is really there: a run that reported success without
+            # doing anything would be the exact thing this replaces.
+            reminders = runtime.handle_reminder(operator, {"action": "list"})
+            self.assertEqual([item["text"] for item in reminders], ["call the seller"])
+
+    def test_the_same_trigger_never_runs_the_work_twice(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            workflow_id = self.active(
+                runtime,
+                operator,
+                steps=[
+                    {
+                        "operation": "reminder.create",
+                        "arguments": {
+                            "text": "call the seller",
+                            "due_at": "2027-01-01T09:00:00+00:00",
+                        },
+                    }
+                ],
+            )
+            first = self.start(runtime, operator, workflow_id)
+            second = self.start(runtime, operator, workflow_id)
+            self.assertEqual(second["run_id"], first["run_id"])
+            self.assertEqual(len(runtime.handle_reminder(operator, {"action": "list"})), 1)
+
+    def test_only_an_active_workflow_runs(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            saved = runtime.handle_read(
+                operator,
+                {
+                    "operation": "workflow",
+                    "workflow_action": "save",
+                    "definition": definition(),
+                },
+            )
+            with self.assertRaises(ValueError):
+                self.start(runtime, operator, saved["workflow_id"])
+
+    def test_one_user_can_never_run_or_read_the_other_s_run(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            employee = self.actor(runtime, Role.EMPLOYEE)
+            workflow_id = self.active(
+                runtime,
+                operator,
+                steps=[
+                    {
+                        "operation": "reminder.create",
+                        "arguments": {
+                            "text": "call the seller",
+                            "due_at": "2027-01-01T09:00:00+00:00",
+                        },
+                    }
+                ],
+            )
+            run = self.start(runtime, operator, workflow_id)
+            with self.assertRaises((ValueError, WorkflowError)):
+                runtime.handle_read(
+                    employee,
+                    {
+                        "operation": "workflow",
+                        "workflow_action": "run_status",
+                        "run_id": run["run_id"],
+                    },
+                )
+            self.assertEqual(
+                runtime.handle_read(employee, {"operation": "workflow", "workflow_action": "runs"}),
+                [],
+            )
+
+    def test_a_finished_run_cannot_be_cancelled_back_into_something_else(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            workflow_id = self.active(
+                runtime,
+                operator,
+                steps=[
+                    {
+                        "operation": "reminder.create",
+                        "arguments": {
+                            "text": "call the seller",
+                            "due_at": "2027-01-01T09:00:00+00:00",
+                        },
+                    }
+                ],
+            )
+            run = self.start(runtime, operator, workflow_id)
+            self.assertEqual(run["state"], "succeeded")
+            with self.assertRaises(ValueError):
+                runtime.handle_read(
+                    operator,
+                    {
+                        "operation": "workflow",
+                        "workflow_action": "cancel_run",
+                        "run_id": run["run_id"],
+                        "reason": "not needed",
+                    },
+                )
+            # The record of what was done stands: a run is history, not a draft.
+            after = runtime.handle_read(
+                operator,
+                {
+                    "operation": "workflow",
+                    "workflow_action": "run_status",
+                    "run_id": run["run_id"],
+                },
+            )
+            self.assertEqual(after["state"], "succeeded")
+
+    def test_a_scheduled_workflow_fires_once_a_window_from_the_supervision_pass(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            self.active(
+                runtime,
+                operator,
+                trigger={"kind": "schedule", "every_minutes": 60},
+                idempotency={"key": "window", "on_duplicate": "skip"},
+                steps=[
+                    {
+                        "operation": "reminder.create",
+                        "arguments": {
+                            "text": "check the board",
+                            "due_at": "2027-01-01T09:00:00+00:00",
+                        },
+                    }
+                ],
+            )
+            first = runtime.advance_workflow_runs()
+            self.assertEqual(first["started"], 1)
+            # The loop runs every second. A schedule that fired every pass
+            # would be one reminder a second, which is the bug the window
+            # exists to prevent.
+            again = runtime.advance_workflow_runs()
+            self.assertEqual(again["started"], 0)
+            self.assertEqual(len(runtime.handle_reminder(operator, {"action": "list"})), 1)
+
+    def test_a_workflow_that_is_not_active_never_fires_on_a_schedule(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            runtime.handle_read(
+                operator,
+                {
+                    "operation": "workflow",
+                    "workflow_action": "save",
+                    "definition": definition(
+                        trigger={"kind": "schedule", "every_minutes": 60},
+                        idempotency={"key": "window", "on_duplicate": "skip"},
+                    ),
+                },
+            )
+            self.assertEqual(runtime.advance_workflow_runs()["started"], 0)
+
+    def test_a_step_the_owner_may_not_do_fails_the_run_rather_than_widening_it(self) -> None:
+        with self.runtime() as runtime:
+            operator = self.actor(runtime)
+            # Trello is not connected in this fixture, so a card step cannot
+            # happen. The run records that and stops; it does not find another
+            # way to do it.
+            workflow_id = self.active(
+                runtime,
+                operator,
+                steps=[{"operation": "property_card.create", "arguments": {"card": {}}}],
+                retries={"attempts": 0, "circuit_breaker": 3, "stop_rule": "on_failure"},
+            )
+            run = self.start(runtime, operator, workflow_id)
+            self.assertEqual(run["state"], "failed")
+            self.assertEqual(run["steps"][0]["state"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()
 

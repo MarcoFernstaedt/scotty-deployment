@@ -63,6 +63,8 @@ A prompt, folder name, model, or persona is not a security boundary. The code, e
 - `assistant/scotty_business/approvals.py`: SQLite proposal state machine with `BEGIN IMMEDIATE`, version compare-and-set, immutable fields, nonce claims, crash recovery, and reconciliation states.
 - `assistant/scotty_business/reminders.py`: tuple-scoped private reminders with atomic claims and no ambiguous retry.
 - `assistant/scotty_business/adapters/`: typed, versioned Discord, Trello, GoHighLevel v3, and RentCast v1 adapters over a bounded standard-library HTTP transport.
+- `assistant/scotty_business/workflows.py`: declared workflows, validated whole, composed only of installed operations.
+- `assistant/scotty_business/workflow_runs.py`: the durable run ledger — one run per trigger, one step at a time, and a step that was in flight when the process stopped comes back `unknown` rather than being repeated.
 - `assistant/scotty_business/service.py`: provider-independent proposal and execution workflows.
 - `assistant/scotty_business/setup.py`: root-only hidden-input setup, Discord privacy/membership validation, and atomic private-state publication.
 - `fixtures/`: synthetic configuration and provider data only.
@@ -116,6 +118,21 @@ sudo ./install.sh
 The installer performs all preflight checks before mutation, installs the generic plugin and local setup command, creates the root-owned operator files, installs the privileged credential broker and the host supervisor, activates the host egress guard, creates the bridge, and creates the container. It never starts the container. Any error, interrupt, termination, or uncommitted exit triggers cleanup limited to objects created by that invocation, including the broker and supervisor units, binaries, and package directories.
 
 The install fails closed if `/srv/Scotty`, the container, bridge, firewall chain/jump, installed operator files, or systemd unit already exists.
+
+## Workflows that run
+
+A workflow is a declaration: it names installed operations only, carries its own limits, approval class, retry and stop rules, idempotency key and retention, and belongs to exactly one client user. Saving one changes nothing; activating it makes it runnable; running it does the work.
+
+Running is a ledger, not a loop. Every run and every step is written down before it happens, so a container that stopped between calling a provider and hearing back comes back knowing exactly which step was in flight. That step is marked `unknown` and the run stops: retrying an effect nobody can see is how one message to a seller becomes two.
+
+- **One trigger, one run.** The author names what makes a run unique — `lead_id`, `card_id+list_id` — and a trigger arriving twice is recognised as the run it already started. A trigger that does not carry that field is refused rather than run.
+- **One step at a time, in order, never replayed.** A finished step is never claimed again, and the next is not handed out while the last is in flight.
+- **Retries are the workflow's own.** A failed step is retried up to the declared attempts and then the run stops; an ambiguous outcome is never retried at all.
+- **Consequence steps do not happen inside a run.** A step that is not freely reversible raises the same proposal a person would, bound to that exact step's frozen payload, and the run waits. Someone with the authority approves and executes it through the ordinary approval path.
+- **Deadlines, daily limits, pause, resume, cancel.** A run past its deadline stops rather than carrying on; the workflow's own `runs_per_day` bounds how often it starts; its owner can pause, resume, or cancel it, and nobody else can see it.
+- **Schedules fire on a window.** A scheduled workflow declares `every_minutes` and is keyed on `window`, so the supervision pass — which runs about once a second — starts one run per window rather than one per pass. Quiet hours are not a window at all: the schedule resumes afterwards, it does not catch up.
+
+Every step goes back through the handler that serves a person asking directly, so a workflow has exactly the authority its owner already has and not a step more.
 
 ## Supervision, backup, and rollback
 

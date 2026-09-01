@@ -28,7 +28,7 @@ from .adapters import (
     TrelloAdapter,
 )
 from .adapters.discord_admin import DiscordAdminAdapter
-from .approvals import ApprovalStore, Proposal
+from .approvals import ApprovalError, ApprovalStore, Proposal
 from .backup import backup_state, restorable, rollback_guidance, verify_backup
 from .brokered_transport import BrokeredTransport
 from .budgets import BudgetLedger, BudgetPolicy
@@ -88,9 +88,30 @@ from .setup_flow import (
     setup_progress,
 )
 from .supervisor import ConsumerLease, HealthState, IncidentLog, Supervisor
-from .workflows import WorkflowState, WorkflowStore, parse_workflow
+from .workflow_runs import (
+    RunError,
+    RunLedger,
+    Runner,
+    RunState,
+    StepOutcome,
+    StepState,
+    due_trigger,
+)
+from .workflows import (
+    Workflow,
+    WorkflowError,
+    WorkflowState,
+    WorkflowStore,
+    parse_workflow,
+)
 
 logger = logging.getLogger(__name__)
+
+#: The run controls a workflow's owner has. Everything else about a workflow is
+#: a declaration; these are the ones that make something happen.
+_WORKFLOW_RUN_ACTIONS = frozenset(
+    {"run", "runs", "run_status", "pause_run", "resume_run", "cancel_run"}
+)
 
 #: The provider credentials the root-owned broker can be asked about. Google is
 #: absent: it uses provider-owned browser consent, not a stored key.
@@ -557,6 +578,13 @@ class Runtime:
         self.setup_staging = SetupStagingStore(state_dir / "setup-staging.json")
         self.personas = PersonaStore(state_dir / "personas.json")
         self.workflows = WorkflowStore(state_dir / "workflows.json")
+        self.workflow_runs = RunLedger(state_dir / "workflow-runs.db")
+        self.workflow_runs.initialize()
+        # A step recorded as running is one nobody watched finish. Coming back
+        # from a restart, those become unknown and stop their run rather than
+        # being repeated into a second card or a second message.
+        self.workflow_runs.recover_interrupted()
+        self.workflow_runner = Runner(self.workflow_runs, self._run_workflow_step)
         self.budgets = BudgetLedger(state_dir / "budgets.db", BudgetPolicy.from_mapping({}))
         self.budgets.initialize()
         self.supervisor = Supervisor(state_dir)
@@ -717,6 +745,118 @@ class Runtime:
             ).as_json()
         raise ValueError("property-card operation is not permitted")
 
+    #: How a workflow step reaches the operation it names. Every one of these
+    #: goes back through the handler that serves a person asking directly, so a
+    #: workflow gets exactly the authority its owner already has and not a step
+    #: more. A step is a way to ask, never a way to be allowed.
+    _WORKFLOW_READS: Mapping[str, Mapping[str, object]] = {
+        "property_card.create": {"operation": "property_card", "card_operation": "create"},
+        "property_card.update": {"operation": "property_card", "card_operation": "update"},
+        "property_card.move": {"operation": "property_card", "card_operation": "move"},
+        "property_card.reformat": {"operation": "property_card", "card_operation": "reformat"},
+        "property_card.apply_template": {
+            "operation": "property_card",
+            "card_operation": "apply_template",
+        },
+        "property_card.duplicates": {"operation": "property_card", "card_operation": "duplicates"},
+        "trello.list_cards": {"operation": "trello_cards"},
+        "ghl.read_contact": {"operation": "ghl_contact"},
+        "rentcast.lookup": {"operation": "rentcast"},
+    }
+
+    #: Steps whose effect is not freely reversible never happen inside a run.
+    #: The run raises the same proposal a person would and stops there; someone
+    #: with the authority approves and executes it through the ordinary path.
+    _WORKFLOW_PROPOSALS: Mapping[str, str] = {
+        "property_card.archive": "trello_archive",
+        "discord.announce": "discord_announcement",
+        "google.send_draft": "google_workspace_write",
+        "ghl.send_sms": "ghl_sms",
+    }
+
+    def _workflow_request(
+        self, operation: str, arguments: Mapping[str, object]
+    ) -> dict[str, object]:
+        """The exact request one workflow step makes, in the runtime's own shape."""
+
+        fixed = self._WORKFLOW_READS.get(operation)
+        if fixed is not None:
+            return {**dict(arguments), **fixed}
+        if operation == "discord.post_update":
+            return {
+                "operation": "discord",
+                "discord_operation": "update_progress",
+                "payload": dict(arguments),
+            }
+        google = {
+            "google.create_draft": "gmail_create_draft",
+            "google.create_event": "calendar_create_event",
+        }.get(operation)
+        if google is not None:
+            return {
+                "operation": "google_workspace",
+                "google_operation": google,
+                "resource_id": str(arguments.get("resource_id", "new")),
+                "payload": {
+                    name: value for name, value in arguments.items() if name != "resource_id"
+                },
+            }
+        raise RunError(f"{operation} is not a step this deployment can carry out")
+
+    def _workflow_proposal(
+        self, operation: str, arguments: Mapping[str, object]
+    ) -> dict[str, object]:
+        proposal = self._WORKFLOW_PROPOSALS[operation]
+        if proposal == "google_workspace_write":
+            return {
+                "operation": proposal,
+                "google_operation": "gmail_send_draft",
+                "resource_id": str(arguments.get("resource_id", "")),
+                "payload": {
+                    name: value for name, value in arguments.items() if name != "resource_id"
+                },
+            }
+        return {**dict(arguments), "operation": proposal}
+
+    def _run_workflow_step(
+        self, principal: Principal, operation: str, arguments: Mapping[str, object]
+    ) -> StepOutcome:
+        """Carry out one step, and say honestly what became of it.
+
+        The three answers are the ones the ledger records: it happened, it did
+        not, or nobody can tell. An ambiguous provider outcome is never reported
+        as a failure, because a failed step is retried and an ambiguous one must
+        not be.
+        """
+
+        try:
+            if operation in self._WORKFLOW_PROPOSALS:
+                raised = self.handle_propose(
+                    principal, self._workflow_proposal(operation, arguments)
+                )
+                proposal_id = raised.get("proposal_id", "") if isinstance(raised, Mapping) else ""
+                return StepOutcome(
+                    StepState.AWAITING_APPROVAL,
+                    "this step needs an approval before it can happen",
+                    str(proposal_id),
+                )
+            if operation in {"reminder.create", "reminder.cancel"}:
+                request = {**dict(arguments), "action": operation.removeprefix("reminder.")}
+                self.handle_reminder(principal, request)
+                return StepOutcome(StepState.DONE, "done")
+            result = self.handle_read(principal, self._workflow_request(operation, arguments))
+        except AmbiguousEffectError as exc:
+            return StepOutcome(StepState.UNKNOWN, str(exc))
+        except (PermissionError, ProviderNotConnected, ApprovalError, RunError, ValueError) as exc:
+            # A refusal, a provider that is not connected, or a malformed step:
+            # each is a plain failure, and the run's own retry rule decides
+            # whether to try again or stop.
+            return StepOutcome(StepState.FAILED, str(exc))
+        if isinstance(result, Mapping) and result.get("status") == "unknown":
+            # The runtime already decided this one cannot be told either way.
+            return StepOutcome(StepState.UNKNOWN, str(result.get("reason", "")))
+        return StepOutcome(StepState.DONE, "done")
+
     def _workflow(self, principal: Principal, args: Mapping[str, object]) -> object:
         """Build, review, and run this user's own workflows. Only their own."""
 
@@ -728,6 +868,15 @@ class Runtime:
             workflow = parse_workflow(_object(args, "definition"), owner=owner)
             saved = self.workflows.save(workflow)
             return {"workflow_id": saved.workflow_id, **saved.preview()}
+        if action in _WORKFLOW_RUN_ACTIONS:
+            # A run is addressed by its own identifier once it exists, so only
+            # starting one needs to name the workflow it comes from.
+            named = (
+                _text(args, "workflow_id")
+                if action == "run"
+                else _text(args, "workflow_id", optional=True) or ""
+            )
+            return self._workflow_run(principal, action, named, args)
         workflow_id = _text(args, "workflow_id")
         if action in {"get", "preview"}:
             return self.workflows.get(workflow_id, owner).preview()
@@ -744,6 +893,54 @@ class Runtime:
             raise ValueError("workflow action is not permitted")
         moved = self.workflows.transition(workflow_id, owner, states[action])
         return {"workflow_id": moved.workflow_id, **moved.preview()}
+
+    def _workflow_run(
+        self,
+        principal: Principal,
+        action: str,
+        workflow_id: str,
+        args: Mapping[str, object],
+    ) -> object:
+        """Start, continue, or control one run of this user's own workflow.
+
+        Running is one pass rather than a loop that owns the process: it goes as
+        far as it honestly can, writes down where it stopped, and returns that.
+        A run waiting on an approval, paused, or holding an effect nobody can
+        see is a state somebody reads, not a thread somebody waits on.
+        """
+
+        owner = principal.role
+        try:
+            if action == "runs":
+                return [item.preview() for item in self.workflow_runs.list(owner)]
+            if action == "resume_run":
+                resumed = self.workflow_runs.resume(_text(args, "run_id"), owner)
+                # The workflow is read from the run rather than from the
+                # caller: resuming must continue the work that was started,
+                # not a different workflow named now.
+                workflow = self.workflows.get(resumed.workflow_id, owner)
+                return self.workflow_runner.advance(resumed.run_id, workflow, principal).preview()
+            if action == "run":
+                workflow = self.workflows.get(workflow_id, owner)
+                if workflow.state is not WorkflowState.ACTIVE:
+                    raise ValueError("only an active workflow runs")
+                run = self.workflow_runs.start(
+                    workflow, principal, _object(args, "trigger", optional=True)
+                )
+                return self.workflow_runner.advance(run.run_id, workflow, principal).preview()
+            run_id = _text(args, "run_id")
+            if action == "run_status":
+                return self.workflow_runs.get(run_id, owner).preview()
+            if action == "pause_run":
+                return self.workflow_runs.pause(run_id, owner).preview()
+            return self.workflow_runs.cancel(
+                run_id, owner, _text(args, "reason", optional=True) or ""
+            ).preview()
+        except RunError as exc:
+            # A run refusing is ordinary: the trigger repeated, the deadline
+            # passed, the run is somebody else's. It is explained, not raised
+            # as an internal failure.
+            raise ValueError(str(exc)) from exc
 
     def actor_connection_status(self, principal: Principal) -> dict[str, bool]:
         """What this exact user is connected to, not what the deployment has."""
@@ -815,6 +1012,62 @@ class Runtime:
                 "restart_allowed": self.supervisor.should_restart().allowed,
             }
         raise ValueError("maintenance action is not permitted")
+
+    def advance_workflow_runs(self) -> dict[str, int]:
+        """One supervision pass over every client user's workflows.
+
+        Two things happen here and nothing else: a scheduled workflow whose
+        window has come is started, and a run that is open is carried forward.
+        Both are safe to repeat, because the window is the run's identity and a
+        finished step is never claimed twice — so a pass that ran a second time,
+        or a restart in the middle of one, does no work over again.
+
+        A run waiting on an approval, paused, or holding an ambiguous effect is
+        left exactly where it is. None of those are waiting on a loop.
+        """
+
+        started = 0
+        advanced = 0
+        for role in (Role.MAIN_OPERATOR, Role.EMPLOYEE):
+            principal = self.config.principal_for(role)
+            if principal is None:
+                continue
+            for workflow in self.workflows.list(role):
+                if workflow.state is not WorkflowState.ACTIVE:
+                    continue
+                trigger = due_trigger(workflow, datetime.now(UTC))
+                if trigger is None or self.workflow_runs.find(workflow, trigger) is not None:
+                    # Not due, or this window's run already exists. The loop
+                    # comes round every second; a window is what stops that
+                    # from being a run every second.
+                    continue
+                try:
+                    run = self.workflow_runs.start(workflow, principal, trigger)
+                except RunError:
+                    # Past the workflow's own daily limit, or the trigger does
+                    # not carry what makes it unique. Nothing is owed.
+                    continue
+                started += 1
+                self._advance_quietly(run.run_id, workflow, principal)
+            for run in self.workflow_runs.list(role):
+                if run.state not in {RunState.PENDING, RunState.RUNNING}:
+                    continue
+                try:
+                    workflow = self.workflows.get(run.workflow_id, role)
+                except WorkflowError:
+                    continue
+                advanced += int(self._advance_quietly(run.run_id, workflow, principal))
+        return {"started": started, "advanced": advanced}
+
+    def _advance_quietly(self, run_id: str, workflow: Workflow, principal: Principal) -> bool:
+        """Carry one run forward, letting a failure stay in the ledger."""
+
+        try:
+            self.workflow_runner.advance(run_id, workflow, principal)
+        except (RunError, WorkflowError, ValueError) as exc:
+            logger.warning("Workflow run could not advance: %s", type(exc).__name__)
+            return False
+        return True
 
     def watch_providers(self) -> dict[str, str]:
         """Check each provider, open or close its breaker, and alert once.
@@ -1467,3 +1720,9 @@ class Controller:
                 runtime.watch_providers()
             except Exception as exc:
                 logger.warning("Provider watch failed: %s", type(exc).__name__)
+            try:
+                # Only the process holding the consumer lease does this, so a
+                # second container cannot fire the same schedule alongside it.
+                runtime.advance_workflow_runs()
+            except Exception as exc:
+                logger.warning("Workflow pass failed: %s", type(exc).__name__)

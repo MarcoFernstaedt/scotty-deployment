@@ -293,12 +293,25 @@ def _steps(value: object) -> tuple[WorkflowStep, ...]:
     return tuple(steps)
 
 
+#: The bounds a schedule fires within. More often than this is not a workflow,
+#: it is a poll; less often than a day is what a reminder is for.
+MIN_SCHEDULE_MINUTES = 5
+MAX_SCHEDULE_MINUTES = 1_440
+
+
 def _trigger(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise WorkflowError("a workflow needs a trigger")
     kind = value.get("kind")
     if type(kind) is not str or kind not in _TRIGGER_KINDS:
         raise WorkflowError("the trigger kind is not one this deployment supports")
+    if kind == "schedule":
+        every = value.get("every_minutes")
+        if type(every) is not int or not MIN_SCHEDULE_MINUTES <= every <= MAX_SCHEDULE_MINUTES:
+            raise WorkflowError(
+                "a scheduled workflow must say how often it runs, in whole minutes "
+                f"from {MIN_SCHEDULE_MINUTES} to {MAX_SCHEDULE_MINUTES}"
+            )
     return dict(value)
 
 
@@ -381,6 +394,15 @@ def parse_workflow(definition: object, *, owner: Role, workflow_id: str | None =
             + ", ".join(sorted(set(consequential)))
             + "), so its approval class must be consequence"
         )
+    trigger = _trigger(definition.get("trigger"))
+    idempotency = _idempotency(definition.get("idempotency"))
+    if trigger["kind"] == "schedule" and idempotency["key"] != "window":
+        # Every firing of one window must be the same run. Keyed on anything
+        # else, a restart inside the window starts the work a second time.
+        raise WorkflowError(
+            "a scheduled workflow is made unique by its window, so its "
+            "idempotency key must be 'window'"
+        )
     retention = definition.get("retention_days", 90)
     if type(retention) is not int or not 1 <= retention <= MAX_RETENTION_DAYS:
         raise WorkflowError("retention_days must be a whole number of days")
@@ -393,13 +415,13 @@ def parse_workflow(definition: object, *, owner: Role, workflow_id: str | None =
         owner=owner,
         name=name,
         purpose=_text(definition.get("purpose"), "the workflow purpose"),
-        trigger=_trigger(definition.get("trigger")),
+        trigger=trigger,
         steps=steps,
         limits=_limits(definition.get("limits")),
         approval_class=approval_class,
         schedule=dict(schedule),
         retries=_retries(definition.get("retries")),
-        idempotency=_idempotency(definition.get("idempotency")),
+        idempotency=idempotency,
         retention_days=retention,
         client_wording=str(definition.get("client_wording", ""))[:MAX_TEXT_CHARS],
         examples=_examples(definition.get("examples")),

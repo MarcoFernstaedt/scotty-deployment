@@ -131,9 +131,27 @@ _READ_SCHEMA = _schema(
         "address": {"type": "string", "maxLength": 300},
         "workflow_action": {
             "type": "string",
-            "enum": ["list", "get", "preview", "save", "revise", "activate", "pause", "retire"],
+            "enum": [
+                "list",
+                "get",
+                "preview",
+                "save",
+                "revise",
+                "activate",
+                "pause",
+                "retire",
+                "run",
+                "runs",
+                "run_status",
+                "pause_run",
+                "resume_run",
+                "cancel_run",
+            ],
         },
         "workflow_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "trigger": {"type": "object", "additionalProperties": True},
+        "reason": {"type": "string", "maxLength": 500},
         "maintenance_action": {
             "type": "string",
             "enum": [
