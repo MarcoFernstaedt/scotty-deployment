@@ -108,6 +108,27 @@ class TrelloAdapterTests(unittest.TestCase):
         # comes back clean on a board that has the card.
         self.assertFalse(complete)
 
+    def test_a_page_that_repeats_itself_stops_rather_than_looping(self) -> None:
+        # Trello's `before` walks by card id. If a board comes back in the
+        # other order, asking again returns the same page: the read must stop
+        # and say it is incomplete rather than spin until the cap.
+        page = [f"card-{index}" for index in range(MAX_CARDS_PER_PAGE)]
+        transport = FakeTransport([self._page(page), self._page(page)])
+        adapter = TrelloAdapter(transport, "k", "t", self.scope)
+        cards, complete = adapter.list_all_cards()
+        self.assertEqual(len(cards), MAX_CARDS_PER_PAGE)
+        self.assertFalse(complete)
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_a_card_seen_on_two_pages_is_only_counted_once(self) -> None:
+        first = self._page([f"card-{index}" for index in range(MAX_CARDS_PER_PAGE)])
+        overlapping = self._page(["card-0", "card-new"])
+        adapter = TrelloAdapter(FakeTransport([first, overlapping]), "k", "t", self.scope)
+        cards, complete = adapter.list_all_cards()
+        self.assertEqual(len({card.source_id for card in cards}), len(cards))
+        self.assertEqual(len(cards), MAX_CARDS_PER_PAGE + 1)
+        self.assertTrue(complete)
+
     def test_a_short_page_ends_the_paging(self) -> None:
         transport = FakeTransport([self._page(["card-1"])])
         adapter = TrelloAdapter(transport, "k", "t", self.scope)

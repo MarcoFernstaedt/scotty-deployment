@@ -92,7 +92,6 @@ from .workflow_runs import (
     RunError,
     RunLedger,
     Runner,
-    RunState,
     StepOutcome,
     StepState,
     due_trigger,
@@ -1049,9 +1048,7 @@ class Runtime:
                     continue
                 started += 1
                 self._advance_quietly(run.run_id, workflow, principal)
-            for run in self.workflow_runs.list(role):
-                if run.state not in {RunState.PENDING, RunState.RUNNING}:
-                    continue
+            for run in self.workflow_runs.open_runs(role):
                 try:
                     workflow = self.workflows.get(run.workflow_id, role)
                 except WorkflowError:

@@ -201,5 +201,29 @@ class RestoreTests(StateHarness):
         self.assertEqual(verify_backup(destination), ("reminders.db",))
 
 
+class OwnershipTests(ReleaseHarness):
+    def test_a_release_built_by_a_person_never_hands_them_the_deployment(self) -> None:
+        from unittest import mock
+
+        from assistant.scotty_supervisor.releases import _restore_attributes
+
+        root = self.root()
+        target = root / "plugin.py"
+        target.write_text("x = 1\n", encoding="utf-8")
+        chowned: list[tuple[int, int]] = []
+
+        def record(_path, uid, gid):
+            chowned.append((uid, gid))
+
+        with mock.patch("os.geteuid", return_value=0), mock.patch("os.chown", record):
+            # A release published from somebody's checkout carries their uid.
+            _restore_attributes(target, {"mode": "0o644", "uid": 1000, "gid": 1000})
+            self.assertEqual(chowned, [])
+            # The accounts the deployment actually uses are restored.
+            _restore_attributes(target, {"mode": "0o600", "uid": 10000, "gid": 10000})
+            _restore_attributes(target, {"mode": "0o755", "uid": 0, "gid": 0})
+            self.assertEqual(chowned, [(10000, 10000), (0, 0)])
+
+
 if __name__ == "__main__":
     unittest.main()

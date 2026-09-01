@@ -400,5 +400,29 @@ class ScheduleTests(LedgerFixture):
         self.assertIsNone(due_trigger(self.workflow(), self.moment))
 
 
+class OpenRunTests(LedgerFixture):
+    def test_an_open_run_behind_newer_ones_is_still_carried_forward(self) -> None:
+        body = definition(steps=[{"operation": "reminder.create", "arguments": {"text": "hi"}}])
+        body["limits"] = {"cards_per_run": 1, "runs_per_day": 100, "recipients": 0}
+        workflow = parse_workflow(body, owner=Role.MAIN_OPERATOR)
+        stuck = self.ledger.start(workflow, self.trent, {"lead_id": "L-old"})
+        for index in range(30):
+            self.moment = MOMENT + timedelta(minutes=index + 1)
+            run = self.ledger.start(workflow, self.trent, {"lead_id": f"L-{index}"})
+            self.ledger.finish(run.run_id, RunState.SUCCEEDED, "done")
+        # A recent-activity list would have lost it twenty-five runs ago.
+        open_ids = [run.run_id for run in self.ledger.open_runs(Role.MAIN_OPERATOR)]
+        self.assertEqual(open_ids, [stuck.run_id])
+
+    def test_open_runs_are_this_user_s_own_and_never_a_finished_one(self) -> None:
+        run = self.start()
+        self.assertEqual(
+            [item.run_id for item in self.ledger.open_runs(Role.MAIN_OPERATOR)], [run.run_id]
+        )
+        self.assertEqual(self.ledger.open_runs(Role.EMPLOYEE), ())
+        self.ledger.finish(run.run_id, RunState.CANCELLED, "never mind")
+        self.assertEqual(self.ledger.open_runs(Role.MAIN_OPERATOR), ())
+
+
 if __name__ == "__main__":
     unittest.main()

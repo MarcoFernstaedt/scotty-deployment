@@ -133,12 +133,21 @@ class TrelloAdapter:
         """
 
         collected: list[ProviderRecord] = []
+        seen: set[str] = set()
         before = ""
         while len(collected) < MAX_BOARD_CARDS:
             page = self.list_cards(before=before)
-            collected.extend(page)
+            fresh = [card for card in page if card.source_id not in seen]
+            seen.update(card.source_id for card in fresh)
+            collected.extend(fresh)
             if len(page) < MAX_CARDS_PER_PAGE:
                 return tuple(collected), True
+            if not fresh:
+                # The page repeated what we already had, which means `before`
+                # is not walking backwards through this board the way we
+                # assumed. Stopping and saying the read is incomplete is right;
+                # looping until the cap on the same page is not.
+                return tuple(collected), False
             before = page[-1].source_id
         return tuple(collected[:MAX_BOARD_CARDS]), False
 

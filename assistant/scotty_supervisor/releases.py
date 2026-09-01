@@ -26,6 +26,10 @@ from pathlib import Path
 MANIFEST_VERSION = 1
 MAX_FILE_BYTES = 64 * 1024 * 1024
 CURRENT_LINK = "current"
+
+#: The only accounts this deployment's files ever belong to: root for the
+#: privileged parts, and the container account for the tree it reads.
+DEPLOYMENT_OWNERS = frozenset({0, 10000})
 ACCEPTED_MARKER = "accepted"
 
 
@@ -235,6 +239,11 @@ def _restore_attributes(target: Path, entry: Mapping[str, object]) -> None:
     if os.geteuid() != 0 or not isinstance(uid, int) or not isinstance(gid, int):
         # Not root, or a release published before ownership was recorded: the
         # bytes are still exact, and nothing pretends otherwise.
+        return
+    if uid not in DEPLOYMENT_OWNERS or gid not in DEPLOYMENT_OWNERS:
+        # A release published from somebody's checkout carries that person's
+        # uid. Handing the deployment to it would be worse than leaving the
+        # ownership alone, so an unrecognised owner is not restored.
         return
     with suppress(OSError):
         os.chown(target, uid, gid)

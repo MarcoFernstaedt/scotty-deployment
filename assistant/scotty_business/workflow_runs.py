@@ -361,6 +361,30 @@ class RunLedger:
         finally:
             connection.close()
 
+    def open_runs(self, owner: Role, *, limit: int = 50) -> tuple[Run, ...]:
+        """Runs that still have somewhere to go, oldest first.
+
+        Separate from `list` because that one is a recent-activity view: a run
+        stuck behind twenty-five newer ones would never be carried forward by a
+        pass that only looked at the newest page.
+        """
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT * FROM runs WHERE owner = ? AND state IN (?, ?)
+                   ORDER BY started_at LIMIT ?""",
+                (
+                    owner.value,
+                    RunState.PENDING.value,
+                    RunState.RUNNING.value,
+                    max(1, min(limit, 200)),
+                ),
+            ).fetchall()
+            return tuple(self._run(connection, row) for row in rows)
+        finally:
+            connection.close()
+
     # -- starting --------------------------------------------------------
 
     def find(self, workflow: Workflow, trigger: Mapping[str, object]) -> Run | None:
