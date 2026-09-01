@@ -162,7 +162,8 @@ class ProgressAndResumeTests(unittest.TestCase):
         self.assertIn("Send Scotty", google.next_action)
         trello = next(item for item in progress if item.provider == "trello")
         self.assertEqual(trello.missing, ())
-        self.assertIn("protected intake", trello.next_action)
+        self.assertIn("local hidden-input setup command", trello.next_action)
+        self.assertIn("cannot accept a credential through Discord", trello.next_action)
 
     def test_resume_returns_the_first_unfinished_provider_in_fixed_order(self) -> None:
         config = synthetic.config()

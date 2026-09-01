@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 
@@ -65,7 +66,30 @@ def event(
     return SimpleNamespace(text=text, source=source, message_id=message_id)
 
 
+@contextlib.contextmanager
+def attested_boundary():
+    """Exercise the retained mechanism as if a boundary had been attested.
+
+    The shipped default is off. These tests keep the mechanism honest so that
+    enabling it later is a one-line change backed by evidence, not a rewrite.
+    """
+
+    from assistant.scotty_business import credential_intake
+
+    original = credential_intake.DISCORD_INTAKE_ENABLED
+    credential_intake.DISCORD_INTAKE_ENABLED = True
+    try:
+        yield
+    finally:
+        credential_intake.DISCORD_INTAKE_ENABLED = original
+
+
 class IntakeHarness(unittest.TestCase):
+    def setUp(self) -> None:
+        self._boundary = attested_boundary()
+        self._boundary.__enter__()
+        self.addCleanup(lambda: self._boundary.__exit__(None, None, None))
+
     def build(self, **kwargs):
         config = synthetic.config()
         sent: list[tuple[str, str]] = []
@@ -443,6 +467,104 @@ class IngressWiringTests(IntakeHarness):
         self.assertEqual(decision, {"action": "skip", "reason": "credential-intake-open"})
         self.assertFalse(intake.has_open_window())
         self.assertEqual(broker.validated, [])
+
+
+class DiscordIntakeIsDisabledTests(unittest.TestCase):
+    """The shipped default: Discord never accepts a credential at all."""
+
+    def guard(self, sent):
+        from assistant.scotty_business.credential_intake import (
+            BROKER_SOCKET,
+            CredentialIntake,
+            UnixSocketBroker,
+        )
+        from assistant.scotty_business.ingress import IngressGuard
+
+        config = synthetic.config()
+        intake = CredentialIntake(
+            config,
+            lambda channel, text: sent.append((channel, text)),
+            broker=UnixSocketBroker(BROKER_SOCKET),
+            deleter=FakeDeleter(),
+            clock=lambda: 1_000,
+        )
+        return (
+            IngressGuard(config, lambda channel, text: sent.append((channel, text)), intake=intake),
+            intake,
+        )
+
+    def test_the_shipped_default_is_off(self) -> None:
+        from assistant.scotty_business import credential_intake
+
+        self.assertFalse(credential_intake.DISCORD_INTAKE_ENABLED)
+
+    def test_an_intake_phrase_opens_nothing_and_names_the_local_path(self) -> None:
+        sent: list[tuple[str, str]] = []
+        guard, intake = self.guard(sent)
+        decision = guard(event("Scotty, accept my Trello API key."))
+        self.assertEqual(decision, {"action": "skip", "reason": "credential-intake-open"})
+        self.assertFalse(intake.has_open_window())
+        message = sent[-1][1].lower()
+        self.assertIn("local hidden-input setup command", message)
+        self.assertIn("rotate", message)
+
+    def test_a_credential_shaped_message_never_reaches_model_dispatch(self) -> None:
+        sent: list[tuple[str, str]] = []
+        guard, _ = self.guard(sent)
+        for text in (
+            "my api key is synthetic-provider-key-000000",
+            "token=synthetic-provider-key-000000",
+            "the secret: synthetic-provider-key-000000",
+        ):
+            with self.subTest(text=text[:20]):
+                decision = guard(event(text))
+                self.assertEqual(decision, {"action": "skip", "reason": "credential-redacted"})
+        rotation = "".join(text for _, text in sent).lower()
+        self.assertIn("rotate", rotation)
+
+    def test_an_opaque_token_is_never_captured_by_a_window(self) -> None:
+        sent: list[tuple[str, str]] = []
+        guard, intake = self.guard(sent)
+        guard(event("Scotty, accept my Trello API key."))
+        # With intake off there is no window, so the next message is ordinary
+        # traffic rather than a captured credential.
+        decision = guard(event(SECRET))
+        self.assertNotEqual(decision.get("reason"), "credential-intake")
+        self.assertFalse(intake.has_open_window())
+
+    def test_no_window_can_be_opened_on_any_route(self) -> None:
+        from assistant.scotty_business.routing import resolve_route
+
+        sent: list[tuple[str, str]] = []
+        _, intake = self.guard(sent)
+        config = synthetic.config()
+        for phrase in INTAKE_COMMANDS:
+            opening = event(phrase)
+            route = resolve_route(config, opening.source)
+            with self.subTest(phrase=phrase):
+                self.assertFalse(intake.open_window(route, phrase))
+                self.assertIsNone(intake.intercept(opening, route))
+
+    def test_the_switch_is_one_literal_constant_nothing_can_compute(self) -> None:
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(
+            Path("assistant/scotty_business/credential_intake.py").read_text(encoding="utf-8")
+        )
+        assignments = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "DISCORD_INTAKE_ENABLED"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(assignments), 1)
+        value = assignments[0].value
+        self.assertIsInstance(value, ast.Constant)
+        self.assertIs(value.value, False)
 
 
 if __name__ == "__main__":

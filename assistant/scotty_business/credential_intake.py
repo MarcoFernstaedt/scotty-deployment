@@ -1,21 +1,29 @@
-"""Protected one-time credential intake, ahead of every model-visible path.
+"""Credential intake, and why the Discord half of it is switched off.
 
-A normal Discord message containing a credential is never acceptable. This
-module gives Trent one purpose-built alternative: from his exact authorized
-private tuple he opens a single-use intake window with a fixed phrase, and the
-*next* message in that exact channel is intercepted here, inside the
-`pre_gateway_dispatch` hook, before event construction, batching, persistence,
-queues, sessions, model dispatch, tools, logs, or ordinary chat history.
+A normal Discord message containing a credential is never acceptable. The
+intended alternative was a purpose-built window: Trent names a credential class
+with a fixed phrase, and his *next* message in that exact channel is intercepted
+before event construction, batching, persistence, queues, sessions, model
+dispatch, tools, or ordinary chat history, then deleted and committed through a
+privilege-separated broker.
 
-The sequence is prepare, confirmed exact source-message deletion, then commit
-through a privilege-separated broker of fixed operations. Delete, validation,
-provenance, timeout, replay, conflict, or commit failure aborts without
-persistence. Nothing here returns, renders, or records credential material; the
-only outputs are fixed redacted states and the next setup step.
+That design depends on a boundary the runtime must provide. `pre_gateway_dispatch`
+receives an event that has already been constructed, so a hook there cannot
+prove it ran before construction or persistence. The earliest raw-message
+boundary would have to come from the pinned Hermes 0.20.6 Discord adapter, and
+this repository has not been able to inspect that image to confirm one exists.
 
-If the platform cannot confirm deletion, or the installed privilege boundary is
-unavailable, the intake fails closed and directs Trent to the approved hidden
-local operator entry path instead.
+Rather than claim a guarantee that has not been verified, Discord intake is off.
+`DISCORD_INTAKE_ENABLED` is False and the module refuses to open a window on any
+route. The intake phrases are still recognised, deterministically and before the
+model, so Trent gets a specific answer pointing at the local hidden-input setup
+command instead of silence. Every credential-shaped message continues to be
+stopped by the ingress leak scan before model dispatch.
+
+The mechanism below is retained, tested, and inert. It becomes reachable only
+when a verified pre-event boundary is installed and attested, which is a change
+to this constant plus the evidence that justifies it — never a runtime toggle,
+an environment variable, or a configuration value a message could influence.
 """
 
 from __future__ import annotations
@@ -47,6 +55,19 @@ INTAKE_COMMANDS: Mapping[str, tuple[str, str]] = {
 
 #: Google Workspace is deliberately absent above: it uses provider-owned browser
 #: consent, so no Google credential is ever handed to Scotty through Discord.
+
+#: Discord intake stays off until the pinned runtime's earliest raw-message
+#: boundary is inspected and attested. This is a source constant on purpose: no
+#: environment variable, configuration value, or message can turn it on.
+DISCORD_INTAKE_ENABLED = False
+
+DISCORD_INTAKE_DISABLED_INSTRUCTION = (
+    "Scotty cannot accept a credential through Discord at all. Deleting a "
+    "message afterwards is not the same as never storing it, and that guarantee "
+    "is not currently proven for this runtime. Enter the credential through the "
+    "local hidden-input setup command on the server instead, and if you already "
+    "pasted one anywhere, rotate it."
+)
 
 #: The one fixed path of the installed root-owned privilege boundary.
 BROKER_SOCKET = "/run/scotty/credential-broker.sock"
@@ -255,6 +276,11 @@ class CredentialIntake:
         if target is None:
             return False
         principal = route.principal
+        if not DISCORD_INTAKE_ENABLED:
+            # Answer the exact phrase with the safe path rather than silence.
+            if principal is not None:
+                self.enqueue(principal.channel_id, DISCORD_INTAKE_DISABLED_INSTRUCTION)
+            return False
         if (
             route.kind is not RouteKind.CLIENT
             or principal is None
@@ -305,6 +331,9 @@ class CredentialIntake:
         no further: it is never queued, dispatched, persisted, or logged.
         """
 
+        if not DISCORD_INTAKE_ENABLED:
+            # No window can exist, so nothing is ever consumed from Discord.
+            return None
         window = self._window
         if window is None or route is None:
             return None

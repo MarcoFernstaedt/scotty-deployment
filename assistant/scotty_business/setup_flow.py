@@ -9,7 +9,7 @@ diagnoses a failure with the next correction, and resumes at the first
 unfinished step.
 
 Two boundaries hold throughout. No credential is ever collected here: secrets
-travel only through the protected intake or local hidden input. And nothing here
+travel only through the local hidden-input setup command. And nothing here
 edits live configuration; validated identifiers are staged into Scotty-owned
 owner-only state that the root-owned local setup command consumes as prefill.
 """
@@ -121,7 +121,7 @@ _DIAGNOSES: Mapping[str, str] = {
     "authentication": (
         "The provider rejected the credential itself. It is missing, mistyped, revoked, "
         "or issued from the wrong account. Issue a fresh one and hand it over through the "
-        "protected intake or local setup."
+        "local hidden-input setup command on the server."
     ),
     "authorization": (
         "The credential is valid but is not permitted on this resource. Check that it was "
@@ -305,8 +305,9 @@ def _next_action(provider: str, connected: bool, missing: tuple[str, ...]) -> st
     if provider == "discord":
         return f"Run {LOCAL_SETUP_COMMAND} so the bot token is entered through hidden input."
     return (
-        "Hand Scotty the credential through the protected intake, or enter it through the "
-        f"local hidden-input setup command, then run {LOCAL_SETUP_COMMAND}."
+        "Enter the credential through the local hidden-input setup command on the "
+        f"server, then run {LOCAL_SETUP_COMMAND}. Scotty cannot accept a credential "
+        "through Discord."
     )
 
 

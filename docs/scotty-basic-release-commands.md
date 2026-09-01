@@ -190,9 +190,8 @@ to enable, the identifiers and scopes to gather, and the callback behaviour, and
 names the single next action. It never asks for a credential in Discord and
 never accepts one from ordinary chat.
 
-If a credential is ever posted in a channel outside the protected intake below,
-Scotty does not use or repeat it. Rotate it, then enter the replacement through
-the local setup command or a fresh intake window.
+If a credential is ever posted in a channel, Scotty does not use or repeat it.
+Rotate it, then enter the replacement through the local setup command.
 
 ### 5.7 Guided setup, resume, and failure diagnosis
 
@@ -208,20 +207,31 @@ written to live configuration. Reporting a provider failure returns a named
 diagnosis and the next correction, never a generic refusal or a bare pointer to
 operator documentation.
 
-### 5.8 Protected credential intake
+### 5.8 Credential handling: Discord intake is switched off
 
 From the main-operator channel:
 
 > Scotty, accept my Trello API key.
 
-Expected: Scotty opens one single-use window bound to that exact tuple and asks
-for the credential as the very next message. That message is intercepted before
-anything else sees it, deleted from Discord, and stored through the root-owned
-broker; Scotty reports only `credential present` and the next setup step.
-Unconfirmed deletion, failed validation, expiry, replay, or a failed commit
-stores nothing and directs the operator to local hidden input. The employee
-cannot open a window, and Google Workspace has no intake phrase because it uses
-provider-owned browser consent.
+Expected: Scotty refuses and names the local hidden-input setup command. It does
+not open a window, and it never accepts a credential through Discord.
+
+The reason is recorded rather than papered over. Intercepting a credential
+*before* the event exists requires the earliest raw-message boundary in the
+pinned Hermes 0.20.6 Discord adapter. `pre_gateway_dispatch` receives an event
+that has already been constructed, so a hook there cannot prove it ran before
+construction or persistence, and this repository has not been able to inspect
+the pinned image to confirm an earlier boundary exists. Deleting a message after
+the fact is not the same as never storing it, so the capability is off rather
+than approximated.
+
+Every credential-shaped message is still stopped by the ingress leak scan before
+model dispatch, and Scotty answers with rotation guidance.
+
+The mechanism remains in the tree, inert and tested, behind a single source
+constant. Turning it on requires inspecting the pinned runtime, attesting the
+boundary, and changing that constant — never an environment variable, a
+configuration value, or anything a message can influence.
 
 ### 5.9 Ordinary Discord assistant work
 
