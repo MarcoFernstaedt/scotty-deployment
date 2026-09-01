@@ -18,7 +18,10 @@ from .config import GOOGLE_OAUTH_SCOPES
 from .google_oauth import (
     GoogleOAuthError,
     GoogleTokenStore,
-    authorize_installed_app,
+    begin_consent,
+    complete_consent,
+    import_client,
+    publish_consent_prompt,
 )
 from .policy import Role
 from .provisioning import (
@@ -1154,6 +1157,76 @@ def next_steps(inputs: SetupInputs) -> tuple[str, ...]:
     return tuple(steps)
 
 
+#: Where the operator keeps the Desktop OAuth client, and where Scotty keeps
+#: the two files that come out of consent.
+GOOGLE_CLIENT_PATH = Path("/srv/Scotty/operator/google-oauth-client.json")
+GOOGLE_TOKEN_PATH = _DATA_DIR / "scotty" / "google-oauth.json"
+GOOGLE_PROMPT_PATH = _DATA_DIR / "scotty" / "google-consent.json"
+
+
+def connect_google_workspace(
+    account_email: str,
+    *,
+    client_path: Path = GOOGLE_CLIENT_PATH,
+    token_path: Path | None = None,
+    prompt_path: Path | None = None,
+    hidden_fn: Callable[[str], str] = getpass.getpass,
+    output: Callable[[str], None] = print,
+    owner_uid: int = 0,
+    runtime_uid: int = _RUNTIME_UID,
+) -> None:
+    """Complete Google consent on a headless server, without a local browser.
+
+    The server has no browser, so it never tries to open one. It prints the
+    exact authorization URL for Trent to open wherever he already is, publishes
+    the same non-secret URL for Scotty to show him in his own channel, and then
+    reads back the redirect he lands on. The redirect carries an authorization
+    code, so it is read through hidden input and never echoed.
+    """
+
+    store = GoogleTokenStore(token_path or GOOGLE_TOKEN_PATH)
+    if store.ready(GOOGLE_OAUTH_SCOPES, account_email):
+        return
+    try:
+        request = begin_consent(client_path, GOOGLE_OAUTH_SCOPES, owner_uid=owner_uid)
+        publish_consent_prompt(prompt_path or GOOGLE_PROMPT_PATH, request, owner_uid=runtime_uid)
+        output("Open this URL as the configured Google Workspace account:")
+        output(request.authorization_url)
+        output(
+            "Approve it, then copy the whole address you land on. The page will "
+            "not load; that is expected on a server with no browser."
+        )
+        verified = complete_consent(
+            client_path,
+            store,
+            request,
+            hidden_fn("Paste the full redirect URL (hidden): "),
+            owner_uid=owner_uid,
+        )
+    except GoogleOAuthError as exc:
+        raise SetupError(
+            "Google OAuth is incomplete; Scotty remains stopped until consent succeeds"
+        ) from exc
+    if verified.casefold() != account_email.casefold() or not store.ready(
+        GOOGLE_OAUTH_SCOPES, account_email
+    ):
+        raise SetupError("Google OAuth account does not match the configured Workspace account")
+
+
+def import_google_client(
+    source: Path,
+    *,
+    destination: Path = GOOGLE_CLIENT_PATH,
+    owner_uid: int = 0,
+) -> None:
+    """Import an owner-only Desktop OAuth client through local setup."""
+
+    try:
+        import_client(source, destination, owner_uid=owner_uid)
+    except GoogleOAuthError as exc:
+        raise SetupError("the Google OAuth client could not be imported") from exc
+
+
 def main() -> int:
     if os.geteuid() != 0:
         raise SetupError("run the local setup command as root")
@@ -1177,20 +1250,7 @@ def main() -> int:
     validate_maintainer_route(inputs, reader)
     write_private_state(inputs)
     if inputs.google_account_email:
-        store = GoogleTokenStore(_DATA_DIR / "scotty" / "google-oauth.json")
-        if not store.ready(GOOGLE_OAUTH_SCOPES, inputs.google_account_email):
-            try:
-                authorize_installed_app(
-                    Path("/srv/Scotty/operator/google-oauth-client.json"),
-                    store,
-                    GOOGLE_OAUTH_SCOPES,
-                )
-            except GoogleOAuthError as exc:
-                raise SetupError(
-                    "Google OAuth is incomplete; Scotty remains stopped until local browser consent succeeds"
-                ) from exc
-        if not store.ready(GOOGLE_OAUTH_SCOPES, inputs.google_account_email):
-            raise SetupError("Google OAuth account does not match the configured Workspace account")
+        connect_google_workspace(inputs.google_account_email)
     for step in next_steps(inputs):
         print(step)
     return 0

@@ -10,11 +10,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import webbrowser
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 
@@ -314,45 +312,80 @@ def ensure_access_token(
     return access
 
 
-def authorize_installed_app(
+#: A Desktop OAuth client redirects to loopback. On a headless server nothing
+#: listens there, which is the point: the browser lands on an address that fails
+#: to load, and its address bar carries the code back to the operator.
+HEADLESS_REDIRECT_URI = "http://localhost:8765/oauth2/callback"
+
+
+@dataclass(frozen=True, slots=True)
+class ConsentRequest:
+    """One consent attempt: what to show, and what the exchange must match."""
+
+    authorization_url: str
+    redirect_uri: str
+    state: str
+    verifier: str
+    scopes: tuple[str, ...]
+    client_id: str
+
+    def presentable(self) -> Mapping[str, object]:
+        """Exactly what may be shown to Trent. No secret is in this mapping."""
+
+        return {
+            "authorization_url": self.authorization_url,
+            "redirect_uri": self.redirect_uri,
+            "scopes": list(self.scopes),
+        }
+
+
+def import_client(source: Path, destination: Path, *, owner_uid: int = 0) -> dict[str, str]:
+    """Copy a Desktop OAuth client into the protected path, owner-only.
+
+    The file is validated before it is stored, so a wrong client type or an
+    unexpected endpoint is refused at import rather than at consent time.
+    """
+
+    client = _load_installed_client(source, owner_uid=owner_uid)
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if destination.parent.is_symlink() or destination.is_symlink():
+        raise GoogleOAuthError("Google OAuth client destination is unsafe")
+    payload = json.dumps({"installed": client}, sort_keys=True, separators=(",", ":")).encode()
+    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except OSError as exc:
+        raise GoogleOAuthError("Google OAuth client could not be stored") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+    return client
+
+
+def begin_consent(
     client_path: Path,
-    token_store: GoogleTokenStore,
     exact_scopes: tuple[str, ...],
     *,
-    timeout: int = 300,
-    exchange: TokenExchange = _post_form,
-) -> None:
-    """Perform Google's installed-app loopback browser flow without exposing codes."""
+    owner_uid: int = 0,
+    redirect_uri: str = HEADLESS_REDIRECT_URI,
+) -> ConsentRequest:
+    """Build the exact authorization URL to show, with PKCE, showing no secret."""
 
-    client = _load_installed_client(client_path)
+    client = _load_installed_client(client_path, owner_uid=owner_uid)
     state = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(64)
     challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     )
-    outcome: dict[str, str] = {}
-
-    class Callback(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:
-            del format, args
-
-        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-            parsed = parse_callback(self.path, state)
-            if parsed is None:
-                # Browser noise (a favicon probe, a stray reload) must not
-                # consume or abort the one consent this flow is waiting for.
-                self.send_response(404)
-                self.end_headers()
-                return
-            outcome[parsed[0]] = parsed[1]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"Google Workspace consent completed. Return to the local terminal.")
-
-    server = HTTPServer(("127.0.0.1", 0), Callback)
-    server.timeout = 5
-    redirect_uri = f"http://127.0.0.1:{server.server_port}/oauth2/callback"
     authorization_url = (
         client["auth_uri"]
         + "?"
@@ -370,41 +403,81 @@ def authorize_installed_app(
             }
         )
     )
-    print("Opening Google provider-owned browser consent. No authorization code will be displayed.")
-    try:
-        if not webbrowser.open(authorization_url, new=1, autoraise=True):
-            raise GoogleOAuthError("a local browser could not be opened for Google consent")
-        deadline = time.monotonic() + timeout
-        while not outcome and time.monotonic() < deadline:
-            server.handle_request()
-    finally:
-        server.server_close()
-    if "error" in outcome:
-        raise GoogleOAuthError("Google consent was declined or failed at the provider")
-    code = outcome.get("code")
-    if not code:
-        raise GoogleOAuthError("Google consent did not complete before the timeout")
+    return ConsentRequest(
+        authorization_url=authorization_url,
+        redirect_uri=redirect_uri,
+        state=state,
+        verifier=verifier,
+        scopes=tuple(exact_scopes),
+        client_id=client["client_id"],
+    )
 
+
+def authorization_code(redirect_url: object, state: str) -> str:
+    """Pull the code out of the redirect URL Trent pasted back.
+
+    The whole URL is treated as secret input: nothing here echoes it, and a
+    mismatched state, a provider-side error, or a missing code is refused
+    without repeating what was pasted.
+    """
+
+    if type(redirect_url) is not str or not redirect_url.strip():
+        raise GoogleOAuthError("no redirect URL was provided")
+    candidate = redirect_url.strip()
+    if len(candidate) > 4096:
+        raise GoogleOAuthError("the redirect URL is malformed")
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+        "localhost",
+        "127.0.0.1",
+    }:
+        raise GoogleOAuthError("the redirect URL is not the expected loopback address")
+    outcome = parse_callback(f"/oauth2/callback?{parsed.query}", state)
+    if outcome is None:
+        raise GoogleOAuthError("the redirect URL does not match this consent attempt")
+    if outcome[0] == "error":
+        raise GoogleOAuthError("Google reported that consent was declined or failed")
+    return outcome[1]
+
+
+def complete_consent(
+    client_path: Path,
+    token_store: GoogleTokenStore,
+    request: ConsentRequest,
+    redirect_url: object,
+    *,
+    owner_uid: int = 0,
+    exchange: TokenExchange = _post_form,
+    verify_account: Callable[[str], str] | None = None,
+) -> str:
+    """Exchange the pasted redirect for tokens and bind them to the account.
+
+    Returns the verified account email. Nothing else about the exchange leaves
+    this function, and no code or token is logged, printed, or raised.
+    """
+
+    client = _load_installed_client(client_path, owner_uid=owner_uid)
+    code = authorization_code(redirect_url, request.state)
     token_body = exchange(
         url=client["token_uri"],
         fields={
             "client_id": client["client_id"],
             "client_secret": client["client_secret"],
             "code": code,
-            "code_verifier": verifier,
+            "code_verifier": request.verifier,
             "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri,
+            "redirect_uri": request.redirect_uri,
         },
     )
     granted = tuple(str(token_body.get("scope", "")).split())
-    if canonical_scopes(granted) != canonical_scopes(exact_scopes):
+    if canonical_scopes(granted) != canonical_scopes(request.scopes):
         raise GoogleOAuthError("Google OAuth granted scopes do not match configured scopes")
     access = token_body.get("access_token")
     refresh = token_body.get("refresh_token")
     expires = token_body.get("expires_in")
     if type(access) is not str or type(refresh) is not str or type(expires) is not int:
         raise GoogleOAuthError("Google OAuth token response is incomplete")
-    account_email = _verify_account(access)
+    account_email = (verify_account or _verify_account)(access)
     token_store.write(
         OAuthToken(
             access_token=access,
@@ -416,6 +489,61 @@ def authorize_installed_app(
             client_secret=client["client_secret"],
         )
     )
+    return account_email
+
+
+def publish_consent_prompt(path: Path, request: ConsentRequest, *, owner_uid: int = 10000) -> None:
+    """Write the non-secret half of a consent attempt for the runtime to show.
+
+    Only what Trent needs in order to click through: the authorization URL, the
+    redirect it will land on, and the scopes. The client secret, the verifier,
+    and every token stay in the root-owned files.
+    """
+
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink() or path.is_symlink():
+        raise GoogleOAuthError("Google consent prompt path is unsafe")
+    payload = json.dumps(dict(request.presentable()), sort_keys=True, separators=(",", ":"))
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = None
+            stream.write(payload.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        with suppress(OSError, PermissionError):
+            os.chown(temporary, owner_uid, owner_uid)
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise GoogleOAuthError("Google consent prompt could not be published") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+
+
+def read_consent_prompt(path: Path) -> Mapping[str, object] | None:
+    """Read the non-secret consent prompt, or None when there is none."""
+
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, Mapping):
+        return None
+    url = raw.get("authorization_url")
+    if type(url) is not str or not url.startswith(GOOGLE_AUTH_URI):
+        return None
+    return {
+        "authorization_url": url,
+        "redirect_uri": str(raw.get("redirect_uri", "")),
+        "scopes": [str(item) for item in raw.get("scopes", []) if type(item) is str],
+    }
 
 
 def _verify_account(access_token: str) -> str:

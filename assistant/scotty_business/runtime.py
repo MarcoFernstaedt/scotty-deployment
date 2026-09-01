@@ -35,7 +35,12 @@ from .discord_policy import (
     redacted_refusal,
     shared_destinations,
 )
-from .google_oauth import GoogleOAuthError, GoogleTokenStore, ensure_access_token
+from .google_oauth import (
+    GoogleOAuthError,
+    GoogleTokenStore,
+    ensure_access_token,
+    read_consent_prompt,
+)
 from .google_policy import ROUTINE_GOOGLE_OPERATIONS
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
@@ -46,6 +51,7 @@ from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
 from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
 from .setup_flow import (
+    LOCAL_SETUP_COMMAND,
     ProviderProgress,
     SetupFlowError,
     SetupStagingStore,
@@ -491,6 +497,22 @@ class Runtime:
         if name not in PROVIDERS:
             raise ValueError("provider is not part of this deployment")
         current = next(item for item in progress if item.provider == name)
+        if name == "google_workspace" and not status[name]:
+            prompt = read_consent_prompt(self.state_dir / "google-consent.json")
+            if prompt is not None:
+                # Presenting the URL is safe: it carries the client id and the
+                # scopes, never the client secret, the verifier, or a token.
+                return {
+                    **_guidance_json(name, status[name]),
+                    **_progress_json(current),
+                    "consent": prompt,
+                    "next_action": (
+                        "Open the authorization URL as the configured Workspace account, "
+                        "approve it, then give the address you land on to the operator for "
+                        f"the local setup command. Scotty cannot accept it here. "
+                        f"Then run {LOCAL_SETUP_COMMAND}."
+                    ),
+                }
         failure = _text(args, "setup_failure", optional=True)
         if failure is not None:
             return {

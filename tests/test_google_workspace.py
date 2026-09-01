@@ -1157,6 +1157,267 @@ class GoogleAdapterTokenProviderTests(unittest.TestCase):
             GoogleWorkspaceAdapter(transport, "", config.google_workspace)
 
 
+class HeadlessConsentTests(unittest.TestCase):
+    """Consent on a server with no browser, and no secret in what is shown."""
+
+    CLIENT = {
+        "installed": {
+            "client_id": "synthetic-client-id.apps.googleusercontent.com",
+            "client_secret": "synthetic-client-secret-0001",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+
+    def client_file(self, directory: Path) -> Path:
+        path = directory / "google-oauth-client.json"
+        path.write_text(json.dumps(self.CLIENT), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def request(self, directory: Path):
+        from assistant.scotty_business.google_oauth import begin_consent
+
+        return begin_consent(
+            self.client_file(directory), GOOGLE_OAUTH_SCOPES, owner_uid=os.getuid()
+        )
+
+    def test_the_server_never_opens_a_browser(self) -> None:
+        source = Path("assistant/scotty_business/google_oauth.py").read_text(encoding="utf-8")
+        self.assertNotIn("webbrowser", source)
+        self.assertNotIn("HTTPServer", source)
+
+    def test_the_authorization_url_is_complete_and_carries_no_secret(self) -> None:
+        import urllib.parse
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            request = self.request(Path(directory))
+        parsed = urllib.parse.urlsplit(request.authorization_url)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        self.assertEqual(
+            f"{parsed.scheme}://{parsed.netloc}{parsed.path}",
+            "https://accounts.google.com/o/oauth2/auth",
+        )
+        self.assertEqual(query["client_id"], self.CLIENT["installed"]["client_id"])
+        self.assertEqual(query["code_challenge_method"], "S256")
+        self.assertEqual(query["access_type"], "offline")
+        self.assertEqual(set(query["scope"].split()), set(GOOGLE_OAUTH_SCOPES))
+        self.assertNotIn("synthetic-client-secret-0001", request.authorization_url)
+        self.assertNotIn(request.verifier, request.authorization_url)
+
+    def test_what_is_presented_to_trent_contains_no_secret(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            request = self.request(Path(directory))
+            rendered = json.dumps(dict(request.presentable()))
+        # The client secret and the PKCE verifier are the two values that must
+        # never leave the root-owned side. The state and the challenge are
+        # designed to travel in the URL.
+        self.assertNotIn("synthetic-client-secret-0001", rendered)
+        self.assertNotIn(request.verifier, rendered)
+
+    def test_a_pasted_redirect_completes_the_exchange(self) -> None:
+        from assistant.scotty_business.google_oauth import (
+            GoogleTokenStore,
+            complete_consent,
+        )
+
+        seen: list[dict[str, object]] = []
+
+        def exchange(**kwargs: object) -> dict[str, object]:
+            seen.append(kwargs)
+            return {
+                "access_token": "synthetic-access",
+                "refresh_token": "synthetic-refresh",
+                "expires_in": 3600,
+                "scope": " ".join(GOOGLE_OAUTH_SCOPES),
+            }
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            request = self.request(root)
+            store = GoogleTokenStore(
+                root / "token.json", owner_uid=os.getuid(), owner_gid=os.getgid()
+            )
+            account = complete_consent(
+                self.client_file(root),
+                store,
+                request,
+                f"{request.redirect_uri}?state={request.state}&code=synthetic-code",
+                owner_uid=os.getuid(),
+                exchange=exchange,
+                verify_account=lambda token: "scotty.synthetic@example.invalid",
+            )
+            self.assertEqual(account, "scotty.synthetic@example.invalid")
+            self.assertTrue(store.ready(GOOGLE_OAUTH_SCOPES, "scotty.synthetic@example.invalid"))
+        fields = seen[0]["fields"]
+        self.assertEqual(fields["code"], "synthetic-code")
+        self.assertEqual(fields["code_verifier"], request.verifier)
+        self.assertEqual(fields["redirect_uri"], request.redirect_uri)
+
+    def test_a_wrong_state_declined_consent_or_bad_address_is_refused(self) -> None:
+        from assistant.scotty_business.google_oauth import (
+            GoogleOAuthError,
+            authorization_code,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            request = self.request(Path(directory))
+        for pasted in (
+            f"{request.redirect_uri}?state=someone-else&code=synthetic-code",
+            f"{request.redirect_uri}?state={request.state}&error=access_denied",
+            f"{request.redirect_uri}?state={request.state}",
+            "https://evil.example.invalid/?state=x&code=y",
+            "not a url",
+            "",
+            None,
+            "x" * 5000,
+        ):
+            with self.subTest(pasted=str(pasted)[:30]), self.assertRaises(GoogleOAuthError):
+                authorization_code(pasted, request.state)
+
+    def test_an_expired_code_fails_closed_and_stores_nothing(self) -> None:
+        from assistant.scotty_business.google_oauth import (
+            GoogleOAuthError,
+            GoogleTokenStore,
+            complete_consent,
+        )
+
+        def rejecting(**kwargs: object) -> dict[str, object]:
+            raise GoogleOAuthError("Google OAuth token exchange failed")
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            request = self.request(root)
+            store = GoogleTokenStore(
+                root / "token.json", owner_uid=os.getuid(), owner_gid=os.getgid()
+            )
+            with self.assertRaises(GoogleOAuthError):
+                complete_consent(
+                    self.client_file(root),
+                    store,
+                    request,
+                    f"{request.redirect_uri}?state={request.state}&code=expired",
+                    owner_uid=os.getuid(),
+                    exchange=rejecting,
+                )
+            self.assertFalse((root / "token.json").exists())
+
+    def test_a_narrowed_grant_is_refused(self) -> None:
+        from assistant.scotty_business.google_oauth import (
+            GoogleOAuthError,
+            GoogleTokenStore,
+            complete_consent,
+        )
+
+        def narrowed(**kwargs: object) -> dict[str, object]:
+            return {
+                "access_token": "synthetic-access",
+                "refresh_token": "synthetic-refresh",
+                "expires_in": 3600,
+                "scope": "openid email",
+            }
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            request = self.request(root)
+            store = GoogleTokenStore(
+                root / "token.json", owner_uid=os.getuid(), owner_gid=os.getgid()
+            )
+            with self.assertRaises(GoogleOAuthError):
+                complete_consent(
+                    self.client_file(root),
+                    store,
+                    request,
+                    f"{request.redirect_uri}?state={request.state}&code=synthetic-code",
+                    owner_uid=os.getuid(),
+                    exchange=narrowed,
+                )
+            self.assertFalse((root / "token.json").exists())
+
+    def test_the_client_is_imported_owner_only_and_validated(self) -> None:
+        from assistant.scotty_business.google_oauth import GoogleOAuthError, import_client
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            destination = root / "protected" / "client.json"
+            import_client(self.client_file(root), destination, owner_uid=os.getuid())
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            self.assertIn("client_secret", destination.read_text(encoding="utf-8"))
+
+            wrong = root / "wrong.json"
+            wrong.write_text(json.dumps({"web": self.CLIENT["installed"]}), encoding="utf-8")
+            wrong.chmod(0o600)
+            with self.assertRaises(GoogleOAuthError):
+                import_client(wrong, root / "other.json", owner_uid=os.getuid())
+
+    def test_the_published_prompt_is_readable_and_secret_free(self) -> None:
+        from assistant.scotty_business.google_oauth import (
+            publish_consent_prompt,
+            read_consent_prompt,
+        )
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            request = self.request(root)
+            prompt_path = root / "google-consent.json"
+            publish_consent_prompt(prompt_path, request, owner_uid=os.getuid())
+            prompt = read_consent_prompt(prompt_path)
+            assert prompt is not None
+            self.assertEqual(prompt["authorization_url"], request.authorization_url)
+            body = prompt_path.read_text(encoding="utf-8")
+            self.assertNotIn("synthetic-client-secret-0001", body)
+            self.assertNotIn(request.verifier, body)
+            # Completing consent needs the verifier and the client secret, both
+            # root-only, so a readable state cannot be used to finish the flow.
+            self.assertNotIn("code_verifier", body)
+
+    def test_an_absent_or_forged_prompt_is_ignored(self) -> None:
+        from assistant.scotty_business.google_oauth import read_consent_prompt
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            self.assertIsNone(read_consent_prompt(root / "absent.json"))
+            forged = root / "forged.json"
+            forged.write_text(
+                json.dumps({"authorization_url": "https://evil.example.invalid/"}),
+                encoding="utf-8",
+            )
+            self.assertIsNone(read_consent_prompt(forged))
+            link = root / "link.json"
+            link.symlink_to(forged)
+            self.assertIsNone(read_consent_prompt(link))
+
+    def test_local_setup_reads_the_redirect_through_hidden_input(self) -> None:
+        from assistant.scotty_business.setup import SetupError, connect_google_workspace
+
+        prompts: list[str] = []
+        printed: list[str] = []
+
+        with tempfile.TemporaryDirectory(prefix="scotty-consent-") as directory:
+            root = Path(directory)
+            client = self.client_file(root)
+
+            def hidden(prompt: str) -> str:
+                prompts.append(prompt)
+                # The state is not known to the caller, so this fails closed.
+                return "http://localhost:8765/oauth2/callback?state=x&code=y"
+
+            with self.assertRaises(SetupError):
+                connect_google_workspace(
+                    "scotty.synthetic@example.invalid",
+                    client_path=client,
+                    token_path=root / "token.json",
+                    prompt_path=root / "prompt.json",
+                    hidden_fn=hidden,
+                    output=printed.append,
+                    owner_uid=os.getuid(),
+                    runtime_uid=os.getuid(),
+                )
+        self.assertTrue(any("hidden" in prompt.lower() for prompt in prompts))
+        self.assertTrue(any("accounts.google.com" in line for line in printed))
+        self.assertFalse((root / "token.json").exists())
+
+
 class GoogleConsentCallbackTests(unittest.TestCase):
     """The loopback consent callback must not leak a code or hang on noise."""
 
