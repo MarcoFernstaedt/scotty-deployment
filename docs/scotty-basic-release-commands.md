@@ -20,8 +20,9 @@ git status --short --untracked-files=all
 
 `make verify` runs format, lint, ShellCheck, mypy, the unit tests, the
 credential-free synthetic acceptance run, the deterministic package build and
-checksum, the pinned-image plugin smoke, the repository and history secret scan,
-and the checksum inventory.
+checksum, the pinned-image plugin smoke, the pinned-image OAuth probe, the
+repository and history secret scan, and the checksum inventory. The same gates
+run in CI on every push.
 
 ## 2. Final install and configure command
 

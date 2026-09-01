@@ -1,15 +1,30 @@
 # Claude App Handoff: Finish Scotty Basic Release
 
+> **Historical record. Not current instructions, and not a current description
+> of this repository.**
+>
+> This was the handoff written for the basic release, on the
+> `feature/scotty-basic-assistant` branch at commit `cbc8c83`. Everything below
+> describes the deployment as it stood then: a smaller plugin, a smaller test
+> suite, and several things that have since changed shape entirely — the
+> credential broker, the host supervisor, executable workflows, per-actor
+> provider identity, and functional Discord administration did not exist yet.
+>
+> `CLAUDE.md` at the repository root is the controlling contract. `README.md`
+> describes what is actually built. The counts, commands, branch and commit in
+> this file are kept only so the record of that release is not lost; do not act
+> on them.
+
 ## Repository and branch
 
 - Repository: `MarcoFernstaedt/scotty-deployment`
-- Working branch: `feature/scotty-basic-assistant`
-- Verified starting commit: `cbc8c83`
+- Working branch at the time: `feature/scotty-basic-assistant`
+- Verified starting commit at the time: `cbc8c83`
 - Base branch: `main`
 
 Do not work directly on `main`. Do not force-push or rewrite history.
 
-## Verified current state
+## State at the time of that handoff
 
 At `cbc8c83`, the generic bounded business plugin, typed Trello/GoHighLevel/RentCast adapters, approval state machine, exact-principal ingress checks, private setup workflow, fixtures, package builder, installer staging, and pinned-runtime smoke tests exist.
 

@@ -37,4 +37,8 @@ checksums:
 	python3 tools/generate_checksums.py --check
 	sha256sum -c SHA256SUMS
 
-verify: format-check lint typecheck test acceptance package smoke scan checksums
+# Every gate the contract names, in the order a person would run them: the
+# cheap static ones first, then the tests, then the ones that need the pinned
+# image. `oauth-probe` was missing from this list, which meant a green `verify`
+# said nothing about the OAuth path the deployment depends on.
+verify: format-check lint typecheck test acceptance package smoke oauth-probe scan checksums

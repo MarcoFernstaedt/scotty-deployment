@@ -66,9 +66,22 @@ A prompt, folder name, model, or persona is not a security boundary. The code, e
 - `assistant/scotty_business/workflows.py`: declared workflows, validated whole, composed only of installed operations.
 - `assistant/scotty_business/workflow_runs.py`: the durable run ledger — one run per trigger, one step at a time, and a step that was in flight when the process stopped comes back `unknown` rather than being repeated.
 - `assistant/scotty_business/service.py`: provider-independent proposal and execution workflows.
+- `assistant/scotty_business/runtime.py`: the tool surface itself — every operation a caller can reach, bound to the authenticated actor before any provider is touched.
+- `assistant/scotty_business/policy.py`: roles, principals, and who may approve what.
+- `assistant/scotty_business/identity.py` and `persona.py`: per-user assistant naming, with no product or vendor identity in any client-visible string.
+- `assistant/scotty_business/provider_identity.py`: which credential belongs to which actor, resolved server-side and never model-selectable. It carries whether a credential is held, never the credential.
+- `assistant/scotty_business/brokered_transport.py`: the runtime's only way out to a provider — a fixed operation table in the root-owned broker, never a URL the runtime composes.
+- `assistant/scotty_business/property_cards.py` and `property_engine.py`: the canonical property-card schema, deterministic duplicate scoring, comparison and merge previews, and effect-logged writes read back before they count.
+- `assistant/scotty_business/budgets.py`: per-actor rates, quiet hours, and provider circuit breakers.
+- `assistant/scotty_business/supervisor.py`: the in-process half of supervision — consumer lease, restart decisions, one alert per incident. It decides; it does not restart, because nothing in a container can.
+- `assistant/scotty_business/backup.py`: the runtime's view of backups. It takes and verifies them; it cannot roll back, and says so.
+- `assistant/scotty_business/google_readback.py`: the authoritative read that turns a Google acknowledgement into a verified write, or an `unknown` to reconcile.
+- `assistant/scotty_business/discord_permissions.py`: the named permissions each Discord operation actually needs, and the role-hierarchy check. `Administrator` is never one of them.
 - `assistant/scotty_business/setup.py`: root-only hidden-input setup, Discord privacy/membership validation, and atomic private-state publication.
+- `assistant/scotty_broker/`: the root-owned credential broker and its typed provider-execution table. Outside every container mount, by design.
+- `assistant/scotty_supervisor/`: the host supervisor, immutable releases, and real backup, restore and rollback.
 - `fixtures/`: synthetic configuration and provider data only.
-- `install.sh`: fail-closed transaction that stages the package and creates, but never starts, the container.
+- `install.sh`: fail-closed transaction that stages the package, installs the broker and supervisor, and creates, but never starts, the container.
 
 Provider reference authorities:
 
@@ -86,7 +99,8 @@ Run the governing local gate from the repository root:
 make verify
 ```
 
-Individual gates:
+`make verify` runs every gate below, in this order. The last three need the
+pinned image present locally; the rest need only the checkout.
 
 ```sh
 make format-check
@@ -96,14 +110,22 @@ make test
 make acceptance
 make package
 make smoke
+make oauth-probe
 make scan
 make checksums
 ```
 
 `make acceptance` runs a credential-free synthetic acceptance pass over the
 fixtures. `make oauth-probe` reads the pinned image's own login subcommand from
-a disposable, network-disabled container; it is not part of `make verify`
-because it needs the pinned image present.
+a disposable, network-disabled container: the OAuth path is what the whole
+Google surface rests on, so a green `verify` that had never exercised it was
+saying less than it appeared to.
+
+The same gates run in CI on every push (`.github/workflows/verify.yml`), split
+into the ones that need the pinned image and the ones that do not, so a pull
+that fails because an image mirror is unreachable does not look like a code
+failure. The suite is run there twice, as an ordinary user and as root, because
+a test that passes as only one of the two will surprise somebody on the host.
 
 `make smoke` uses a disposable, network-disabled container from the pinned image and proves Hermes 0.20.6 discovers exactly the five Scotty tools, and that the generated configuration parses into three native profile routes with the served allowlist and per-profile toolsets it expects. It also drives the runtime's own sender authorization, the full admit/deny tuple matrix through both pre-dispatch hooks, the fixed wizard dispatch, and profile-scoped model resolution. It does not use credentials or providers. `make package` writes ignored deterministic artifacts below `dist/`.
 

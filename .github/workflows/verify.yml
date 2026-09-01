@@ -1,0 +1,88 @@
+# The governing gates, run on every push and pull request.
+#
+# They are split by what they need rather than by what they check. The static
+# gates and the test suite need nothing but the checkout; the last three need
+# the pinned runtime image, which is a several-hundred-megabyte pull and the
+# only thing here that can fail for a reason that is not this repository's
+# fault. Splitting them means a broken image mirror does not hide a lint error.
+name: verify
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: static gates and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the repository scan reads reachable history, not just the tip
+
+      - name: Install the pinned tooling
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          python3 -m pip install --user --quiet uv
+          printf '%s/.local/bin\n' "$HOME" >> "$GITHUB_PATH"
+
+      - run: make format-check
+      - run: make lint
+      - run: make typecheck
+
+      - name: Shell syntax and the shell-level test assertions
+        run: |
+          set -Eeuo pipefail
+          bash -n install.sh scotty-start firewall/scotty-egress-guard tests/*.sh
+          ./tests/test_firewall_cleanup.sh
+          ./tests/test_err_traps.sh
+          ./tests/test_symlink_preflight.sh
+
+      - name: The suite, as an ordinary user
+        # The runner is not root, which is the case the broker's peer checks
+        # actually have to hold for.
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: The suite, as root
+        # And again as root, because a test that only passes as one of the two
+        # is a test that will surprise somebody on the host.
+        run: sudo -E python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - run: make acceptance
+      - run: make package
+      - run: make scan
+      - run: make checksums
+
+  pinned-image:
+    name: gates that need the pinned runtime
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned tooling
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          python3 -m pip install --user --quiet uv
+          printf '%s/.local/bin\n' "$HOME" >> "$GITHUB_PATH"
+
+      - name: Pull the image by its immutable digest
+        # By digest, never by tag: a tag is a name somebody can move.
+        run: |
+          set -Eeuo pipefail
+          docker pull 'nousresearch/hermes-agent@sha256:d64f4e9aba92884fff3d5020c02a75676066f237622d0776759ca1437b9b0517'
+
+      - run: make test
+      - run: make smoke
+      - run: make oauth-probe
