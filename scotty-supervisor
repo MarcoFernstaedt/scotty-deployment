@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Watch the managed container from outside it, and run the release lifecycle.
+
+Started by systemd as root. Nothing inside a container can restart the container
+it is part of, so this runs on the host. Docker's own restart policy is off by
+design: it cannot tell a transient death from a crash loop, cannot decide that
+restarting has stopped helping, and cannot hand the problem to a person.
+
+The root precondition is checked before anything is imported from the installed
+tree, so a non-root invocation says what is wrong rather than failing on an
+import.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+USAGE = """usage: scotty-supervisor <command>
+
+  watch              supervise continuously (this is what systemd runs)
+  once               make one supervision decision and print it
+  status             print supervision state, current release, and health
+  hold <reason>      stop supervising until released
+  release            resume supervising
+  backup             take a verified backup of non-secret state
+  verify <backup>    check a backup against its manifest
+  restore <backup>   stage, validate, and atomically put state back
+  rollback           print the plan to return to the last accepted release
+  uninstall          remove product-owned services, sockets and files
+"""
+
+
+def main(argv: list[str]) -> int:
+    if os.geteuid() != 0:
+        print("scotty-supervisor: must run as root", file=sys.stderr)
+        return 1
+    if len(argv) < 2 or argv[1] in {"-h", "--help", "help"}:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    sys.path.insert(0, "/usr/local/lib/scotty")
+    from scotty_supervisor.cli import run
+
+    return run(argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

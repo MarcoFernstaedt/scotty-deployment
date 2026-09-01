@@ -30,6 +30,18 @@ readonly GUARD_BIN=/usr/local/libexec/scotty-egress-guard
 readonly GUARD_UNIT=/etc/systemd/system/scotty-egress-guard.service
 readonly BROKER_BIN=/usr/local/sbin/scotty-credential-broker
 readonly BROKER_UNIT=/etc/systemd/system/scotty-credential-broker.service
+readonly SUPERVISOR_BIN=/usr/local/sbin/scotty-supervisor
+readonly SUPERVISOR_UNIT=/etc/systemd/system/scotty-supervisor.service
+readonly SUPERVISOR_DIR=/usr/local/lib/scotty/scotty_supervisor
+# Nothing inside a container can restart the container it is part of, so the
+# supervisor runs on the host, root-owned, outside every mount.
+readonly -a SUPERVISOR_FILES=(
+  "__init__.py"
+  "cli.py"
+  "releases.py"
+  "state.py"
+  "supervise.py"
+)
 # Deliberately outside /srv/Scotty/data: that tree is owned by the container
 # account and bind-mounted read-write, so anything root imports from it could be
 # replaced from inside the container.
@@ -65,6 +77,10 @@ INSTALLED_GUARD=0
 INSTALLED_UNIT=0
 INSTALLED_BROKER=0
 INSTALLED_BROKER_UNIT=0
+INSTALLED_SUPERVISOR=0
+INSTALLED_SUPERVISOR_UNIT=0
+CREATED_SUPERVISOR_DIR=0
+ENABLED_SUPERVISOR=0
 CREATED_BROKER_DIR=0
 CREATED_BROKER_ROOT=0
 ENABLED_BROKER=0
@@ -270,6 +286,26 @@ install_broker_file() {
   [[ -f $target && ! -L $target ]] || die "broker install reported success but target is absent: ${relative}"
 }
 
+install_supervisor_file() {
+  local relative=$1 source target install_rc
+  source=${SOURCE_DIR}/assistant/scotty_supervisor/${relative}
+  target=${SUPERVISOR_DIR}/${relative}
+  [[ -f $source && ! -L $source ]] || die "supervisor source is absent or unsafe: ${relative}"
+  require_safe_ancestors "$target"
+  require_absent_destination "$target"
+  explicit_status_begin
+  install -o root -g root -m 0644 "$source" "$target"
+  install_rc=$?
+  explicit_status_end
+  if [[ -f $target && ! -L $target ]]; then
+    INSTALLED_PLUGIN_FILES+=("$target")
+  elif [[ -L $target ]]; then
+    die "supervisor install produced or encountered an unowned symlink: ${target}"
+  fi
+  (( install_rc == 0 )) || die "supervisor install failed for ${relative} (status ${install_rc})"
+  [[ -f $target && ! -L $target ]] || die "supervisor install reported success but target is absent: ${relative}"
+}
+
 cleanup() {
   local original_rc=$1 label inventory probe_rc remove_rc disable_rc guard_rc rc=0
   local installed_file index
@@ -345,6 +381,31 @@ cleanup() {
       rc=1
     else
       rm -f -- "$BROKER_BIN"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
+  if (( ENABLED_SUPERVISOR )); then
+    systemctl disable --now scotty-supervisor.service >/dev/null 2>&1
+    remove_rc=$?
+    (( remove_rc == 0 )) || rc=1
+  fi
+  if (( INSTALLED_SUPERVISOR_UNIT )); then
+    if [[ -L $SUPERVISOR_UNIT ]]; then
+      printf 'install: refusing to remove replacement symlink: %s\n' "$SUPERVISOR_UNIT" >&2
+      rc=1
+    else
+      rm -f -- "$SUPERVISOR_UNIT"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
+  if (( INSTALLED_SUPERVISOR )); then
+    if [[ -L $SUPERVISOR_BIN ]]; then
+      printf 'install: refusing to remove replacement symlink: %s\n' "$SUPERVISOR_BIN" >&2
+      rc=1
+    else
+      rm -f -- "$SUPERVISOR_BIN"
       remove_rc=$?
       (( remove_rc == 0 )) || rc=1
     fi
@@ -428,8 +489,10 @@ cleanup() {
   fi
   for (( index=${#INSTALLED_PLUGIN_FILES[@]}-1; index>=0; index-- )); do
     installed_file=${INSTALLED_PLUGIN_FILES[index]}
-    if [[ $installed_file != "$DATA_DIR/"* || -L $installed_file ]]; then
-      printf 'install: refusing to remove unsafe plugin path: %s\n' "$installed_file" >&2
+    if [[ $installed_file != "$DATA_DIR/"* \
+      && $installed_file != "$BROKER_DIR/"* \
+      && $installed_file != "$SUPERVISOR_DIR/"* ]] || [[ -L $installed_file ]]; then
+      printf 'install: refusing to remove unsafe installed path: %s\n' "$installed_file" >&2
       rc=1
     else
       rm -f -- "$installed_file"
@@ -448,6 +511,15 @@ cleanup() {
       (( remove_rc == 0 )) || rc=1
     fi
   done
+  if (( CREATED_SUPERVISOR_DIR )); then
+    if [[ -L $SUPERVISOR_DIR ]]; then
+      rc=1
+    else
+      rmdir -- "$SUPERVISOR_DIR"
+      remove_rc=$?
+      (( remove_rc == 0 )) || rc=1
+    fi
+  fi
   if (( CREATED_BROKER_DIR )); then
     if [[ -L $BROKER_DIR ]]; then
       rc=1
@@ -688,12 +760,18 @@ verify_install() {
   systemctl is-active --quiet scotty-credential-broker.service || die 'credential broker is not active'
   command_output actual stat -c '%u:%g:%a' /run/scotty/credential-broker.sock
   [[ $actual == '0:10000:660' ]] || die "broker socket ownership/mode mismatch: ${actual}"
-  command_output actual stat -c '%u:%g:%a' "$BROKER_BIN" "$BROKER_UNIT" "$BROKER_DIR"
-  [[ $actual == $'0:0:755\n0:0:644\n0:0:755' ]] || die "broker artefact ownership/mode mismatch: ${actual}"
-  [[ ! -e /srv/Scotty/data/plugins/scotty_broker ]] \
-    || die 'the broker must never sit inside the container-writable data mount'
-  [[ ! -e /srv/Scotty/data/profiles/scotty-main-operator/plugins/scotty_broker ]] \
-    || die 'a client profile must never carry the broker'
+  command_output actual stat -c '%u:%g:%a' "$BROKER_BIN" "$BROKER_UNIT" "$BROKER_DIR" "$SUPERVISOR_BIN" "$SUPERVISOR_UNIT" "$SUPERVISOR_DIR"
+  [[ $actual == $'0:0:755\n0:0:644\n0:0:755\n0:0:755\n0:0:644\n0:0:755' ]] \
+    || die "privileged artefact ownership/mode mismatch: ${actual}"
+  for privileged in scotty_broker scotty_supervisor; do
+    [[ ! -e /srv/Scotty/data/plugins/${privileged} ]] \
+      || die "the ${privileged} package must never sit inside the container-writable data mount"
+    for client_profile in "${CLIENT_PROFILES[@]}"; do
+      [[ ! -e /srv/Scotty/data/profiles/${client_profile}/plugins/${privileged} ]] \
+        || die "a client profile must never carry ${privileged}"
+    done
+  done
+  systemctl is-enabled --quiet scotty-supervisor.service || die 'supervisor unit is not enabled'
 
   systemctl is-active --quiet scotty-egress-guard.service || die 'firewall service is not active'
   "$GUARD_BIN" verify
@@ -737,6 +815,12 @@ for broker_file in "${BROKER_FILES[@]}"; do
 done
 install_owned INSTALLED_BROKER "$BROKER_BIN" -o root -g root -m 0755 "$SOURCE_DIR/scotty-credential-broker" "$BROKER_BIN"
 install_owned INSTALLED_BROKER_UNIT "$BROKER_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/broker/scotty-credential-broker.service" "$BROKER_UNIT"
+install_owned CREATED_SUPERVISOR_DIR "$SUPERVISOR_DIR" -d -o root -g root -m 0755 "$SUPERVISOR_DIR"
+for supervisor_file in "${SUPERVISOR_FILES[@]}"; do
+  install_supervisor_file "$supervisor_file"
+done
+install_owned INSTALLED_SUPERVISOR "$SUPERVISOR_BIN" -o root -g root -m 0755 "$SOURCE_DIR/scotty-supervisor" "$SUPERVISOR_BIN"
+install_owned INSTALLED_SUPERVISOR_UNIT "$SUPERVISOR_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/supervisor/scotty-supervisor.service" "$SUPERVISOR_UNIT"
 install_owned INSTALLED_GUARD "$GUARD_BIN" -o root -g root -m 0755 "$SOURCE_DIR/firewall/scotty-egress-guard" "$GUARD_BIN"
 install_owned INSTALLED_UNIT "$GUARD_UNIT" -o root -g root -m 0644 "$SOURCE_DIR/firewall/scotty-egress-guard.service" "$GUARD_UNIT"
 RELOADED_SYSTEMD=1
@@ -745,6 +829,10 @@ ENABLED_BROKER=1
 systemctl enable --now scotty-credential-broker.service
 ENABLED_GUARD=1
 systemctl enable --now scotty-egress-guard.service
+# Enabled but not started here: the container does not exist yet, and the
+# supervisor's job is to keep an installed one running, not to create one.
+ENABLED_SUPERVISOR=1
+systemctl enable scotty-supervisor.service
 
 explicit_status_begin
 create_output="$(docker network create --driver bridge --subnet "$SUBNET" --label com.scotty.deployment=managed "$NETWORK" 2>&1)"

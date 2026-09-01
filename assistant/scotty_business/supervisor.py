@@ -34,7 +34,9 @@ CRASH_LOOP_WINDOW = timedelta(minutes=10)
 #: is down for an hour produces one message rather than sixty.
 MAX_TRACKED_INCIDENTS = 64
 
-OPERATOR_RECOVERY_STEP = "sudo /usr/local/sbin/scotty-start"
+#: The host supervisor restarts the container; this process cannot. Once
+#: restarting has stopped helping, what is left is a person on the host.
+OPERATOR_RECOVERY_STEP = "sudo /usr/local/sbin/scotty-supervisor status"
 
 
 class HealthState(StrEnum):

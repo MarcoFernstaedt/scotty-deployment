@@ -113,9 +113,33 @@ Run once from a clean, checksum-verified checkout on the documented Debian host:
 sudo ./install.sh
 ```
 
-The installer performs all preflight checks before mutation, installs the generic plugin and local setup command, creates the root-owned operator files, activates the host egress guard, creates the bridge, and creates the container. It never starts the container. Any error, interrupt, termination, or uncommitted exit triggers cleanup limited to objects created by that invocation.
+The installer performs all preflight checks before mutation, installs the generic plugin and local setup command, creates the root-owned operator files, installs the privileged credential broker and the host supervisor, activates the host egress guard, creates the bridge, and creates the container. It never starts the container. Any error, interrupt, termination, or uncommitted exit triggers cleanup limited to objects created by that invocation, including the broker and supervisor units, binaries, and package directories.
 
-The install fails closed if `/srv/Scotty`, the container, bridge, firewall chain/jump, installed operator files, or systemd unit already exists. There is no persistent rollback or uninstall script.
+The install fails closed if `/srv/Scotty`, the container, bridge, firewall chain/jump, installed operator files, or systemd unit already exists.
+
+## Supervision, backup, and rollback
+
+Nothing inside a container can restart the container it is part of, so Compose sets `restart: "no"` and a root-owned supervisor watches from the host. `scotty-supervisor.service` runs `watch`; every subcommand is also available to an operator:
+
+```sh
+sudo /usr/local/sbin/scotty-supervisor status        # container, current release, integrity, restart history
+sudo /usr/local/sbin/scotty-supervisor once          # one supervision pass, printed
+sudo /usr/local/sbin/scotty-supervisor hold "reason" # stop supervising; release lifts it
+sudo /usr/local/sbin/scotty-supervisor backup        # non-secret state, hash-bound
+sudo /usr/local/sbin/scotty-supervisor verify NAME
+sudo /usr/local/sbin/scotty-supervisor restore NAME  # staged and validated, then cut over
+sudo /usr/local/sbin/scotty-supervisor rollback      # name the accepted release to return to
+sudo /usr/local/sbin/scotty-supervisor rollback --execute
+sudo /usr/local/sbin/scotty-supervisor uninstall     # remove what was installed; data is left in place
+```
+
+The supervisor restarts a container that died, waits out a backoff rather than hammering, gives up once restarting is plainly not recovering anything, refuses to start into a release that no longer matches its manifest, and reports one incident and one recovery rather than one per look. It holds no credential of any kind.
+
+`rollback --execute` stops the container and proves it stopped before it selects anything — two processes on one Discord bot token is the failure that ordering prevents — then selects the newest release someone accepted, puts its exact recorded bytes, modes, and ownership back, starts it, and reports `verified`, `failed`, or `unknown`. An `unknown` outcome is escalated and left held for a person rather than retried.
+
+A backup carries the deployment's own work — workflows, personas, reminders, approvals, effect records, property-card provenance — and never a credential: a restore that could put a token back would be a way to resurrect access somebody revoked. Restores stage and validate every file before moving any of them into place, and write files only: no consumer is started, no lease claimed, no schedule replayed.
+
+The runtime itself can take and verify a backup, and can tell a maintainer the rollback command. It cannot roll back: releases are root-owned under `/var/lib/scotty`, outside every mount the container has.
 
 ## Local private setup
 

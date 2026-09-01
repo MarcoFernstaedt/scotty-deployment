@@ -1,0 +1,36 @@
+[Unit]
+Description=Scotty external container supervision
+Documentation=file:///srv/Scotty/operator
+After=docker.service scotty-credential-broker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/scotty-supervisor watch
+Restart=always
+RestartSec=10
+User=root
+Group=root
+
+# It talks to the Docker socket and its own state directory. It holds no
+# credential, reaches no provider, and never enters the container.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/scotty /srv/Scotty/data/scotty
+RuntimeDirectory=scotty-supervisor
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

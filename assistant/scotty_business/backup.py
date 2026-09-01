@@ -1,4 +1,4 @@
-"""Backing up the work, and rolling back to a release that was accepted.
+"""Backing up the work, and putting it back.
 
 What must survive a bad release is the work: workflows, personas, reminders,
 approvals, effect records, and the provenance behind every property card. What
@@ -8,18 +8,23 @@ would be a way to resurrect access someone had revoked.
 
 So the file list is an explicit allowlist, the secrets are named separately and
 excluded whatever the allowlist says, and every copied file is hash-bound in a
-manifest that a restore checks before it writes anything. Rollback is a plan,
-not an action: it names the last accepted release and the order to move in, and
-a person runs it.
+manifest that a restore checks before it writes anything, and the whole set is
+staged and validated before a single file is moved into place.
+
+Rollback is not here at all. Releases live on the host, root-owned and outside
+every mount this process can reach, and the host supervisor selects them. This
+module can say what an operator would run; it cannot see a release, and code
+that pretended to read one would only ever report that there were none.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,6 +43,7 @@ BACKUP_INCLUDES: tuple[str, ...] = (
     "approvals.db",
     "property-effects.db",
     "budgets.db",
+    "workflow-runs.db",
 )
 
 #: Never copied, whatever else changes. Named separately so that adding a file
@@ -146,6 +152,10 @@ def verify_backup(destination: Path) -> tuple[str, ...]:
 def restore_state(destination: Path, state_dir: Path) -> tuple[str, ...]:
     """Put the backed-up work back, after proving the backup is intact.
 
+    Every file is staged and checked first, and only then moved into place, so
+    a restore that fails halfway leaves the state directory as it was rather
+    than half of one backup and half of another.
+
     A restore writes files and does nothing else. It starts no consumer, claims
     no lease, and replays no schedule: bringing state back is not the same as
     bringing a second deployment to life.
@@ -154,89 +164,52 @@ def restore_state(destination: Path, state_dir: Path) -> tuple[str, ...]:
     mismatched = verify_backup(destination)
     if mismatched:
         raise BackupError("this backup does not match its manifest: " + ", ".join(mismatched))
-    restored: list[str] = []
     state_root = state_dir.resolve()
-    for entry in _entries(_manifest(destination)):
-        name = str(entry.get("name", ""))
-        if name not in BACKUP_INCLUDES or _is_secret(name):
-            raise BackupError(f"{name} is not something a restore may write")
-        target = (state_dir / name).resolve()
-        if target.parent != state_root:
-            # A manifest is data, not a path to trust.
-            raise BackupError("a restore may only write inside the state directory")
-        shutil.copy2(destination / "files" / name, target)
-        target.chmod(0o600)
-        restored.append(name)
-    return tuple(restored)
+    staging = state_dir / f".restore.{uuid.uuid4().hex}"
+    staged: list[tuple[Path, Path]] = []
+    try:
+        staging.mkdir(mode=0o700, parents=True)
+        for entry in _entries(_manifest(destination)):
+            name = str(entry.get("name", ""))
+            if name not in BACKUP_INCLUDES or _is_secret(name):
+                raise BackupError(f"{name} is not something a restore may write")
+            target = (state_dir / name).resolve()
+            if target.parent != state_root:
+                # A manifest is data, not a path to trust.
+                raise BackupError("a restore may only write inside the state directory")
+            source = destination / "files" / name
+            held = staging / name
+            shutil.copy2(source, held)
+            held.chmod(0o600)
+            if _digest(held) != entry.get("sha256"):
+                raise BackupError(f"{name} did not survive being staged")
+            staged.append((held, target))
+        for held, target in staged:
+            os.replace(held, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return tuple(target.name for _, target in staged)
 
 
-@dataclass(frozen=True, slots=True)
-class RollbackPlan:
-    """The release to go back to, and the order to do it in. Never executed."""
-
-    current: str
-    target: str = ""
-    image_digest: str = ""
-    reason: str = ""
-
-    @property
-    def available(self) -> bool:
-        return bool(self.target)
-
-    def steps(self) -> tuple[str, ...]:
-        """The exact order. The current container stops before another starts.
-
-        Two Discord consumers on one bot token is the failure this ordering
-        exists to prevent, so the stop is never optional and never last.
-        """
-
-        if not self.available:
-            return ()
-        return (
-            f"stop the running container for {self.current}",
-            "verify no container is consuming Discord",
-            f"start the accepted release {self.target} at {self.image_digest}",
-            "verify exactly one consumer, then confirm health",
-        )
-
-    def as_json(self) -> dict[str, object]:
-        return {
-            "current": self.current,
-            "target": self.target,
-            "image_digest": self.image_digest,
-            "available": self.available,
-            "reason": self.reason,
-            "steps": list(self.steps()),
-        }
+#: What an operator runs to roll back. Releases are root-owned and live outside
+#: every mount this process has, which is the point: a runtime that could select
+#: its own release could roll forward onto one nobody accepted.
+ROLLBACK_COMMAND = "sudo /usr/local/sbin/scotty-supervisor rollback"
 
 
-def rollback_plan(releases_dir: Path, *, current: str) -> RollbackPlan:
-    """Name the newest independently accepted release that is not the current one."""
+def rollback_guidance() -> dict[str, object]:
+    """The fixed management step for a rollback, which this process never runs."""
 
-    if not releases_dir.is_dir():
-        return RollbackPlan(current=current, reason="there is no release directory")
-    accepted: list[tuple[str, str]] = []
-    for entry in sorted(releases_dir.iterdir()):
-        if not entry.is_dir() or entry.name == current or entry.is_symlink():
-            continue
-        marker = entry / "release.json"
-        if not marker.is_file():
-            continue
-        try:
-            body = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(body, Mapping) or body.get("accepted") is not True:
-            # Rolling back to something nobody accepted is not a recovery.
-            continue
-        digest = body.get("image_digest")
-        if type(digest) is not str or not digest.startswith("sha256:"):
-            continue
-        accepted.append((entry.name, digest))
-    if not accepted:
-        return RollbackPlan(current=current, reason="there is no accepted release to roll back to")
-    name, digest = accepted[-1]
-    return RollbackPlan(current=current, target=name, image_digest=digest)
+    return {
+        "available": False,
+        "reason": "releases are held on the host and are not visible from the runtime",
+        "operator_command": ROLLBACK_COMMAND,
+        "steps": [
+            f"run {ROLLBACK_COMMAND} to see the accepted release it would return to",
+            f"run {ROLLBACK_COMMAND} --execute to carry it out",
+            "read the reported state: verified, failed, or unknown",
+        ],
+    }
 
 
 def restorable(destination: Path) -> Sequence[str]:
@@ -248,12 +221,12 @@ def restorable(destination: Path) -> Sequence[str]:
 __all__ = [
     "BACKUP_INCLUDES",
     "MANIFEST_VERSION",
+    "ROLLBACK_COMMAND",
     "SECRET_NAMES",
     "BackupError",
-    "RollbackPlan",
     "backup_state",
     "restorable",
     "restore_state",
-    "rollback_plan",
+    "rollback_guidance",
     "verify_backup",
 ]

@@ -270,14 +270,16 @@ class RuntimeWiringTests(unittest.TestCase):
                         },
                     )
 
-    def test_a_rollback_plan_is_returned_and_nothing_is_executed(self) -> None:
+    def test_a_rollback_hands_back_the_host_step_and_executes_nothing(self) -> None:
         with self.runtime() as runtime:
             plan = runtime.handle_read(
                 self.maintainer(runtime),
                 {"operation": "maintenance", "maintenance_action": "rollback_plan"},
             )
-            # There is no release directory in a test root, so it reports that
-            # rather than inventing a target.
+            # Releases are root-owned on the host, outside every mount this
+            # process has. Reporting "no accepted release" from in here would
+            # read as a fact about the deployment when it is only a fact about
+            # what a container can see, so it returns the operator's command.
             self.assertFalse(plan["available"])
-            self.assertTrue(plan["reason"])
-            self.assertEqual(plan["steps"], [])
+            self.assertIn("scotty-supervisor", str(plan["operator_command"]))
+            self.assertTrue(plan["steps"])

@@ -15,14 +15,15 @@ from pathlib import Path
 
 from assistant.scotty_business.backup import (
     BACKUP_INCLUDES,
+    ROLLBACK_COMMAND,
     SECRET_NAMES,
     BackupError,
-    RollbackPlan,
     backup_state,
     restore_state,
-    rollback_plan,
+    rollback_guidance,
     verify_backup,
 )
+from assistant.scotty_supervisor import state as host_state
 
 
 class StateFixture(unittest.TestCase):
@@ -129,50 +130,42 @@ class RestoreTests(StateFixture):
         self.assertFalse((state / "replay.marker").exists())
 
 
-class RollbackTests(StateFixture):
-    def plan(self, releases) -> RollbackPlan:
-        directory = tempfile.TemporaryDirectory(prefix="scotty-releases-")
-        self.addCleanup(directory.cleanup)
-        root = Path(directory.name)
-        for name, accepted, digest in releases:
-            release = root / name
-            release.mkdir()
-            (release / "release.json").write_text(
-                json.dumps({"accepted": accepted, "image_digest": digest}), encoding="utf-8"
-            )
-        return rollback_plan(root, current="r3")
+class RollbackTests(unittest.TestCase):
+    """Rollback is a host operation, and the runtime says so rather than guessing.
 
-    def test_the_target_is_the_last_independently_accepted_release(self) -> None:
-        plan = self.plan(
-            [
-                ("r1", True, "sha256:aaa"),
-                ("r2", True, "sha256:bbb"),
-                ("r3", False, "sha256:ccc"),
-            ]
-        )
-        self.assertEqual(plan.target, "r2")
-        self.assertEqual(plan.image_digest, "sha256:bbb")
-        self.assertTrue(plan.available)
+    Releases are root-owned under /var/lib/scotty, which is outside every mount
+    the container has. Code in here that walked a release directory would find
+    nothing and report "no accepted release" — which reads like a fact about
+    the deployment and is really a fact about what this process can see.
+    """
 
-    def test_an_unaccepted_release_is_never_a_rollback_target(self) -> None:
-        plan = self.plan([("r1", False, "sha256:aaa"), ("r3", False, "sha256:ccc")])
-        self.assertFalse(plan.available)
-        self.assertIn("no accepted release", plan.reason)
+    def test_the_guidance_names_the_host_command_and_never_claims_a_target(self) -> None:
+        guidance = rollback_guidance()
+        self.assertFalse(guidance["available"])
+        self.assertEqual(guidance["operator_command"], ROLLBACK_COMMAND)
+        self.assertIn("scotty-supervisor", ROLLBACK_COMMAND)
+        self.assertIn("not visible from the runtime", str(guidance["reason"]))
 
-    def test_the_plan_stops_the_current_container_before_starting_another(self) -> None:
-        plan = self.plan([("r2", True, "sha256:bbb"), ("r3", False, "sha256:ccc")])
-        steps = plan.steps()
-        self.assertTrue(steps[0].startswith("stop"))
-        self.assertTrue(any(step.startswith("start") for step in steps))
-        self.assertLess(
-            next(index for index, step in enumerate(steps) if step.startswith("stop")),
-            next(index for index, step in enumerate(steps) if step.startswith("start")),
-        )
+    def test_the_steps_are_the_command_an_operator_actually_has(self) -> None:
+        steps = [str(step) for step in guidance_steps()]
+        # Not prose about what someone might do: the exact command, including
+        # the flag that carries it out, and what its answer means.
+        self.assertTrue(any(ROLLBACK_COMMAND in step for step in steps))
+        self.assertTrue(any("--execute" in step for step in steps))
+        self.assertTrue(any("unknown" in step for step in steps))
 
-    def test_the_plan_is_a_proposal_and_executes_nothing(self) -> None:
-        plan = self.plan([("r2", True, "sha256:bbb"), ("r3", False, "sha256:ccc")])
-        self.assertFalse(hasattr(plan, "execute"))
-        self.assertFalse(hasattr(plan, "run"))
+    def test_nothing_here_reads_a_release_directory(self) -> None:
+        # No argument, so there is no path for a caller to point at and no way
+        # for this to report on a directory that happens to exist in a test root.
+        import inspect
+
+        self.assertEqual(list(inspect.signature(rollback_guidance).parameters), [])
+
+
+def guidance_steps() -> list[object]:
+    steps = rollback_guidance()["steps"]
+    assert isinstance(steps, list)
+    return steps
 
 
 class IncludeListTests(unittest.TestCase):
@@ -180,6 +173,19 @@ class IncludeListTests(unittest.TestCase):
         self.assertFalse(set(BACKUP_INCLUDES) & set(SECRET_NAMES))
         for name in SECRET_NAMES:
             self.assertNotIn(name, BACKUP_INCLUDES)
+
+    def test_the_runtime_and_the_host_supervisor_back_up_the_same_files(self) -> None:
+        # Two copies of this list is two chances to drift, and the drift only
+        # shows up as a file that quietly stopped being backed up. The host
+        # supervisor takes the backups; the runtime describes them.
+        self.assertEqual(BACKUP_INCLUDES, host_state.BACKUP_INCLUDES)
+        self.assertEqual(SECRET_NAMES, host_state.SECRET_NAMES)
+
+    def test_both_sides_agree_on_what_counts_as_a_secret(self) -> None:
+        from assistant.scotty_business.backup import _is_secret
+
+        for name in (*SECRET_NAMES, *BACKUP_INCLUDES, "google-oauth.mikey.json", "session.db"):
+            self.assertEqual(_is_secret(name), host_state._is_secret(name), name)
 
 
 if __name__ == "__main__":

@@ -801,9 +801,11 @@ class PackagedArtefactTests(unittest.TestCase):
         self.assertIn("readonly BROKER_DIR=/usr/local/lib/scotty/scotty_broker", installer)
         self.assertIn('sys.path.insert(0, "/usr/local/lib/scotty")', executable)
         self.assertNotIn("/srv/Scotty/data", executable)
-        self.assertIn(
-            "the broker must never sit inside the container-writable data mount", installer
-        )
+        # The installer proves this for every privileged package it lays down,
+        # so the guarantee cannot be true of the broker and quietly untrue of
+        # the host supervisor sitting beside it.
+        self.assertIn("for privileged in scotty_broker scotty_supervisor; do", installer)
+        self.assertIn("must never sit inside the container-writable data mount", installer)
 
     def test_the_runtime_directory_survives_a_broker_restart(self) -> None:
         """Removing /run/scotty would pin the container's mount to a dead inode."""
@@ -817,7 +819,7 @@ class PackagedArtefactTests(unittest.TestCase):
         self.assertIn("install_broker_file", installer)
         self.assertIn("-o root -g root -m 0644", installer)
         self.assertNotIn('install_broker_file "$broker_file" "${PROFILES_DIR}', installer)
-        self.assertIn("a client profile must never carry the broker", installer)
+        self.assertIn("a client profile must never carry ${privileged}", installer)
 
     def test_the_unit_keeps_the_broker_bounded(self) -> None:
         unit = Path("broker/scotty-credential-broker.service").read_text(encoding="utf-8")

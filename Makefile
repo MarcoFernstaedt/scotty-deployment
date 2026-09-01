@@ -1,17 +1,17 @@
 .PHONY: format-check lint shellcheck typecheck test acceptance package smoke oauth-probe scan checksums verify
 
 format-check:
-	uvx ruff@0.12.9 format --check assistant tests tools setup-scotty scotty-credential-broker
+	uvx ruff@0.12.9 format --check assistant tests tools setup-scotty scotty-credential-broker scotty-supervisor
 
 lint:
-	uvx ruff@0.12.9 check assistant tests tools setup-scotty scotty-credential-broker
+	uvx ruff@0.12.9 check assistant tests tools setup-scotty scotty-credential-broker scotty-supervisor
 	$(MAKE) shellcheck
 
 shellcheck:
 	shellcheck -x install.sh scotty-start firewall/scotty-egress-guard tests/*.sh
 
 typecheck:
-	uvx mypy@1.17.1 assistant/scotty_business assistant/scotty_guard assistant/scotty_broker tools
+	uvx mypy@1.17.1 assistant/scotty_business assistant/scotty_guard assistant/scotty_broker assistant/scotty_supervisor tools
 
 test:
 	./tests/test.sh

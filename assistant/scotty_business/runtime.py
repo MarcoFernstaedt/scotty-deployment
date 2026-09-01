@@ -29,7 +29,7 @@ from .adapters import (
 )
 from .adapters.discord_admin import DiscordAdminAdapter
 from .approvals import ApprovalStore, Proposal
-from .backup import backup_state, restorable, rollback_plan, verify_backup
+from .backup import backup_state, restorable, rollback_guidance, verify_backup
 from .brokered_transport import BrokeredTransport
 from .budgets import BudgetLedger, BudgetPolicy
 from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
@@ -757,8 +757,9 @@ class Runtime:
         """Backup, restore-preview, rollback-plan and health. Maintainer only.
 
         These reach the deployment's own state rather than any one user's work,
-        so they are not client operations. Rollback is planned here and run by a
-        person: nothing in this process stops or starts a container.
+        so they are not client operations. Rollback is not among them: releases
+        are root-owned on the host and the host supervisor selects them, so what
+        comes back from here is the operator's command, never an executed one.
         """
 
         if principal.role is not Role.MAINTAINER:
@@ -801,9 +802,10 @@ class Runtime:
                 "would_restore": list(restorable(destination)),
             }
         if action == "rollback_plan":
-            return rollback_plan(
-                Path("/srv/Scotty/releases"), current=_text(args, "release", optional=True) or ""
-            ).as_json()
+            # Releases are root-owned and outside every mount this process has,
+            # so this hands back the operator step rather than reading a
+            # directory it cannot see and reporting an empty one as the truth.
+            return rollback_guidance()
         if action == "provider_watch":
             return self.watch_providers()
         if action == "supervision":
