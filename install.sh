@@ -40,6 +40,8 @@ readonly BROKER_DIR=/usr/local/lib/scotty/scotty_broker
 readonly -a BROKER_FILES=(
   "__init__.py"
   "broker.py"
+  "executor.py"
+  "operations.py"
 )
 readonly CONTAINER=scotty
 readonly NETWORK=scotty-egress
@@ -78,6 +80,7 @@ readonly -a PLUGIN_FILES=(
   "plugin.yaml"
   "approvals.py"
   "backup.py"
+  "brokered_transport.py"
   "budgets.py"
   "calculations.py"
   "config.py"

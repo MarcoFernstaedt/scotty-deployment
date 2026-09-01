@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import synthetic
 
 from assistant.scotty_business.guidance import NOT_CONNECTED, PROVIDERS
 from assistant.scotty_business.policy import Principal, Role
 from assistant.scotty_business.runtime import ProviderNotConnected, Runtime
+from assistant.scotty_business.setup import CONTAINER_ENVIRONMENT_NAMES
 
 _ALL_SECRETS = {
     "DISCORD_BOT_TOKEN": "synthetic-discord",
@@ -35,6 +38,62 @@ _ALL_SECRETS = {
 }
 
 
+class _BrokerHarness:
+    """A real broker on a real socket, holding what the test says is connected.
+
+    Connectivity is no longer an environment variable: the runtime asks the
+    broker whether a credential is held. So the harness runs one, with the
+    credentials the caller named committed to it, and the runtime talks to it
+    over a genuine socket.
+    """
+
+    def __init__(self, home: Path, secrets: Mapping[str, str]) -> None:
+        from assistant.scotty_broker.broker import Broker, CredentialStore
+        from assistant.scotty_broker.executor import Executor
+        from assistant.scotty_business.setup import SetupError, broker_commitments
+
+        self.socket_path = home / "credential-broker.sock"
+        store = CredentialStore(home / "broker-credentials.json")
+        for name, value in secrets.items():
+            if name in CONTAINER_ENVIRONMENT_NAMES:
+                continue
+            try:
+                commitment = broker_commitments(
+                    SimpleNamespace(secrets={name: value})  # type: ignore[arg-type]
+                )[name]
+            except SetupError:  # noqa: S112 - a name with no address is simply not held
+                continue
+            store.put(
+                commitment.provider,
+                commitment.credential_class,
+                commitment.material,
+                commitment.actor,
+            )
+        self._broker = Broker(store, runtime_uid=os.getuid(), executor=Executor(store))
+        self._server: object | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        from assistant.scotty_broker.broker import bind_socket, serve_forever
+
+        self._server = bind_socket(self.socket_path, group=os.getgid())
+        self._thread = threading.Thread(
+            target=serve_forever,
+            args=(self._broker, self._server),
+            kwargs={"should_stop": self._stop.is_set},
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(3.0)
+        if self._server is not None:
+            self._server.close()  # type: ignore[attr-defined]
+
+
 @contextmanager
 def runtime(private: dict[str, object] | None = None, **secrets: str) -> Iterator[Runtime]:
     private = private or {}
@@ -45,13 +104,20 @@ def runtime(private: dict[str, object] | None = None, **secrets: str) -> Iterato
             json.dumps(synthetic.private_mapping(**private)), encoding="utf-8"
         )
         saved = {name: os.environ.get(name) for name in _ALL_SECRETS}
+        broker = _BrokerHarness(home, secrets)
         try:
             for name in _ALL_SECRETS:
                 os.environ.pop(name, None)
             for name, value in secrets.items():
-                os.environ[name] = value
-            yield Runtime(home)
+                # Only what the pinned runtime itself consumes still travels in
+                # the environment. Every provider credential goes to the broker,
+                # which is where the runtime will look for it.
+                if name in CONTAINER_ENVIRONMENT_NAMES:
+                    os.environ[name] = value
+            broker.start()
+            yield Runtime(home, broker_socket=broker.socket_path)
         finally:
+            broker.stop()
             for name, value in saved.items():
                 if value is None:
                     os.environ.pop(name, None)

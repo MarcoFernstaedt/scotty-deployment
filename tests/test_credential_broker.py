@@ -670,6 +670,17 @@ class RuntimeBrokerStatusTests(unittest.TestCase):
             self.assertNotIn(SECRET, json.dumps(reply))
 
 
+def _installed_broker_files() -> tuple[str, ...]:
+    """The broker package's file list, taken from install.sh's own array."""
+
+    source = Path("install.sh").read_text(encoding="utf-8")
+    block = source.split("readonly -a BROKER_FILES=(", 1)[1].split(")", 1)[0]
+    names = tuple(line.strip().strip('"') for line in block.splitlines() if line.strip())
+    if not names:  # pragma: no cover - the installer always declares them
+        raise AssertionError("the installer declares no broker files")
+    return names
+
+
 def _unprivileged_uid() -> int | None:
     """A real non-root account this process may become, or None."""
 
@@ -737,7 +748,9 @@ class PackagedArtefactTests(unittest.TestCase):
             root = Path(directory)
             staged = root / "plugins" / "scotty_broker"
             staged.mkdir(parents=True)
-            for name in ("__init__.py", "broker.py"):
+            # Stage exactly what the installer stages, read from the installer
+            # itself, so the package and this test cannot drift apart.
+            for name in _installed_broker_files():
                 (staged / name).write_bytes(Path("assistant/scotty_broker", name).read_bytes())
             socket_path = root / "broker.sock"
             store_path = root / "credentials.json"

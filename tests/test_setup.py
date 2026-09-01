@@ -18,6 +18,7 @@ from assistant.scotty_business.routing import MAINTAINER_PROFILE, SERVED_PROFILE
 from assistant.scotty_business.setup import (
     CODEX_AUTH_COMMAND,
     CODEX_PROVIDER,
+    CONTAINER_ENVIRONMENT_NAMES,
     SetupError,
     SetupInputs,
     channel_plans,
@@ -304,7 +305,16 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn("browser", rendered)
         self.assertNotIn("model-secret", rendered)
 
-    def test_private_state_is_atomic_owner_only_and_secrets_stay_in_env(self) -> None:
+    def test_private_state_is_atomic_owner_only_and_holds_no_provider_secret(self) -> None:
+        """The data tree is mounted into the container, so it holds no credential.
+
+        This used to assert the opposite — that the GoHighLevel token was
+        written to `.env` — which is the unsafe design being corrected. That
+        file is inside a read-write bind mount owned by the account the runtime
+        runs as, so a mode of 0600 separates it from nobody: every profile in
+        that container reads as that same user. Only what the pinned runtime
+        consumes itself stays there now.
+        """
         with tempfile.TemporaryDirectory(prefix="scotty-setup-test-") as directory:
             root = Path(directory)
             stage_client_plugins(root)
@@ -321,11 +331,37 @@ class SetupTests(unittest.TestCase):
                 ["discord", "trello", "ghl", "rentcast", "google_workspace"],
             )
             self.assertNotIn("secret", private_path.read_text(encoding="utf-8"))
-            self.assertIn(
-                "SCOTTY_GHL_PRIVATE_TOKEN=ghl-secret", env_path.read_text(encoding="utf-8")
-            )
+            environment = env_path.read_text(encoding="utf-8")
+            # The provider credential is not there, under any name.
+            self.assertNotIn("SCOTTY_GHL_PRIVATE_TOKEN", environment)
+            self.assertNotIn("ghl-secret", environment)
             self.assertNotIn("ghl-secret", config_path.read_text(encoding="utf-8"))
+            self.assertNotIn("ghl-secret", private_path.read_text(encoding="utf-8"))
+            # What the pinned runtime consumes itself is still delivered.
+            self.assertIn("DISCORD_BOT_TOKEN=", environment)
             self.assertEqual(list(root.rglob("*.tmp")), [])
+
+    def test_nothing_under_the_container_mount_carries_a_provider_credential(self) -> None:
+        """Sweep everything setup writes, not just the file we expect to fail."""
+
+        with tempfile.TemporaryDirectory(prefix="scotty-setup-test-") as directory:
+            root = Path(directory)
+            stage_client_plugins(root)
+            sample = self.sample()
+            write_private_state(sample, root, owner_uid=os.getuid(), owner_gid=os.getgid())
+            withheld = {
+                value
+                for name, value in sample.secrets.items()
+                if name not in CONTAINER_ENVIRONMENT_NAMES
+            }
+            self.assertTrue(withheld)
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                body = path.read_text(encoding="utf-8", errors="ignore")
+                for value in withheld:
+                    with self.subTest(path=path.name, value=value[:8]):
+                        self.assertNotIn(value, body)
 
     def test_symlinked_private_target_is_rejected_without_following(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-setup-test-") as directory:

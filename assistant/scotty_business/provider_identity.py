@@ -15,14 +15,19 @@ carries the authenticated actor so every effect stays attributable.
 
 from __future__ import annotations
 
-import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from .config import GoogleWorkspaceScope, RuntimeConfig
 from .policy import Principal, Role
 from .routing import CLIENT_PROFILES
+
+
+class CredentialHolder(Protocol):
+    """Whatever can answer whether a credential is held. Never what it is."""
+
+    def status(self, provider: str, credential_class: str, actor: str = ...) -> bool: ...
 
 
 class ProviderIdentityError(RuntimeError):
@@ -67,14 +72,13 @@ _IDENTITY_ARGUMENTS = frozenset(
 
 _MAX_OVERRIDE_DEPTH = 12
 
-#: The credential each provider needs. An unsuffixed variable is the shared
-#: business identity; a suffixed one belongs to exactly one actor.
-_TRELLO_KEY = "SCOTTY_TRELLO_API_KEY"
-_TRELLO_TOKEN = "SCOTTY_TRELLO_TOKEN"  # noqa: S105 - env var name, not a secret
-_GHL_TOKEN = "SCOTTY_GHL_PRIVATE_TOKEN"  # noqa: S105 - env var name, not a secret
-_RENTCAST_KEY = "SCOTTY_RENTCAST_API_KEY"
-
-_SAFE_SUFFIX = re.compile(r"[A-Z0-9_]{1,32}")
+#: The credential that decides whether a provider is reachable at all, asked of
+#: the broker by (provider, class, actor). The values live only in the broker.
+_PROVIDER_CREDENTIALS: tuple[tuple[str, str], ...] = (
+    ("trello", "api_key"),
+    ("ghl", "private_token"),
+    ("rentcast", "api_key"),
+)
 
 
 def reject_identity_override(args: object, depth: int = 0) -> None:
@@ -100,13 +104,6 @@ def reject_identity_override(args: object, depth: int = 0) -> None:
             reject_identity_override(item, depth + 1)
 
 
-def _suffix(role: Role) -> str:
-    suffix = role.value.upper()
-    if not _SAFE_SUFFIX.fullmatch(suffix):  # pragma: no cover - roles are fixed slugs
-        raise ProviderIdentityError("role is not a usable credential suffix")
-    return suffix
-
-
 @dataclass(frozen=True, slots=True)
 class ProviderIdentity:
     """One actor's provider identity. Never rendered with its credentials."""
@@ -116,7 +113,10 @@ class ProviderIdentity:
     user_id: str
     google: GoogleWorkspaceScope | None
     google_token_name: str
-    _credentials: Mapping[str, tuple[str, bool]] = field(default_factory=dict, repr=False)
+    #: Which provider credentials the broker holds for this actor. Names and
+    #: whether they are this user's own or the shared business identity —
+    #: never the material, which this process has no way to obtain.
+    held: Mapping[str, bool] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return f"ProviderIdentity(role={self.role.value}, profile={self.profile})"
@@ -134,38 +134,6 @@ class ProviderIdentity:
 
         return self.google is not None
 
-    def credential(self, name: str) -> str | None:
-        entry = self._credentials.get(name)
-        return entry[0] if entry is not None else None
-
-    def is_shared(self, name: str) -> bool:
-        entry = self._credentials.get(name)
-        return bool(entry is not None and entry[1])
-
-    @property
-    def trello_token(self) -> str | None:
-        return self.credential(_TRELLO_TOKEN)
-
-    @property
-    def trello_key(self) -> str | None:
-        return self.credential(_TRELLO_KEY)
-
-    @property
-    def trello_shared(self) -> bool:
-        return self.is_shared(_TRELLO_TOKEN)
-
-    @property
-    def trello_connected(self) -> bool:
-        return bool(self.trello_key and self.trello_token)
-
-    @property
-    def ghl_token(self) -> str | None:
-        return self.credential(_GHL_TOKEN)
-
-    @property
-    def rentcast_key(self) -> str | None:
-        return self.credential(_RENTCAST_KEY)
-
     def attribution(self) -> dict[str, object]:
         """Who an effect is recorded against. Carries no credential."""
 
@@ -174,17 +142,18 @@ class ProviderIdentity:
             "profile": self.profile,
             "user_id": self.user_id,
             "google_account": self.google_account,
-            "shared_identities": sorted(
-                name for name, (_, shared) in self._credentials.items() if shared
-            ),
+            "shared_identities": sorted(name for name, own in self.held.items() if not own),
         }
 
 
 class ProviderIdentityResolver:
     """Map an authorized client principal to the identity it may act as."""
 
-    def __init__(self, config: RuntimeConfig):
+    def __init__(self, config: RuntimeConfig, broker: CredentialHolder | None = None):
         self.config = config
+        # Asks the broker what it holds. It cannot ask for the material, and
+        # there is no operation that would return it.
+        self.broker = broker
 
     def resolve(
         self, principal: Principal, *, environ: Mapping[str, str] | None = None
@@ -193,28 +162,34 @@ class ProviderIdentityResolver:
             # The maintainer route is served separately and never borrows a
             # client's provider identity.
             raise ProviderIdentityError("this route has no client provider identity")
-        environ = os.environ if environ is None else environ
-        suffix = _suffix(principal.role)
-        credentials: dict[str, tuple[str, bool]] = {}
-        for name in (_TRELLO_KEY, _TRELLO_TOKEN, _GHL_TOKEN, _RENTCAST_KEY):
-            own = environ.get(f"{name}_{suffix}")
-            if own:
-                credentials[name] = (own, False)
-                continue
-            # The unsuffixed variable is the deployment's one shared business
-            # identity, which the provider itself may require. Another actor's
-            # suffixed credential is never reachable from here at all.
-            shared = environ.get(name)
-            if shared:
-                credentials[name] = (shared, True)
+        del environ
         return ProviderIdentity(
             role=principal.role,
             profile=CLIENT_PROFILES[principal.role],
             user_id=principal.user_id,
             google=self.config.google_for(principal.role),
             google_token_name=f"google-oauth.{principal.role.value}.json",
-            _credentials=credentials,
+            held=dict(self.held(principal)),
         )
+
+    def held(self, principal: Principal) -> dict[str, bool]:
+        """Which providers the broker holds a credential for, and whose it is.
+
+        True means this actor's own; False means the shared business identity.
+        A provider that is absent from the mapping is one this actor cannot
+        reach at all. The material itself is never returned here or anywhere
+        else in this process — it does not leave the broker.
+        """
+
+        if self.broker is None:
+            return {}
+        held: dict[str, bool] = {}
+        for provider, credential_class in _PROVIDER_CREDENTIALS:
+            if self.broker.status(provider, credential_class, principal.role.value):
+                held[provider] = True
+            elif self.broker.status(provider, credential_class, "shared"):
+                held[provider] = False
+        return held
 
 
 __all__ = [

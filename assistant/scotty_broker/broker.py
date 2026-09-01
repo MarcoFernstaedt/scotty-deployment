@@ -54,8 +54,13 @@ CREDENTIAL_CLASSES: Mapping[str, frozenset[str]] = {
 }
 
 #: Operations, and the smallest uid set each one needs.
+#:
+#: `execute` is the runtime's way to reach a provider: it names one of the
+#: declared provider operations and its arguments, and the broker makes the
+#: call with a credential the runtime never sees. It returns what the provider
+#: said, bounded — never the credential that was used.
 ROOT_OPERATIONS = frozenset({"open", "validate", "commit", "revoke"})
-RUNTIME_OPERATIONS = frozenset({"status"})
+RUNTIME_OPERATIONS = frozenset({"status", "execute"})
 OPERATIONS = ROOT_OPERATIONS | RUNTIME_OPERATIONS
 
 #: Bounds. A frame past these is refused rather than parsed.
@@ -66,6 +71,9 @@ WINDOW_SECONDS = 300
 
 _MATERIAL = re.compile(r"[A-Za-z0-9._:/+\-=]+")
 _WINDOW_ID = re.compile(r"[0-9a-f]{32}")
+
+
+from .executor import ExecutionError, Executor  # noqa: E402
 
 
 class BrokerError(Exception):
@@ -109,12 +117,22 @@ def peer_of(connection: socket.socket) -> Peer:
     return Peer(pid, uid, gid)
 
 
-def _known(provider: object, credential_class: object) -> tuple[str, str]:
+#: Whose credential this is. One shared business identity, or exactly one
+#: client user. The actor is part of the address, so one user's token is stored
+#: and read separately from the other's and no request can reach across.
+ACTORS = frozenset({"shared", "main_operator", "employee"})
+
+
+def _known(
+    provider: object, credential_class: object, actor: object = "shared"
+) -> tuple[str, str, str]:
     if type(provider) is not str or provider not in CREDENTIAL_CLASSES:
         raise BrokerError("unknown provider")
     if type(credential_class) is not str or credential_class not in CREDENTIAL_CLASSES[provider]:
         raise BrokerError("unknown credential class")
-    return provider, credential_class
+    if type(actor) is not str or actor not in ACTORS:
+        raise BrokerError("unknown actor")
+    return provider, credential_class, actor
 
 
 def _material(value: object) -> str:
@@ -173,26 +191,54 @@ class CredentialStore:
             temporary.unlink(missing_ok=True)
             raise BrokerError("credential store could not be written") from exc
 
-    def put(self, provider: str, credential_class: str, material: str) -> None:
+    @staticmethod
+    def _slot(credential_class: str, actor: str) -> str:
+        """One credential's address inside a provider. The actor is part of it.
+
+        Storing the shared business identity and each user's own credential in
+        separate slots is what makes a per-user token per-user: there is no key
+        under which one actor's request can find another's material.
+        """
+
+        return credential_class if actor == "shared" else f"{credential_class}@{actor}"
+
+    def put(
+        self, provider: str, credential_class: str, material: str, actor: str = "shared"
+    ) -> None:
         data = self._load()
-        data.setdefault(provider, {})[credential_class] = material
+        data.setdefault(provider, {})[self._slot(credential_class, actor)] = material
         self._save(data)
 
-    def drop(self, provider: str, credential_class: str) -> bool:
+    def drop(self, provider: str, credential_class: str, actor: str = "shared") -> bool:
         data = self._load()
         entries = data.get(provider)
-        if not entries or credential_class not in entries:
+        slot = self._slot(credential_class, actor)
+        if not entries or slot not in entries:
             return False
-        del entries[credential_class]
+        del entries[slot]
         if not entries:
             del data[provider]
         self._save(data)
         return True
 
-    def present(self, provider: str, credential_class: str) -> bool:
+    def present(self, provider: str, credential_class: str, actor: str = "shared") -> bool:
         """Whether a credential is held. Never returns the value itself."""
 
-        return bool(self._load().get(provider, {}).get(credential_class))
+        return bool(self._load().get(provider, {}).get(self._slot(credential_class, actor)))
+
+    def read(self, provider: str, credential_class: str, actor: str = "shared") -> str | None:
+        """The material itself, for the executor running inside this process.
+
+        This exists so the privileged side can put a credential onto a request
+        it builds. It is deliberately not reachable over the socket: no wire
+        operation calls it, and the operation table has no entry that returns
+        material. If that ever changes, the boundary is gone — so the tests
+        assert both the absence of such an operation and the absence of
+        material from every reply.
+        """
+
+        held = self._load().get(provider, {}).get(self._slot(credential_class, actor))
+        return held if isinstance(held, str) and held else None
 
 
 #: A validator answers "would the provider accept this?" without keeping it.
@@ -217,8 +263,12 @@ class Broker:
         clock: Callable[[], float] = time.monotonic,
         window_seconds: float = WINDOW_SECONDS,
         runtime_uid: int = RUNTIME_UID,
+        executor: Executor | None = None,
     ) -> None:
         self.store = store
+        # Present in the service, absent in the pure-policy tests. When absent,
+        # provider execution is refused rather than silently unavailable.
+        self.executor = executor
         self.validator = validator
         self.clock = clock
         self.window_seconds = window_seconds
@@ -244,29 +294,34 @@ class Broker:
             "commit": self._commit,
             "revoke": self._revoke,
             "status": self._status,
+            "execute": self._execute,
         }
         return handler[operation](request)
 
     def _open(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class = _known(
-            request.get("provider"), request.get("credential_class")
+        provider, credential_class, actor = _known(
+            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
         )
         self._expire()
         window = secrets.token_hex(16)
-        self._windows[window] = (provider, credential_class, self.clock() + self.window_seconds)
+        self._windows[window] = (
+            f"{provider}/{credential_class}/{actor}",
+            "",
+            self.clock() + self.window_seconds,
+        )
         return {"ok": True, "state": "window open", "window": window}
 
     def _validate(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class = _known(
-            request.get("provider"), request.get("credential_class")
+        provider, credential_class, _ = _known(
+            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
         )
         material = _material(request.get("material"))
         accepted = bool(self.validator(provider, credential_class, material))
         return {"ok": accepted, "state": "validation passed" if accepted else "validation failed"}
 
     def _commit(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class = _known(
-            request.get("provider"), request.get("credential_class")
+        provider, credential_class, actor = _known(
+            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
         )
         window = request.get("window")
         if type(window) is not str or not _WINDOW_ID.fullmatch(window):
@@ -277,30 +332,55 @@ class Broker:
         held = self._windows.pop(window, None)
         if held is None:
             raise BrokerError("no open window")
-        if (held[0], held[1]) != (provider, credential_class):
+        if held[0] != f"{provider}/{credential_class}/{actor}":
+            # A window opened for one address can never commit into another,
+            # so a window is not a way to write into someone else's slot.
             raise BrokerError("window does not match this credential")
         material = _material(request.get("material"))
         if not self.validator(provider, credential_class, material):
             return {"ok": False, "state": "validation failed"}
-        self.store.put(provider, credential_class, material)
+        self.store.put(provider, credential_class, material, actor)
         return {"ok": True, "state": "credential present"}
 
     def _revoke(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class = _known(
-            request.get("provider"), request.get("credential_class")
+        provider, credential_class, actor = _known(
+            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
         )
-        removed = self.store.drop(provider, credential_class)
+        removed = self.store.drop(provider, credential_class, actor)
         return {"ok": removed, "state": "credential removed" if removed else "no credential"}
 
     def _status(self, request: Mapping[str, Any]) -> dict[str, object]:
-        provider, credential_class = _known(
-            request.get("provider"), request.get("credential_class")
+        provider, credential_class, actor = _known(
+            request.get("provider"), request.get("credential_class"), request.get("actor", "shared")
         )
-        present = self.store.present(provider, credential_class)
+        present = self.store.present(provider, credential_class, actor)
         return {
             "ok": present,
             "state": "credential present" if present else "credential absent",
         }
+
+    def _execute(self, request: Mapping[str, Any]) -> dict[str, object]:
+        """Run one declared provider operation on the caller's behalf.
+
+        The caller names an operation and its arguments. It does not name a
+        host, a path, a method, a header, or a credential — those come from the
+        operation table and the store, on this side of the socket.
+        """
+
+        if self.executor is None:
+            raise BrokerError("provider execution is not configured")
+        actor = request.get("actor", "shared")
+        if type(actor) is not str or actor not in ACTORS:
+            raise BrokerError("unknown actor")
+        arguments = request.get("arguments", {})
+        if not isinstance(arguments, Mapping):
+            raise BrokerError("malformed arguments")
+        try:
+            outcome = self.executor.run(request.get("operation"), arguments, actor=actor)
+        except ExecutionError as exc:
+            # The message is written by our own code and names no credential.
+            raise BrokerError(str(exc)) from None
+        return outcome.as_reply()
 
     def _expire(self) -> None:
         now = self.clock()

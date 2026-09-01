@@ -804,10 +804,90 @@ def discord_allowed_users(inputs: SetupInputs) -> tuple[str, ...]:
     return users
 
 
-def runtime_environment(inputs: SetupInputs) -> dict[str, str]:
-    """Every value written to the owner-only runtime environment file."""
+#: The only secrets that reach the container, and why each one has to.
+#:
+#: The data directory is bind-mounted read-write and owned by the account the
+#: runtime runs as, so anything written there is readable by every profile in
+#: that container — including the maintainer's broad one. A file mode does not
+#: separate two things running as the same user. So a credential lives there
+#: only when the pinned runtime itself consumes it and no boundary of ours can
+#: change that; everything else goes to the root-owned broker instead.
+CONTAINER_ENVIRONMENT_REASONS: Mapping[str, str] = {
+    "DISCORD_BOT_TOKEN": (
+        "the pinned runtime runs the Discord gateway in-process, so the gateway's "
+        "own token has to be in the container it runs in"
+    ),
+    "OPENROUTER_API_KEY": "the pinned runtime dispatches to the model itself",
+    "OPENAI_API_KEY": "the pinned runtime dispatches to the model itself",
+    "ANTHROPIC_API_KEY": "the pinned runtime dispatches to the model itself",
+}
 
-    environment = dict(inputs.secrets)
+CONTAINER_ENVIRONMENT_NAMES: tuple[str, ...] = tuple(CONTAINER_ENVIRONMENT_REASONS)
+
+#: How a collected secret is addressed in the broker's own store.
+_BROKER_ADDRESSES: Mapping[str, tuple[str, str]] = {
+    "SCOTTY_TRELLO_API_KEY": ("trello", "api_key"),
+    "SCOTTY_TRELLO_TOKEN": ("trello", "token"),
+    "SCOTTY_GHL_PRIVATE_TOKEN": ("ghl", "private_token"),
+    "SCOTTY_RENTCAST_API_KEY": ("rentcast", "api_key"),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class Commitment:
+    """One credential, and where the broker will hold it."""
+
+    provider: str
+    credential_class: str
+    actor: str
+    material: str
+
+    def __repr__(self) -> str:
+        return (
+            f"Commitment(provider={self.provider}, "
+            f"credential_class={self.credential_class}, actor={self.actor})"
+        )
+
+
+def broker_commitments(inputs: SetupInputs) -> dict[str, Commitment]:
+    """Every collected secret that belongs in the broker rather than the container.
+
+    Setup hands these to the root-owned broker and never writes them anywhere
+    the runtime can read. The actor is part of the address, so one user's token
+    is stored separately from the other's and from the shared business identity.
+    """
+
+    commitments: dict[str, Commitment] = {}
+    for name, value in inputs.secrets.items():
+        if name in CONTAINER_ENVIRONMENT_REASONS or not value:
+            continue
+        actor, base = "shared", name
+        for role in CLIENT_ROLES:
+            suffix = f"_{role.value.upper()}"
+            if name.endswith(suffix):
+                actor, base = role.value, name[: -len(suffix)]
+                break
+        address = _BROKER_ADDRESSES.get(base)
+        if address is None:
+            # An unrecognised secret is never silently written into the
+            # container; setup refuses rather than downgrading the boundary.
+            raise SetupError(f"{name} has no broker address and cannot be stored safely")
+        commitments[name] = Commitment(address[0], address[1], actor, value)
+    return commitments
+
+
+def runtime_environment(inputs: SetupInputs) -> dict[str, str]:
+    """Only what the pinned runtime itself needs, plus non-secret settings.
+
+    Every other collected credential is committed to the broker by `main` and
+    never written to the container's environment file.
+    """
+
+    environment = {
+        name: value
+        for name, value in inputs.secrets.items()
+        if name in CONTAINER_ENVIRONMENT_REASONS and value
+    }
     environment[DISCORD_ALLOWED_USERS_ENV] = ",".join(discord_allowed_users(inputs))
     environment["SCOTTY_PRIVATE_CONFIG"] = "/opt/data/scotty/private.json"
     return environment
@@ -1134,6 +1214,60 @@ def write_private_state(
     )
 
 
+def _broker_store(path: Path) -> Any:
+    """Open the broker's own store, from wherever the broker actually is.
+
+    This module is staged into the container, where the broker package is
+    deliberately absent, so the import happens here rather than at module scope:
+    importing setup inside the container must never require code that is not
+    supposed to be reachable from there. On the host, root's own installed tree
+    is preferred, and the checkout is the fallback the tests use.
+    """
+
+    import sys
+
+    for candidate in ("/usr/local/lib/scotty",):
+        if candidate not in sys.path and Path(candidate).is_dir():
+            sys.path.insert(0, candidate)
+    try:
+        from scotty_broker.broker import CredentialStore  # type: ignore[import-not-found]
+    except ImportError:
+        from assistant.scotty_broker.broker import CredentialStore
+    return CredentialStore(path)
+
+
+def commit_to_broker(
+    inputs: SetupInputs,
+    *,
+    store_path: Path = Path("/var/lib/scotty/credentials.json"),
+    owner_uid: int = 0,
+) -> tuple[str, ...]:
+    """Hand every withheld credential to the root-owned store.
+
+    Setup runs as root, which is the identity the broker's own store requires,
+    so it writes there directly rather than talking to itself over the socket.
+    The material never touches the container's environment file, so a tool
+    inside the container has nothing to read even as the account that owns the
+    data directory.
+    """
+
+    if os.geteuid() != owner_uid:
+        raise SetupError("only root may commit credentials to the broker store")
+    commitments = broker_commitments(inputs)
+    store = _broker_store(store_path)
+    stored: list[str] = []
+    for name, commitment in sorted(commitments.items()):
+        store.put(
+            commitment.provider,
+            commitment.credential_class,
+            commitment.material,
+            commitment.actor,
+        )
+        # The name is safe to report; the material is not, and is never logged.
+        stored.append(name)
+    return tuple(stored)
+
+
 def _require_stopped_container() -> None:
     docker = shutil.which("docker")
     if not docker:
@@ -1343,6 +1477,7 @@ def main() -> int:
     validate_discord_scope(inputs, reader)
     validate_maintainer_route(inputs, reader)
     write_private_state(inputs)
+    commit_to_broker(inputs)
     for role, email in (
         (Role.MAIN_OPERATOR, inputs.google_account_email),
         (Role.EMPLOYEE, inputs.employee_google_account_email),

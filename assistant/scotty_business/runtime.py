@@ -30,6 +30,7 @@ from .adapters import (
 from .adapters.discord_admin import DiscordAdminAdapter
 from .approvals import ApprovalStore, Proposal
 from .backup import backup_state, restorable, rollback_plan, verify_backup
+from .brokered_transport import BrokeredTransport
 from .budgets import BudgetLedger, BudgetPolicy
 from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
@@ -425,9 +426,19 @@ def _object(
 _BACKUP_NAME = re.compile(r"[0-9]{8}T[0-9]{6}")
 
 
+#: The adapters require a non-empty credential argument to construct. Nothing
+#: in this container has one, and nothing needs one: the broker replaces it
+#: with the material it holds. This placeholder is never sent anywhere — the
+#: brokered transport drops the credential query names before it forwards.
+_BROKERED = "brokered"
+
+
 class Runtime:
-    def __init__(self, home: Path):
+    def __init__(self, home: Path, *, broker_socket: Path | None = None):
         self.home = home
+        # The socket is fixed in the deployment; the parameter exists so a test
+        # can stand up a real broker of its own rather than mock the boundary.
+        self.broker_socket = broker_socket or Path(BROKER_SOCKET)
         self.config = _load_private_config(home)
         transport = HttpTransport()
         # Client-visible tools may only ever reach configured client destinations.
@@ -443,7 +454,10 @@ class Runtime:
         # Provider credentials are resolved per actor: a suffixed variable is
         # that user's own, the unsuffixed one is the deployment's single shared
         # business identity, and neither user can reach the other's.
-        self.identities = ProviderIdentityResolver(self.config)
+        # Provider calls leave through the broker, which holds the credential
+        # outside this container. Nothing here has one to give an adapter.
+        self.provider_broker = UnixSocketBroker(self.broker_socket)
+        self.identities = ProviderIdentityResolver(self.config, self.provider_broker)
         trello_scope = self.config.trello
         location_id = self.config.ghl_location_id
         endpoints = self.config.rentcast_endpoints
@@ -451,35 +465,50 @@ class Runtime:
         self.ghl_adapters: dict[Role, GHLReadPort] = {}
         self.rentcast_adapters: dict[Role, RentCastPort] = {}
         self.actor_connected: dict[Role, dict[str, bool]] = {}
+        broker_available = self.provider_broker.available()
         for role in CLIENT_ROLES:
-            identity = self.identities.resolve(self.config.principal_for(role))
-            # A provider is connected for this user only when their credential
-            # and the configured resource scope are both present.
-            trello_ready = bool(identity.trello_connected and trello_scope is not None)
-            ghl_ready = bool(identity.ghl_token and location_id is not None)
-            rentcast_ready = bool(identity.rentcast_key and endpoints)
+            # A provider is connected for this user when the broker holds a
+            # credential it can act with — their own or the shared business
+            # identity — and the configured resource scope is present. The
+            # runtime never learns which, and never sees either.
+            trello_held = broker_available and (
+                self.provider_broker.status("trello", "api_key", role.value)
+                or self.provider_broker.status("trello", "api_key", "shared")
+            )
+            ghl_held = broker_available and (
+                self.provider_broker.status("ghl", "private_token", role.value)
+                or self.provider_broker.status("ghl", "private_token", "shared")
+            )
+            rentcast_held = broker_available and (
+                self.provider_broker.status("rentcast", "api_key", role.value)
+                or self.provider_broker.status("rentcast", "api_key", "shared")
+            )
+            trello_ready = bool(trello_held and trello_scope is not None)
+            ghl_ready = bool(ghl_held and location_id is not None)
+            rentcast_ready = bool(rentcast_held and endpoints)
+            brokered = BrokeredTransport(self.provider_broker, actor=role.value)
             self.actor_connected[role] = {
                 "trello": trello_ready,
                 "ghl": ghl_ready,
                 "rentcast": rentcast_ready,
             }
+            # The adapters still build their own requests, but the transport
+            # under them cannot send one: it recognises the request as a
+            # declared operation and hands that to the broker. The credential
+            # arguments below are placeholders the broker discards and
+            # replaces with what it holds.
             self.trello_adapters[role] = (
-                TrelloAdapter(
-                    transport,
-                    identity.trello_key or "",
-                    identity.trello_token or "",
-                    trello_scope,
-                )
+                TrelloAdapter(brokered, _BROKERED, _BROKERED, trello_scope)
                 if trello_ready and trello_scope is not None
                 else UnconnectedProvider("Trello")
             )
             self.ghl_adapters[role] = (
-                GHLAdapter(transport, identity.ghl_token or "", location_id)
+                GHLAdapter(brokered, _BROKERED, location_id)
                 if ghl_ready and location_id is not None
                 else UnconnectedProvider("GoHighLevel")
             )
             self.rentcast_adapters[role] = (
-                RentCastAdapter(transport, identity.rentcast_key or "", endpoints)
+                RentCastAdapter(brokered, _BROKERED, endpoints)
                 if rentcast_ready and endpoints
                 else UnconnectedProvider("RentCast")
             )

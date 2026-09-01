@@ -100,56 +100,50 @@ class PerActorGoogleIdentityTests(unittest.TestCase):
 
 
 class CredentialSelectionTests(unittest.TestCase):
+    def holder(self, **held: bool):
+        """A stand-in for the broker: says what is held, never what it is."""
+
+        class Holder:
+            def status(self, provider: str, credential_class: str, actor: str = "shared") -> bool:
+                del credential_class
+                own = held.get(f"{provider}:{actor}")
+                return bool(own)
+
+        return Holder()
+
     def test_a_per_actor_credential_is_preferred_over_the_shared_one(self) -> None:
-        resolver = ProviderIdentityResolver(config())
-        environ = {
-            "SCOTTY_TRELLO_TOKEN": "shared-token",
-            "SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR": "operator-token",
-            "SCOTTY_TRELLO_API_KEY": "shared-key",
-        }
-        operator = resolver.resolve(principal(Role.MAIN_OPERATOR), environ=environ)
-        employee = resolver.resolve(principal(Role.EMPLOYEE), environ=environ)
-        self.assertEqual(operator.trello_token, "operator-token")
-        self.assertFalse(operator.trello_shared)
-        # The employee has no token of their own, so the shared identity is used
-        # and marked shared; the operator's personal token is never borrowed.
-        self.assertEqual(employee.trello_token, "shared-token")
-        self.assertTrue(employee.trello_shared)
+        resolver = ProviderIdentityResolver(
+            config(),
+            self.holder(**{"trello:main_operator": True, "trello:shared": True}),
+        )
+        operator = resolver.resolve(principal(Role.MAIN_OPERATOR))
+        employee = resolver.resolve(principal(Role.EMPLOYEE))
+        # True means this actor's own credential; False means the shared one.
+        self.assertIs(operator.held["trello"], True)
+        self.assertIs(employee.held["trello"], False)
 
     def test_one_actor_never_receives_another_actors_credential(self) -> None:
-        resolver = ProviderIdentityResolver(config())
-        environ = {
-            "SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR": "operator-token",
-            "SCOTTY_TRELLO_API_KEY": "shared-key",
-        }
-        employee = resolver.resolve(principal(Role.EMPLOYEE), environ=environ)
-        self.assertIsNone(employee.trello_token)
-        self.assertFalse(employee.trello_connected)
+        resolver = ProviderIdentityResolver(config(), self.holder(**{"trello:main_operator": True}))
+        employee = resolver.resolve(principal(Role.EMPLOYEE))
+        # No credential of their own and no shared one: not reachable at all.
+        self.assertNotIn("trello", employee.held)
 
-    def test_a_resolved_identity_never_renders_its_credentials(self) -> None:
-        resolver = ProviderIdentityResolver(config())
-        identity = resolver.resolve(
-            principal(Role.MAIN_OPERATOR),
-            environ={
-                "SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR": "operator-token",
-                "SCOTTY_TRELLO_API_KEY": "shared-key",
-                "SCOTTY_GHL_PRIVATE_TOKEN": "ghl-token",
-            },
-        )
-        rendered = f"{identity!r} {identity}"
-        for secret in ("operator-token", "shared-key", "ghl-token"):
-            self.assertNotIn(secret, rendered)
+    def test_a_resolved_identity_carries_no_material_at_all(self) -> None:
+        resolver = ProviderIdentityResolver(config(), self.holder(**{"trello:main_operator": True}))
+        identity = resolver.resolve(principal(Role.MAIN_OPERATOR))
+        rendered = f"{identity!r} {identity} {identity.attribution()} {identity.held}"
+        # There is nothing to leak: this process never receives the value.
+        self.assertNotIn("token", rendered.casefold().replace("google_token_name", ""))
 
     def test_every_operation_carries_the_authenticated_actor_for_attribution(self) -> None:
-        resolver = ProviderIdentityResolver(config())
-        identity = resolver.resolve(
-            principal(Role.EMPLOYEE), environ={"SCOTTY_TRELLO_API_KEY": "shared-key"}
-        )
+        resolver = ProviderIdentityResolver(config(), self.holder(**{"trello:shared": True}))
+        identity = resolver.resolve(principal(Role.EMPLOYEE))
         attribution = identity.attribution()
         self.assertEqual(attribution["role"], "employee")
         self.assertEqual(attribution["profile"], "scotty-employee")
         self.assertEqual(attribution["user_id"], synthetic.EMPLOYEE_USER)
-        self.assertNotIn("shared-key", str(attribution))
+        # The shared identity is named as shared, so effects stay attributable.
+        self.assertEqual(attribution["shared_identities"], ["trello"])
 
 
 class ModelOverrideTests(unittest.TestCase):
@@ -311,19 +305,24 @@ class RuntimeWiringTests(unittest.TestCase):
 
         return runtime(DISCORD_BOT_TOKEN="synthetic-discord", **environment)
 
-    def test_each_user_gets_an_adapter_built_from_their_own_credential(self) -> None:
+    def test_each_user_gets_an_adapter_bound_to_their_own_actor(self) -> None:
+        """The runtime holds no credential, so the binding is the actor itself."""
+
         with self.runtime(
             SCOTTY_TRELLO_API_KEY="shared-key",
             SCOTTY_TRELLO_TOKEN="shared-token",  # noqa: S106 - synthetic
+            SCOTTY_TRELLO_API_KEY_MAIN_OPERATOR="operator-key",
             SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
         ) as runtime:
             operator = runtime.config.principal_for(Role.MAIN_OPERATOR)
             employee = runtime.config.principal_for(Role.EMPLOYEE)
             self.assertIsNot(runtime._trello(operator), runtime._trello(employee))
-            self.assertEqual(runtime.identity_for(operator).trello_token, "operator-token")
-            self.assertEqual(runtime.identity_for(employee).trello_token, "shared-token")
-            self.assertTrue(runtime.identity_for(employee).trello_shared)
-            self.assertFalse(runtime.identity_for(operator).trello_shared)
+            # The broker holds the operator's own; the employee falls back to
+            # the shared business identity, and both are reported as such.
+            self.assertIs(runtime.identity_for(operator).held["trello"], True)
+            self.assertIs(runtime.identity_for(employee).held["trello"], False)
+            # Nothing in this process ever held either value.
+            self.assertFalse(hasattr(runtime.identity_for(operator), "trello_token"))
 
     def test_a_user_without_a_credential_is_not_connected_to_that_provider(self) -> None:
         from assistant.scotty_business.runtime import ProviderNotConnected

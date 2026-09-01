@@ -251,10 +251,38 @@ class UnixSocketBroker:
         )
         return reply is not None and reply.get("ok") is True
 
-    def status(self, provider: str, credential_class: str) -> bool:
+    def status(self, provider: str, credential_class: str, actor: str = "shared") -> bool:
         """Whether the broker holds this credential. Never returns the value."""
 
-        return self._call("status", provider, credential_class, None)
+        reply = self._request(
+            {
+                "op": "status",
+                "provider": provider,
+                "credential_class": credential_class,
+                "actor": actor,
+            }
+        )
+        return bool(reply and reply.get("ok") is True)
+
+    def execute(
+        self, operation: str, arguments: Mapping[str, object], *, actor: str = "shared"
+    ) -> Mapping[str, object] | None:
+        """Ask the broker to run one declared provider operation.
+
+        The reply carries what the provider said, bounded. It never carries the
+        credential the broker used, and this side never had one to begin with.
+        None means the broker did not answer, which is not the same as a
+        refusal: the provider may or may not have acted.
+        """
+
+        return self._request(
+            {
+                "op": "execute",
+                "operation": operation,
+                "actor": actor,
+                "arguments": dict(arguments),
+            }
+        )
 
 
 class SourceMessageDeleter(Protocol):
