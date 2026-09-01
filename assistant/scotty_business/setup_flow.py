@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .config import RuntimeConfig
 from .guidance import CONNECTED, NOT_CONNECTED, PROVIDERS, provider_guidance
+from .policy import Role
 
 LOCAL_SETUP_COMMAND = "sudo /usr/local/sbin/scotty-start"
 
@@ -238,8 +239,12 @@ class ProviderProgress:
         return self.status == CONNECTED and not self.missing
 
 
-def _configured_identifiers(config: RuntimeConfig) -> dict[str, tuple[str, ...]]:
-    """Which identifier fields the private configuration already carries."""
+def _configured_identifiers(config: RuntimeConfig, role: Role) -> dict[str, tuple[str, ...]]:
+    """Which identifier fields this exact user's configuration already carries.
+
+    Google consent is personal, so one user's connected account never counts as
+    setup progress for the other.
+    """
 
     present: dict[str, tuple[str, ...]] = {"discord": ("guild_id",)}
     channels = tuple(
@@ -254,7 +259,7 @@ def _configured_identifiers(config: RuntimeConfig) -> dict[str, tuple[str, ...]]
     present["trello"] = ("board_id", "list_id") if config.trello is not None else ()
     present["ghl"] = ("location_id",) if config.ghl_location_id else ()
     present["rentcast"] = ("endpoint",) if config.rentcast_endpoints else ()
-    present["google_workspace"] = ("account_email",) if config.google_workspace is not None else ()
+    present["google_workspace"] = ("account_email",) if config.google_for(role) is not None else ()
     return present
 
 
@@ -262,10 +267,12 @@ def setup_progress(
     config: RuntimeConfig,
     connected: Mapping[str, bool],
     staged: Mapping[str, Mapping[str, str]] | None = None,
+    *,
+    role: Role = Role.MAIN_OPERATOR,
 ) -> tuple[ProviderProgress, ...]:
-    """Report every provider's setup state in one fixed order."""
+    """Report one user's setup state for every provider, in one fixed order."""
 
-    configured = _configured_identifiers(config)
+    configured = _configured_identifiers(config, role)
     staged = staged or {}
     result: list[ProviderProgress] = []
     for provider in PROVIDERS:

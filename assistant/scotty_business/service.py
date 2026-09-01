@@ -92,7 +92,9 @@ class ScottyService:
         ghl: GHLPort,
         rentcast: RentCastPort | None,
         discord: DiscordPort,
-        google_workspace: GoogleWorkspacePort | None = None,
+        google_workspace: GoogleWorkspacePort
+        | None
+        | Callable[[Role], GoogleWorkspacePort | None] = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
@@ -103,6 +105,18 @@ class ScottyService:
         self.discord = discord
         self.google_workspace = google_workspace
         self.clock = clock
+
+    def _workspace_for(self, actor: Principal) -> GoogleWorkspacePort | None:
+        """The Workspace this exact actor may act on, and no other.
+
+        Each client user connects their own account, so the adapter is chosen
+        by the authenticated actor rather than held once for the deployment.
+        """
+
+        workspace = self.google_workspace
+        if callable(workspace):
+            return workspace(actor.role)
+        return workspace
 
     def _now(self) -> datetime:
         now = self.clock()
@@ -328,8 +342,8 @@ class ScottyService:
         resource_id: str,
         payload: Mapping[str, object],
     ) -> Proposal:
-        scope = self.config.google_workspace
-        if scope is None or self.google_workspace is None:
+        scope = self.config.google_for(requester.role)
+        if scope is None or self._workspace_for(requester) is None:
             raise ProviderError("Google Workspace is not connected")
         if (
             not resource_id
@@ -374,8 +388,14 @@ class ScottyService:
     def _execute_google(
         self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
     ) -> Proposal:
-        if self.google_workspace is None:
+        # The approver authorizes the requester's action on the requester's own
+        # Workspace. Approving never moves an action onto the approver's account.
+        workspace = self._workspace_for(proposal.requester)
+        scope = self.config.google_for(proposal.requester.role)
+        if workspace is None or scope is None:
             raise ApprovalError("Google Workspace is no longer connected")
+        if scope.account_email not in proposal.target_ids:
+            raise ApprovalError("Google Workspace proposal is bound to another account")
         operation = _payload_text(proposal.payload, "operation")
         resource_id = _payload_text(proposal.payload, "resource_id")
         payload = proposal.payload.get("payload")
@@ -389,7 +409,7 @@ class ScottyService:
             "configured-google-resource-v1",
         )
         try:
-            result = self.google_workspace.mutate(operation, resource_id, payload)
+            result = workspace.mutate(operation, resource_id, payload)
         except AmbiguousEffectError:
             return self._unknown(
                 executing,

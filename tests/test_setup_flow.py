@@ -174,7 +174,7 @@ class ProgressAndResumeTests(unittest.TestCase):
         self.assertEqual(first_unfinished(setup_progress(config, partial)).provider, "ghl")
 
     def test_nothing_remains_once_every_provider_is_configured_and_connected(self) -> None:
-        config = synthetic.config(google_workspace=GOOGLE_SCOPE)
+        config = synthetic.config(google_workspace={"main_operator": GOOGLE_SCOPE})
         self.assertIsNone(first_unfinished(setup_progress(config, dict.fromkeys(PROVIDERS, True))))
 
     def test_a_staged_identifier_counts_as_collected_and_advances_the_resume_point(self) -> None:

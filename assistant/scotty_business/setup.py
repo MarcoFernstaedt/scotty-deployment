@@ -24,6 +24,12 @@ from .google_oauth import (
     import_client,
     publish_consent_prompt,
 )
+from .google_oauth import (
+    google_prompt_path as _google_prompt_path,
+)
+from .google_oauth import (
+    google_token_path as _google_token_path,
+)
 from .policy import Role
 from .provisioning import (
     BOT_ALLOW,
@@ -208,13 +214,18 @@ def apply_prefill(inputs: SetupInputs, prefill: Mapping[str, object]) -> SetupIn
     google = prefill.get("google_workspace")
     if google is not None:
         raw = _prefill_mapping(google, "prefill.google_workspace")
-        if set(raw) != {"account_email"}:
+        if not set(raw) or set(raw) - {"account_email", "employee_account_email"}:
             raise SetupError("setup prefill Google Workspace account is malformed")
-        changes.update(
-            google_account_email=_google_account_email(
+        if "account_email" in raw:
+            changes["google_account_email"] = _google_account_email(
                 _prefill_text(raw["account_email"], "prefill.google.account_email")
-            ),
-        )
+            )
+        if "employee_account_email" in raw:
+            changes["employee_google_account_email"] = _google_account_email(
+                _prefill_text(
+                    raw["employee_account_email"], "prefill.google.employee_account_email"
+                )
+            )
     return replace(inputs, **cast(Any, changes))
 
 
@@ -237,7 +248,9 @@ class SetupInputs:
     trello_label_ids: tuple[str, ...] = ()
     trello_custom_field_ids: tuple[str, ...] = ()
     ghl_location_id: str = ""
+    #: Consent is personal, so each client user connects their own account.
     google_account_email: str = ""
+    employee_google_account_email: str = ""
     provision_channel_names: Mapping[str, str] | None = None
 
     @property
@@ -328,6 +341,9 @@ def apply_staged_identifiers(
     google = staged.get("google_workspace", {}).get("account_email")
     if google and not inputs.google_account_email:
         changes["google_account_email"] = _google_account_email(google)
+    employee_google = staged.get("google_workspace", {}).get("employee_account_email")
+    if employee_google and not inputs.employee_google_account_email:
+        changes["employee_google_account_email"] = _google_account_email(employee_google)
     location = staged.get("ghl", {}).get("location_id")
     if location and not inputs.ghl_location_id:
         changes["ghl_location_id"] = location
@@ -400,7 +416,16 @@ def collect_inputs(
     )
     location_id = _optional(input_fn, "GoHighLevel location ID (blank to connect later): ")
     google_account = _google_account_email(
-        _optional(input_fn, "Google Workspace account email (blank to connect later): ")
+        _optional(
+            input_fn,
+            "Main operator's Google Workspace account email (blank to connect later): ",
+        )
+    )
+    employee_google_account = _google_account_email(
+        _optional(
+            input_fn,
+            "Employee's Google Workspace account email (blank to connect later): ",
+        )
     )
 
     secrets: dict[str, str] = {}
@@ -452,6 +477,7 @@ def collect_inputs(
         trello_custom_field_ids=custom_fields,
         ghl_location_id=location_id,
         google_account_email=google_account,
+        employee_google_account_email=employee_google_account,
         secrets=secrets,
         provision_channel_names=provision_names,
     )
@@ -938,10 +964,20 @@ def private_mapping(inputs: SetupInputs) -> dict[str, object]:
         mapping["rentcast"] = {
             "endpoints": ["/v1/properties", "/v1/avm/value", "/v1/avm/rent/long-term"]
         }
-    if inputs.google_account_email:
+    accounts = {
+        role: email
+        for role, email in (
+            ("main_operator", inputs.google_account_email),
+            ("employee", inputs.employee_google_account_email),
+        )
+        if email
+    }
+    if accounts:
+        # One Workspace account per client user. A user who has not connected
+        # one is simply absent, and never inherits the other user's mail.
         mapping["google_workspace"] = {
-            "account_email": inputs.google_account_email,
-            "oauth_scopes": list(GOOGLE_OAUTH_SCOPES),
+            role: {"account_email": email, "oauth_scopes": list(GOOGLE_OAUTH_SCOPES)}
+            for role, email in accounts.items()
         }
     return mapping
 
@@ -1161,13 +1197,21 @@ def next_steps(inputs: SetupInputs) -> tuple[str, ...]:
 #: Where the operator keeps the Desktop OAuth client, and where Scotty keeps
 #: the two files that come out of consent.
 GOOGLE_CLIENT_PATH = Path("/srv/Scotty/operator/google-oauth-client.json")
-GOOGLE_TOKEN_PATH = _DATA_DIR / "scotty" / "google-oauth.json"
-GOOGLE_PROMPT_PATH = _DATA_DIR / "scotty" / "google-consent.json"
+_GOOGLE_STATE_DIR = _DATA_DIR / "scotty"
+
+
+def google_token_path(role: Role, state_dir: Path | None = None) -> Path:
+    return _google_token_path(role, state_dir or _GOOGLE_STATE_DIR)
+
+
+def google_prompt_path(role: Role, state_dir: Path | None = None) -> Path:
+    return _google_prompt_path(role, state_dir or _GOOGLE_STATE_DIR)
 
 
 def connect_google_workspace(
     account_email: str,
     *,
+    role: Role = Role.MAIN_OPERATOR,
     client_path: Path = GOOGLE_CLIENT_PATH,
     token_path: Path | None = None,
     prompt_path: Path | None = None,
@@ -1192,8 +1236,8 @@ def connect_google_workspace(
     code, so it is read through hidden input and never echoed.
     """
 
-    prompt_file = prompt_path or GOOGLE_PROMPT_PATH
-    store = GoogleTokenStore(token_path or GOOGLE_TOKEN_PATH)
+    prompt_file = prompt_path or google_prompt_path(role)
+    store = GoogleTokenStore(token_path or google_token_path(role))
     if store.ready(GOOGLE_OAUTH_SCOPES, account_email):
         # A prompt left over from an earlier attempt names an authorization URL
         # whose verifier is long gone. Clear it rather than show a dead link.
@@ -1213,7 +1257,7 @@ def connect_google_workspace(
     try:
         request = begin_consent(client_path, GOOGLE_OAUTH_SCOPES, owner_uid=owner_uid)
         publish_consent_prompt(prompt_file, request, owner_uid=runtime_uid)
-        output("Open this URL as the configured Google Workspace account:")
+        output(f"Open this URL as the {role.value} Google Workspace account ({account_email}):")
         output(request.authorization_url)
         output(
             "Approve it, then copy the whole address you land on. The page will "
@@ -1275,8 +1319,12 @@ def main() -> int:
     validate_discord_scope(inputs, reader)
     validate_maintainer_route(inputs, reader)
     write_private_state(inputs)
-    if inputs.google_account_email:
-        connect_google_workspace(inputs.google_account_email)
+    for role, email in (
+        (Role.MAIN_OPERATOR, inputs.google_account_email),
+        (Role.EMPLOYEE, inputs.employee_google_account_email),
+    ):
+        if email:
+            connect_google_workspace(email, role=role)
     for step in next_steps(inputs):
         print(step)
     return 0
@@ -1296,6 +1344,8 @@ __all__ = [
     "connect_google_workspace",
     "discord_allowed_users",
     "ensure_profile_homes",
+    "google_prompt_path",
+    "google_token_path",
     "hermes_config_mapping",
     "import_google_client",
     "main",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .policy import Principal, Role
 
@@ -71,6 +71,9 @@ GOOGLE_OAUTH_SCOPES: tuple[str, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class GoogleWorkspaceScope:
+    """One client user's own Workspace account. Never shared between actors."""
+
+    role: Role
     account_email: str
     oauth_scopes: tuple[str, ...]
 
@@ -85,7 +88,12 @@ class RuntimeConfig:
     trello: TrelloScope | None = None
     ghl_location_id: str | None = None
     rentcast_endpoints: tuple[str, ...] = ()
-    google_workspace: GoogleWorkspaceScope | None = None
+    #: One Workspace account per client user, keyed by role. A role that is
+    #: absent is simply not linked; it never falls back to another user's.
+    google_accounts: Mapping[Role, GoogleWorkspaceScope] = field(default_factory=dict)
+
+    def google_for(self, role: Role) -> GoogleWorkspaceScope | None:
+        return self.google_accounts.get(role)
 
     def client_discord_destinations(self) -> tuple[str, ...]:
         """Every Discord destination a client-visible tool may ever reach."""
@@ -152,7 +160,7 @@ class RuntimeConfig:
             trello=_trello(raw.get("trello")),
             ghl_location_id=_ghl(raw.get("ghl")),
             rentcast_endpoints=_rentcast(raw.get("rentcast")),
-            google_workspace=_google_workspace(raw.get("google_workspace")),
+            google_accounts=_google_accounts(raw.get("google_workspace")),
         )
 
 
@@ -187,22 +195,42 @@ def _rentcast(value: object) -> tuple[str, ...]:
     return endpoints
 
 
-def _google_workspace(value: object) -> GoogleWorkspaceScope | None:
-    if value is None:
-        return None
-    raw = _mapping(value, "google_workspace")
+def _google_account(value: object, role: Role) -> GoogleWorkspaceScope:
+    field_name = f"google_workspace.{role.value}"
+    raw = _mapping(value, field_name)
     if set(raw) != {"account_email", "oauth_scopes"}:
-        raise ConfigError("Google Workspace must contain exactly account_email and oauth_scopes")
-    scopes = _texts(raw.get("oauth_scopes"), "google_workspace.oauth_scopes")
+        raise ConfigError(f"{field_name} must contain exactly account_email and oauth_scopes")
+    scopes = _texts(raw.get("oauth_scopes"), f"{field_name}.oauth_scopes")
     if set(scopes) != set(GOOGLE_OAUTH_SCOPES) or len(scopes) != len(GOOGLE_OAUTH_SCOPES):
         raise ConfigError("Google OAuth scopes must equal the full Workspace product scope set")
-    account = _text(raw.get("account_email"), "google_workspace.account_email")
+    account = _text(raw.get("account_email"), f"{field_name}.account_email")
     if "@" not in account or account.startswith("@") or account.endswith("@"):
-        raise ConfigError("Google Workspace account must be an email address")
-    return GoogleWorkspaceScope(
-        account_email=account,
-        oauth_scopes=scopes,
-    )
+        raise ConfigError(f"{field_name}.account_email must be an email address")
+    return GoogleWorkspaceScope(role=role, account_email=account, oauth_scopes=scopes)
+
+
+def _google_accounts(value: object) -> Mapping[Role, GoogleWorkspaceScope]:
+    """Parse one Workspace account per client user.
+
+    Consent is personal, so the configuration is keyed by role and each user
+    connects their own account. Two users must never name the same account:
+    that would make one user's mail reachable through the other's session.
+    """
+
+    if value is None:
+        return {}
+    raw = _mapping(value, "google_workspace")
+    roles = {role.value: role for role in CLIENT_ROLES}
+    unknown = set(raw) - set(roles)
+    if unknown:
+        raise ConfigError("google_workspace may name only the client roles")
+    if not raw:
+        raise ConfigError("google_workspace must name at least one client role")
+    accounts = {roles[name]: _google_account(entry, roles[name]) for name, entry in raw.items()}
+    emails = [scope.account_email.casefold() for scope in accounts.values()]
+    if len(set(emails)) != len(emails):
+        raise ConfigError("each client user must connect a distinct Google account")
+    return accounts
 
 
 def _maintainer_route(value: object, principals: Sequence[Principal]) -> MaintainerRoute:

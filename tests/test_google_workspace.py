@@ -18,6 +18,12 @@ GOOGLE_SCOPE = {
     "account_email": "scotty.synthetic@example.invalid",
     "oauth_scopes": list(GOOGLE_OAUTH_SCOPES),
 }
+EMPLOYEE_SCOPE = {
+    "account_email": "employee.synthetic@example.invalid",
+    "oauth_scopes": list(GOOGLE_OAUTH_SCOPES),
+}
+#: Each client user connects their own Workspace account.
+GOOGLE_ACCOUNTS = {"main_operator": GOOGLE_SCOPE, "employee": EMPLOYEE_SCOPE}
 
 
 class FakeTransport:
@@ -54,13 +60,17 @@ class GoogleConfigTests(unittest.TestCase):
         self,
     ) -> None:
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
-        self.assertEqual(config.google_workspace.account_email, "scotty.synthetic@example.invalid")
-        self.assertEqual(set(config.google_workspace.oauth_scopes), set(GOOGLE_OAUTH_SCOPES))
-        self.assertFalse(hasattr(config.google_workspace, "drive_file_ids"))
-        self.assertFalse(hasattr(config.google_workspace, "gmail_label_ids"))
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
+        self.assertEqual(
+            config.google_for(Role.MAIN_OPERATOR).account_email, "scotty.synthetic@example.invalid"
+        )
+        self.assertEqual(
+            set(config.google_for(Role.MAIN_OPERATOR).oauth_scopes), set(GOOGLE_OAUTH_SCOPES)
+        )
+        self.assertFalse(hasattr(config.google_for(Role.MAIN_OPERATOR), "drive_file_ids"))
+        self.assertFalse(hasattr(config.google_for(Role.MAIN_OPERATOR), "gmail_label_ids"))
         self.assertIn("https://www.googleapis.com/auth/drive", GOOGLE_OAUTH_SCOPES)
         self.assertIn("https://www.googleapis.com/auth/calendar", GOOGLE_OAUTH_SCOPES)
         self.assertNotIn("https://mail.google.com/", GOOGLE_OAUTH_SCOPES)
@@ -74,7 +84,9 @@ class GoogleConfigTests(unittest.TestCase):
         ):
             malformed = dict(GOOGLE_SCOPE, oauth_scopes=scopes)
             with self.subTest(scopes=scopes), self.assertRaises(ConfigError):
-                RuntimeConfig.from_mapping(synthetic.private_mapping(google_workspace=malformed))
+                RuntimeConfig.from_mapping(
+                    synthetic.private_mapping(google_workspace={"main_operator": malformed})
+                )
 
 
 class AdapterHarness(unittest.TestCase):
@@ -82,14 +94,14 @@ class AdapterHarness(unittest.TestCase):
         from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         transport = FakeTransport()
         return GoogleWorkspaceAdapter(
             transport,
             "synthetic-access-token",
-            config.google_workspace,
+            config.google_for(Role.MAIN_OPERATOR),
         ), transport
 
 
@@ -439,11 +451,11 @@ class GoogleRequestShapeTests(AdapterHarness):
                 return HttpResponse(200, {}, {"resultSizeEstimate": 0})
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         adapter = GoogleWorkspaceAdapter(
-            EmptyTransport(), "synthetic-access-token", config.google_workspace
+            EmptyTransport(), "synthetic-access-token", config.google_for(Role.MAIN_OPERATOR)
         )
         self.assertEqual(adapter.search_gmail("from:nobody"), ())
         self.assertEqual(adapter.list_contacts(), ())
@@ -457,11 +469,11 @@ class GoogleRequestShapeTests(AdapterHarness):
                 return HttpResponse(200, {}, {"messages": "not a list"})
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         adapter = GoogleWorkspaceAdapter(
-            MalformedTransport(), "synthetic-access-token", config.google_workspace
+            MalformedTransport(), "synthetic-access-token", config.google_for(Role.MAIN_OPERATOR)
         )
         with self.assertRaises(ProviderError):
             adapter.search_gmail("from:nobody")
@@ -504,11 +516,13 @@ class BoundedGoogleReadTests(unittest.TestCase):
                 return HttpResponse(200, {}, {})
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         return (
-            GoogleWorkspaceAdapter(Transport(), "synthetic-access-token", config.google_workspace),
+            GoogleWorkspaceAdapter(
+                Transport(), "synthetic-access-token", config.google_for(Role.MAIN_OPERATOR)
+            ),
             calls,
         )
 
@@ -733,12 +747,12 @@ class AuthoritativeReadbackTests(unittest.TestCase):
         from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         google = SyntheticGoogle()
         return GoogleWorkspaceAdapter(
-            google, "synthetic-access-token", config.google_workspace
+            google, "synthetic-access-token", config.google_for(Role.MAIN_OPERATOR)
         ), google
 
     def test_every_mutation_reads_the_resource_back_before_reporting_success(self) -> None:
@@ -990,7 +1004,7 @@ class UnverifiedConsequenceLedgerTests(unittest.TestCase):
         unused = object()
         return (
             ScottyService(
-                synthetic.config(google_workspace=GOOGLE_SCOPE),
+                synthetic.config(google_workspace=GOOGLE_ACCOUNTS),
                 store,
                 trello=unused,
                 ghl=unused,
@@ -1005,10 +1019,12 @@ class UnverifiedConsequenceLedgerTests(unittest.TestCase):
         from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
-        return GoogleWorkspaceAdapter(transport, "synthetic-access-token", config.google_workspace)
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
+        return GoogleWorkspaceAdapter(
+            transport, "synthetic-access-token", config.google_for(Role.MAIN_OPERATOR)
+        )
 
     def execute(self, google):
         from assistant.scotty_business.approvals import ProposalStatus
@@ -1233,12 +1249,14 @@ class GoogleAdapterTokenProviderTests(unittest.TestCase):
         from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         transport = FakeTransport()
         issued = iter(["token-1", "token-2", "token-3"])
-        adapter = GoogleWorkspaceAdapter(transport, lambda: next(issued), config.google_workspace)
+        adapter = GoogleWorkspaceAdapter(
+            transport, lambda: next(issued), config.google_for(Role.MAIN_OPERATOR)
+        )
 
         adapter.search_gmail("from:customer")
         adapter.search_gmail("from:customer")
@@ -1255,21 +1273,23 @@ class GoogleAdapterTokenProviderTests(unittest.TestCase):
         from assistant.scotty_business.google_oauth import GoogleOAuthError
 
         config = RuntimeConfig.from_mapping(
-            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+            synthetic.private_mapping(google_workspace=GOOGLE_ACCOUNTS)
         )
-        assert config.google_workspace is not None
+        assert config.google_for(Role.MAIN_OPERATOR) is not None
         transport = FakeTransport()
 
         def unavailable() -> str:
             raise GoogleOAuthError("Google OAuth token state is unavailable")
 
-        adapter = GoogleWorkspaceAdapter(transport, unavailable, config.google_workspace)
+        adapter = GoogleWorkspaceAdapter(
+            transport, unavailable, config.google_for(Role.MAIN_OPERATOR)
+        )
         with self.assertRaises(ProviderError):
             adapter.search_gmail("from:customer")
         self.assertEqual(transport.calls, [])
 
         with self.assertRaises(ProviderError):
-            GoogleWorkspaceAdapter(transport, "", config.google_workspace)
+            GoogleWorkspaceAdapter(transport, "", config.google_for(Role.MAIN_OPERATOR))
 
 
 class HeadlessConsentTests(unittest.TestCase):
@@ -1700,8 +1720,8 @@ class GoogleConsentCallbackTests(unittest.TestCase):
                 self.assertIsNone(self.parse(path, "s1"))
 
 
-class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
-    """An employee may read the Workspace but never mutate it."""
+class PerUserWorkspaceAuthorityTests(unittest.TestCase):
+    """Each client user works in their own Workspace and never the other's."""
 
     def runtime(self):
         from test_provider_connection import runtime
@@ -1752,22 +1772,29 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
 
                 return getter
 
-        recorder = Recorder()
-        runtime.google_workspace = recorder
-        runtime.connected["google_workspace"] = True
-        return recorder
+        from assistant.scotty_business.policy import Role
 
-    def test_an_employee_cannot_reach_a_workspace_mutation_through_the_read_tool(self) -> None:
+        recorders = {role: Recorder() for role in (Role.MAIN_OPERATOR, Role.EMPLOYEE)}
+        runtime.google_adapters = dict(recorders)
+        runtime.google_connected = dict.fromkeys(recorders, True)
+        runtime.connected["google_workspace"] = True
+        return recorders
+
+    def test_a_users_routine_work_never_touches_the_other_users_workspace(self) -> None:
+        """Consent is personal, so the actor decides which mailbox is reached."""
+
         from assistant.scotty_business.google_policy import ROUTINE_GOOGLE_OPERATIONS
         from assistant.scotty_business.policy import Role
 
-        with self.runtime() as runtime:
-            recorder = self.connect(runtime)
-            employee = self.principal(Role.EMPLOYEE)
-            for operation in sorted(ROUTINE_GOOGLE_OPERATIONS):
-                with self.subTest(operation=operation), self.assertRaises(PermissionError):
+        for actor, bystander in (
+            (Role.EMPLOYEE, Role.MAIN_OPERATOR),
+            (Role.MAIN_OPERATOR, Role.EMPLOYEE),
+        ):
+            with self.subTest(actor=actor), self.runtime() as runtime:
+                recorders = self.connect(runtime)
+                for operation in sorted(ROUTINE_GOOGLE_OPERATIONS):
                     runtime.handle_read(
-                        employee,
+                        self.principal(actor),
                         {
                             "operation": "google_workspace",
                             "google_operation": operation,
@@ -1775,13 +1802,60 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                             "payload": {"name": "synthetic"},
                         },
                     )
-            self.assertEqual(recorder.calls, [])
+                self.assertEqual(len(recorders[actor].calls), len(ROUTINE_GOOGLE_OPERATIONS))
+                self.assertEqual(recorders[bystander].calls, [])
+
+    def test_an_unlinked_user_is_told_to_connect_rather_than_borrowing_an_account(
+        self,
+    ) -> None:
+        from assistant.scotty_business.policy import Role
+        from assistant.scotty_business.runtime import ProviderNotConnected
+
+        with self.runtime() as runtime:
+            recorders = self.connect(runtime)
+            # The employee has not completed consent, so they have no adapter.
+            del runtime.google_adapters[Role.EMPLOYEE]
+            runtime.google_connected[Role.EMPLOYEE] = False
+            with self.assertRaises(ProviderNotConnected):
+                runtime.handle_read(
+                    self.principal(Role.EMPLOYEE),
+                    {
+                        "operation": "google_workspace",
+                        "google_operation": "search_gmail",
+                        "payload": {"query": "invoice"},
+                    },
+                )
+            self.assertEqual(recorders[Role.MAIN_OPERATOR].calls, [])
+
+    def test_a_tool_argument_can_never_choose_whose_workspace_is_used(self) -> None:
+        from assistant.scotty_business.policy import Role
+        from assistant.scotty_business.provider_identity import ProviderIdentityError
+
+        with self.runtime() as runtime:
+            recorders = self.connect(runtime)
+            for override in (
+                {"account_email": "operator.synthetic@example.invalid"},
+                {"actor": "main_operator"},
+                {"role": "main_operator"},
+                {"payload": {"on_behalf_of": "301000000000000001"}},
+            ):
+                with self.subTest(override=override), self.assertRaises(ProviderIdentityError):
+                    runtime.handle_read(
+                        self.principal(Role.EMPLOYEE),
+                        {
+                            "operation": "google_workspace",
+                            "google_operation": "search_gmail",
+                            **override,
+                        },
+                    )
+            self.assertEqual(recorders[Role.MAIN_OPERATOR].calls, [])
+            self.assertEqual(recorders[Role.EMPLOYEE].calls, [])
 
     def test_the_new_bounded_reads_are_available_to_both_client_roles(self) -> None:
         from assistant.scotty_business.policy import Role
 
         with self.runtime() as runtime:
-            recorder = self.connect(runtime)
+            recorders = self.connect(runtime)
             for role in (Role.EMPLOYEE, Role.MAIN_OPERATOR):
                 for operation, payload in (
                     ("read_drive_file", {}),
@@ -1798,13 +1872,13 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                                 "payload": payload,
                             },
                         )
-            self.assertEqual(len(recorder.calls), 6)
+            self.assertEqual(sum(len(recorder.calls) for recorder in recorders.values()), 6)
 
     def test_a_malformed_range_argument_is_refused_by_the_runtime(self) -> None:
         from assistant.scotty_business.policy import Role
 
         with self.runtime() as runtime:
-            recorder = self.connect(runtime)
+            recorders = self.connect(runtime)
             for operation, payload in (
                 ("get_sheet_values", {}),
                 ("get_sheet_values", {"range": 7}),
@@ -1821,7 +1895,7 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                             "payload": payload,
                         },
                     )
-            self.assertEqual(recorder.calls, [])
+            self.assertEqual(recorders[Role.MAIN_OPERATOR].calls, [])
 
     def test_the_new_reads_report_not_connected_rather_than_failing_oddly(self) -> None:
         from assistant.scotty_business.policy import Role
@@ -1848,7 +1922,7 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
         from assistant.scotty_business.policy import Role
 
         with self.runtime() as runtime:
-            recorder = self.connect(runtime)
+            recorders = self.connect(runtime)
             result = runtime.handle_read(
                 self.principal(Role.EMPLOYEE),
                 {
@@ -1858,13 +1932,14 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                 },
             )
             self.assertTrue(result)
-            self.assertEqual(recorder.calls, [("search_gmail", "from:customer")])
+            self.assertEqual(recorders[Role.EMPLOYEE].calls, [("search_gmail", "from:customer")])
+            self.assertEqual(recorders[Role.MAIN_OPERATOR].calls, [])
 
     def test_the_main_operator_may_perform_routine_workspace_work(self) -> None:
         from assistant.scotty_business.policy import Role
 
         with self.runtime() as runtime:
-            recorder = self.connect(runtime)
+            recorders = self.connect(runtime)
             runtime.handle_read(
                 self.principal(Role.MAIN_OPERATOR),
                 {
@@ -1874,14 +1949,14 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                     "payload": {"name": "Renamed"},
                 },
             )
-            self.assertEqual(recorder.calls, [("drive_update_file", "file-1")])
+            self.assertEqual(recorders[Role.MAIN_OPERATOR].calls, [("drive_update_file", "file-1")])
 
 
 class GoogleApprovalPolicyTests(unittest.TestCase):
     def test_employee_cannot_approve_google_consequences_but_operator_can(self) -> None:
         from assistant.scotty_business.policy import can_approve
 
-        config = synthetic.config(google_workspace=GOOGLE_SCOPE)
+        config = synthetic.config(google_workspace=GOOGLE_ACCOUNTS)
         employee = config.principal_for(Role.EMPLOYEE)
         operator = config.principal_for(Role.MAIN_OPERATOR)
         self.assertFalse(can_approve(employee, "google_workspace_consequence"))

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -19,6 +20,8 @@ from pathlib import Path
 class GoogleOAuthError(RuntimeError):
     """Google OAuth state is absent, malformed, expired, or out of scope."""
 
+
+_ROLE_SLUG = re.compile(r"[a-z][a-z_]{1,30}[a-z]")
 
 GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/auth"
 GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"  # noqa: S105 - endpoint, not a secret
@@ -523,6 +526,29 @@ def publish_consent_prompt(path: Path, request: ConsentRequest, *, owner_uid: in
             os.close(descriptor)
         with suppress(OSError):
             temporary.unlink(missing_ok=True)
+
+
+def google_token_path(role: object, state_dir: Path) -> Path:
+    """Where one client user's own Workspace token lives. Never shared.
+
+    The file name is derived from the fixed role slug, so no caller — and
+    certainly no model — can point one user's session at another's token.
+    """
+
+    return state_dir / f"google-oauth.{_role_slug(role)}.json"
+
+
+def google_prompt_path(role: object, state_dir: Path) -> Path:
+    """Where one client user's pending consent URL is published."""
+
+    return state_dir / f"google-consent.{_role_slug(role)}.json"
+
+
+def _role_slug(role: object) -> str:
+    slug = getattr(role, "value", role)
+    if type(slug) is not str or not _ROLE_SLUG.fullmatch(slug):
+        raise GoogleOAuthError("Google OAuth role is not a usable record name")
+    return slug
 
 
 def clear_consent_prompt(path: Path) -> None:

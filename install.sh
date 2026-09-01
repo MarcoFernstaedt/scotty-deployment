@@ -89,6 +89,7 @@ readonly -a PLUGIN_FILES=(
   "ingress.py"
   "policy.py"
   "progress.py"
+  "provider_identity.py"
   "provisioning.py"
   "reminders.py"
   "routing.py"

@@ -43,7 +43,8 @@ MAINT_GUILD = "110000000000000001"
 MAINT_CHANNEL = "220000000000000001"
 MAINT_USER = "320000000000000001"
 BOT_ID = "600000000000000001"
-GOOGLE_ACCOUNT = "scotty.synthetic@example.invalid"
+GOOGLE_ACCOUNT = "operator.synthetic@example.invalid"
+EMPLOYEE_GOOGLE_ACCOUNT = "employee.synthetic@example.invalid"
 
 VIEW_CHANNEL = 1 << 10
 SEND_MESSAGES = 1 << 11
@@ -212,6 +213,7 @@ class SetupTests(unittest.TestCase):
                 "field-1",
                 "location-1",
                 GOOGLE_ACCOUNT,
+                EMPLOYEE_GOOGLE_ACCOUNT,
             ]
         )
         hidden_prompts: list[str] = []
@@ -245,6 +247,7 @@ class SetupTests(unittest.TestCase):
                 MAINT_GUILD,
                 MAINT_CHANNEL,
                 MAINT_USER,
+                "",
                 "",
                 "",
                 "",
@@ -503,6 +506,7 @@ class CodexAndOptionalProviderTests(unittest.TestCase):
                 "",
                 "",
                 "",
+                "",
             ]
         )
         hidden_prompts: list[str] = []
@@ -638,6 +642,7 @@ class CredentialSourceTests(unittest.TestCase):
                 MAINT_GUILD,
                 MAINT_CHANNEL,
                 MAINT_USER,
+                "",
                 "",
                 "",
                 "",

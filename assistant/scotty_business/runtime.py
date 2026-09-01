@@ -6,7 +6,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -25,7 +25,7 @@ from .adapters import (
     TrelloAdapter,
 )
 from .approvals import ApprovalStore, Proposal
-from .config import ConfigError, RuntimeConfig
+from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
 from .discord_policy import (
     BULK_WINDOW_SECONDS,
@@ -39,17 +39,19 @@ from .google_oauth import (
     GoogleOAuthError,
     GoogleTokenStore,
     ensure_access_token,
+    google_prompt_path,
+    google_token_path,
     read_consent_prompt,
 )
-from .google_policy import ROUTINE_GOOGLE_OPERATIONS
 from .guidance import PROVIDERS, provider_guidance, provider_status
 from .identity import AuthorizedPrincipalResolver
 from .ingress import IngressGuard
 from .policy import Principal, Role
 from .progress import ProgressReporter
+from .provider_identity import reject_identity_override
 from .reminders import Reminder, ReminderStore, ReminderWorker
 from .self_repair import SelfRepairError, SelfRepairManager
-from .service import GHLPort, RentCastPort, ScottyService, TrelloPort
+from .service import GHLPort, GoogleWorkspacePort, RentCastPort, ScottyService, TrelloPort
 from .setup_flow import (
     LOCAL_SETUP_COMMAND,
     ProviderProgress,
@@ -142,6 +144,38 @@ class ProviderNotConnected(RuntimeError):
 
 class TrelloReadPort(TrelloPort, Protocol):
     def list_cards(self) -> Sequence[ProviderRecord]: ...
+
+
+class GoogleWorkspaceReadPort(GoogleWorkspacePort, Protocol):
+    """Everything the client read tool may ask one user's Workspace to do."""
+
+    def search_gmail(self, query: str, *, max_results: int = 50) -> Sequence[ProviderRecord]: ...
+    def search_drive(self, query: str, *, max_results: int = 50) -> Sequence[ProviderRecord]: ...
+    def list_calendar_events(
+        self,
+        calendar_id: str,
+        *,
+        query: str = "",
+        time_min: str | None = None,
+        time_max: str | None = None,
+        max_results: int = 50,
+    ) -> Sequence[ProviderRecord]: ...
+    def list_contacts(self, *, page_size: int = 50) -> Sequence[ProviderRecord]: ...
+    def read_drive_file(self, file_id: str) -> ProviderRecord: ...
+    def get_sheet_values(self, spreadsheet_id: str, a1_range: str) -> ProviderRecord: ...
+    def batch_get_sheet_values(
+        self, spreadsheet_id: str, ranges: Sequence[str]
+    ) -> ProviderRecord: ...
+    def get_gmail_message(self, message_id: str) -> ProviderRecord: ...
+    def create_gmail_draft(self, raw_base64url: str) -> ProviderRecord: ...
+    def get_calendar_event(self, calendar_id: str, event_id: str) -> ProviderRecord: ...
+    def get_drive_file(self, file_id: str) -> ProviderRecord: ...
+    def get_document(self, document_id: str) -> ProviderRecord: ...
+    def get_spreadsheet(self, spreadsheet_id: str) -> ProviderRecord: ...
+    def get_contact(self, resource_name: str) -> ProviderRecord: ...
+    def execute_routine(
+        self, operation: str, resource_id: str, payload: Mapping[str, object]
+    ) -> ProviderRecord: ...
 
 
 class GHLReadPort(GHLPort, Protocol):
@@ -402,19 +436,28 @@ class Runtime:
             else UnconnectedProvider("RentCast")
         )
         state_dir = home / "scotty"
-        google_scope = self.config.google_workspace
-        self.google_store = GoogleTokenStore(state_dir / "google-oauth.json")
-        # Connected means consent exists for this exact account and scope set. An
-        # hour-old access token refreshes in place; it never means "not connected".
-        self.connected["google_workspace"] = bool(
-            google_scope is not None
-            and self.google_store.ready(google_scope.oauth_scopes, google_scope.account_email)
-        )
-        self.google_workspace = (
-            GoogleWorkspaceAdapter(transport, self._google_access_token, google_scope)
-            if google_scope is not None and self.connected["google_workspace"]
-            else UnconnectedProvider("Google Workspace")
-        )
+        # Consent is personal, so each client user has their own token record
+        # and their own adapter. Nothing here is shared between the two.
+        self.google_stores: dict[Role, GoogleTokenStore] = {
+            role: GoogleTokenStore(google_token_path(role, state_dir)) for role in CLIENT_ROLES
+        }
+        self.google_connected: dict[Role, bool] = {}
+        self.google_adapters: dict[Role, GoogleWorkspaceAdapter] = {}
+        for role in CLIENT_ROLES:
+            scope = self.config.google_for(role)
+            # Connected means consent exists for this exact account and scope
+            # set. An hour-old access token refreshes in place; it never means
+            # "not connected".
+            linked = bool(
+                scope is not None
+                and self.google_stores[role].ready(scope.oauth_scopes, scope.account_email)
+            )
+            self.google_connected[role] = linked
+            if linked and scope is not None:
+                self.google_adapters[role] = GoogleWorkspaceAdapter(
+                    transport, self._google_token_provider(role), scope
+                )
+        self.connected["google_workspace"] = any(self.google_connected.values())
         self.state_dir = state_dir
         self.approvals = ApprovalStore(state_dir / "approvals.db")
         self.approvals.initialize()
@@ -437,9 +480,7 @@ class Runtime:
             ghl=self.ghl,
             rentcast=self.rentcast,
             discord=self.discord,
-            google_workspace=(
-                self.google_workspace if self.connected["google_workspace"] else None
-            ),
+            google_workspace=self.google_workspace_for,
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
         self._reporters: dict[tuple[str, str], ProgressReporter] = {}
@@ -456,13 +497,35 @@ class Runtime:
             status[provider] = "present" if broker.status(provider, credential_class) else "absent"
         return status
 
-    def _google_access_token(self) -> str:
-        """Return a valid Workspace access token, refreshing it when it expires."""
+    def _google_token_provider(self, role: Role) -> Callable[[], str]:
+        """A token provider bound to exactly one client user's own account."""
 
-        scope = self.config.google_workspace
-        if scope is None:
-            raise GoogleOAuthError("Google Workspace is not configured")
-        return ensure_access_token(self.google_store, scope.oauth_scopes, scope.account_email)
+        def provide() -> str:
+            scope = self.config.google_for(role)
+            if scope is None:
+                raise GoogleOAuthError("Google Workspace is not configured")
+            return ensure_access_token(
+                self.google_stores[role], scope.oauth_scopes, scope.account_email
+            )
+
+        return provide
+
+    def google_workspace_for(self, role: Role) -> GoogleWorkspaceAdapter | None:
+        """The Workspace adapter for exactly this client user, or none."""
+
+        return self.google_adapters.get(role)
+
+    def _workspace(self, principal: Principal) -> GoogleWorkspaceReadPort:
+        """This actor's own Workspace, or a provider that explains it is absent.
+
+        An actor who has not connected their own account never falls through to
+        the other user's adapter; they are told to connect their own.
+        """
+
+        adapter = self.google_adapters.get(principal.role)
+        if adapter is None:
+            return UnconnectedProvider("Google Workspace")
+        return adapter
 
     def principal(self, session_id: object) -> Principal:
         return self.resolver.resolve(session_id)
@@ -470,14 +533,23 @@ class Runtime:
     def provider_connection_status(self) -> dict[str, bool]:
         return provider_status(self.connected)
 
+    def actor_connection_status(self, principal: Principal) -> dict[str, bool]:
+        """What this exact user is connected to, not what the deployment has."""
+
+        connected = dict(self.connected)
+        connected["google_workspace"] = self.google_connected.get(principal.role, False)
+        return provider_status(connected)
+
     def _provider_setup(
         self, principal: Principal, args: Mapping[str, object]
     ) -> dict[str, object]:
         """Answer one guided setup turn: explain, validate, diagnose, or resume."""
 
-        status = self.provider_connection_status()
+        # Setup state is personal: this user's own Google account, their own
+        # connected providers, and their own next step.
+        status = self.actor_connection_status(principal)
         staged = self.setup_staging.read()
-        progress = setup_progress(self.config, status, staged)
+        progress = setup_progress(self.config, status, staged, role=principal.role)
         name = _text(args, "provider", optional=True)
         if name is None:
             resume = first_unfinished(progress)
@@ -520,7 +592,7 @@ class Runtime:
                 staged = self.setup_staging.stage(name, field, raw)
             except SetupFlowError as exc:
                 return {"provider": name, "accepted": False, "correction": str(exc)}
-            refreshed = setup_progress(self.config, status, staged)
+            refreshed = setup_progress(self.config, status, staged, role=principal.role)
             resume = first_unfinished(refreshed)
             return {
                 "provider": name,
@@ -530,7 +602,7 @@ class Runtime:
             }
         answer = {**_guidance_json(name, status[name]), **_progress_json(current)}
         if name == "google_workspace" and not status[name]:
-            prompt = read_consent_prompt(self.state_dir / "google-consent.json")
+            prompt = read_consent_prompt(google_prompt_path(principal.role, self.state_dir))
             if prompt is not None:
                 # Presenting the URL is safe: it carries the client id and the
                 # scopes, never the client secret, the verifier, or a token.
@@ -544,6 +616,11 @@ class Runtime:
         return answer
 
     def handle_read(self, principal: Principal, args: Mapping[str, object]) -> object:
+        # Nothing the model wrote may name whose identity this call runs as.
+        # The actor is the authorized Discord origin, resolved before any
+        # provider is touched.
+        reject_identity_override(args)
+        workspace = self._workspace(principal)
         operation = _text(args, "operation")
         if operation == "self_health":
             return self.self_repair.health()
@@ -568,22 +645,18 @@ class Runtime:
             google_operation = _text(args, "google_operation")
             payload = _object(args, "payload", optional=True)
             resource_id = _text(args, "resource_id", optional=True) or "new"
-            if (
-                google_operation in ROUTINE_GOOGLE_OPERATIONS
-                and principal.role not in _WORKSPACE_WRITE_ROLES
-            ):
-                # Reading the Workspace is shared; changing it belongs to its
-                # owner. An employee proposes instead of writing.
-                raise PermissionError("Google Workspace changes require the main operator")
+            # Each client user works in their own Workspace, so routine
+            # reversible work needs no approval from anyone else. Consequence
+            # actions are still gated, and an employee still cannot approve one.
             if google_operation in {"search_gmail", "search_drive"}:
                 query = payload.get("query", "")
                 maximum = payload.get("max_results", 50)
                 if type(query) is not str or type(maximum) is not int:
                     raise ValueError("Google search query or max_results is malformed")
                 records = (
-                    self.google_workspace.search_gmail(query, max_results=maximum)
+                    workspace.search_gmail(query, max_results=maximum)
                     if google_operation == "search_gmail"
-                    else self.google_workspace.search_drive(query, max_results=maximum)
+                    else workspace.search_drive(query, max_results=maximum)
                 )
                 return [_record_json(item) for item in records]
             if google_operation == "list_calendar_events":
@@ -593,7 +666,7 @@ class Runtime:
                     raise ValueError("Google Calendar list request is malformed")
                 return [
                     _record_json(item)
-                    for item in self.google_workspace.list_calendar_events(
+                    for item in workspace.list_calendar_events(
                         calendar_id,
                         query=str(payload.get("query", "")),
                         time_min=(str(payload["time_min"]) if "time_min" in payload else None),
@@ -605,42 +678,37 @@ class Runtime:
                 if "/" not in resource_id:
                     raise ValueError("calendar event resource must be calendar/event")
                 calendar_id, event_id = resource_id.split("/", 1)
-                return _record_json(self.google_workspace.get_calendar_event(calendar_id, event_id))
+                return _record_json(workspace.get_calendar_event(calendar_id, event_id))
             if google_operation == "read_drive_file":
-                return _record_json(self.google_workspace.read_drive_file(resource_id))
+                return _record_json(workspace.read_drive_file(resource_id))
             if google_operation == "get_sheet_values":
                 target = payload.get("range")
                 if type(target) is not str:
                     raise ValueError("spreadsheet range is malformed")
-                return _record_json(self.google_workspace.get_sheet_values(resource_id, target))
+                return _record_json(workspace.get_sheet_values(resource_id, target))
             if google_operation == "batch_get_sheet_values":
                 ranges = payload.get("ranges")
                 if not isinstance(ranges, list):
                     raise ValueError("spreadsheet ranges are malformed")
-                return _record_json(
-                    self.google_workspace.batch_get_sheet_values(resource_id, ranges)
-                )
+                return _record_json(workspace.batch_get_sheet_values(resource_id, ranges))
             if google_operation == "list_contacts":
                 maximum = payload.get("max_results", 100)
                 if type(maximum) is not int:
                     raise ValueError("Google Contacts max_results is malformed")
-                return [
-                    _record_json(item)
-                    for item in self.google_workspace.list_contacts(page_size=maximum)
-                ]
+                return [_record_json(item) for item in workspace.list_contacts(page_size=maximum)]
             getters = {
-                "get_gmail_message": self.google_workspace.get_gmail_message,
-                "get_drive_file": self.google_workspace.get_drive_file,
-                "get_document": self.google_workspace.get_document,
-                "get_spreadsheet": self.google_workspace.get_spreadsheet,
-                "get_contact": self.google_workspace.get_contact,
+                "get_gmail_message": workspace.get_gmail_message,
+                "get_drive_file": workspace.get_drive_file,
+                "get_document": workspace.get_document,
+                "get_spreadsheet": workspace.get_spreadsheet,
+                "get_contact": workspace.get_contact,
             }
             getter = getters.get(google_operation)
             if getter is not None:
                 return _record_json(getter(resource_id))
             try:
                 return _record_json(
-                    self.google_workspace.execute_routine(google_operation, resource_id, payload)
+                    workspace.execute_routine(google_operation, resource_id, payload)
                 )
             except AmbiguousEffectError as exc:
                 # The write may or may not have landed. Say so plainly so the
@@ -674,25 +742,21 @@ class Runtime:
             endpoint = _text(args, "endpoint")
             return _record_json(self.rentcast.fetch(endpoint, _object(args, "query")))
         if operation == "google_gmail_message":
-            return _record_json(self.google_workspace.get_gmail_message(_text(args, "message_id")))
+            return _record_json(workspace.get_gmail_message(_text(args, "message_id")))
         if operation == "google_gmail_draft":
-            return _record_json(self.google_workspace.create_gmail_draft(_text(args, "raw")))
+            return _record_json(workspace.create_gmail_draft(_text(args, "raw")))
         if operation == "google_calendar_event":
             return _record_json(
-                self.google_workspace.get_calendar_event(
-                    _text(args, "calendar_id"), _text(args, "event_id")
-                )
+                workspace.get_calendar_event(_text(args, "calendar_id"), _text(args, "event_id"))
             )
         if operation == "google_drive_file":
-            return _record_json(self.google_workspace.get_drive_file(_text(args, "file_id")))
+            return _record_json(workspace.get_drive_file(_text(args, "file_id")))
         if operation == "google_document":
-            return _record_json(self.google_workspace.get_document(_text(args, "document_id")))
+            return _record_json(workspace.get_document(_text(args, "document_id")))
         if operation == "google_spreadsheet":
-            return _record_json(
-                self.google_workspace.get_spreadsheet(_text(args, "spreadsheet_id"))
-            )
+            return _record_json(workspace.get_spreadsheet(_text(args, "spreadsheet_id")))
         if operation == "google_contact":
-            return _record_json(self.google_workspace.get_contact(_text(args, "resource_name")))
+            return _record_json(workspace.get_contact(_text(args, "resource_name")))
         raise ValueError("read operation is not permitted")
 
     def _reporter(self, channel_id: str, task_id: str) -> ProgressReporter:

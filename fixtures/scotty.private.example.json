@@ -16,17 +16,32 @@
     "location_id": "synthetic-location-1"
   },
   "google_workspace": {
-    "account_email": "scotty.synthetic@example.invalid",
-    "oauth_scopes": [
-      "openid",
-      "email",
-      "https://www.googleapis.com/auth/gmail.modify",
-      "https://www.googleapis.com/auth/calendar",
-      "https://www.googleapis.com/auth/drive",
-      "https://www.googleapis.com/auth/documents",
-      "https://www.googleapis.com/auth/spreadsheets",
-      "https://www.googleapis.com/auth/contacts"
-    ]
+    "employee": {
+      "account_email": "employee.synthetic@example.invalid",
+      "oauth_scopes": [
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/contacts"
+      ]
+    },
+    "main_operator": {
+      "account_email": "operator.synthetic@example.invalid",
+      "oauth_scopes": [
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/contacts"
+      ]
+    }
   },
   "maintainer_route": {
     "channel_id": "220000000000000001",

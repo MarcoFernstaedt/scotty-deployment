@@ -571,7 +571,7 @@ def check_google_read_bounds() -> None:
     fixture = json.loads(
         (ROOT / "fixtures" / "scotty.private.example.json").read_text(encoding="utf-8")
     )
-    scope = RuntimeConfig.from_mapping(fixture).google_workspace
+    scope = RuntimeConfig.from_mapping(fixture).google_for(Role.MAIN_OPERATOR)
     assert scope is not None
     transport = RefusingTransport()
     adapter = GoogleWorkspaceAdapter(transport, "synthetic-access-token", scope)
