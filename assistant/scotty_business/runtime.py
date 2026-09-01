@@ -14,6 +14,7 @@ from typing import Literal, Protocol, overload
 
 from .adapters import (
     MAX_ATTACHMENT_BYTES,
+    AmbiguousEffectError,
     Attachment,
     DiscordAdapter,
     GHLAdapter,
@@ -595,9 +596,19 @@ class Runtime:
             getter = getters.get(google_operation)
             if getter is not None:
                 return _record_json(getter(resource_id))
-            return _record_json(
-                self.google_workspace.execute_routine(google_operation, resource_id, payload)
-            )
+            try:
+                return _record_json(
+                    self.google_workspace.execute_routine(google_operation, resource_id, payload)
+                )
+            except AmbiguousEffectError as exc:
+                # The write may or may not have landed. Say so plainly so the
+                # caller reconciles rather than repeating the mutation.
+                return {
+                    "status": "unknown",
+                    "operation": google_operation,
+                    "reconcile_before_retry": True,
+                    "reason": str(exc),
+                }
         if operation == "trello_card":
             return _record_json(self.trello.get_card(_text(args, "card_id")))
         if operation == "trello_cards":

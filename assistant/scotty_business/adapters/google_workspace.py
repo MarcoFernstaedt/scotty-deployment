@@ -7,7 +7,14 @@ from collections.abc import Callable, Mapping, Sequence
 from ..config import GoogleWorkspaceScope
 from ..google_oauth import GoogleOAuthError
 from ..google_policy import GoogleActionClass, classify_google_action
-from .http import ProviderError, RedactedMapping, Transport, require_success
+from ..google_readback import ReadbackStatus, applied_fully, plan, verify
+from .http import (
+    AmbiguousEffectError,
+    ProviderError,
+    RedactedMapping,
+    Transport,
+    require_success,
+)
 from .records import ProviderRecord, utc_now
 
 _GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
@@ -16,6 +23,16 @@ _DRIVE = "https://www.googleapis.com/drive/v3"
 _DOCS = "https://docs.googleapis.com/v1"
 _SHEETS = "https://sheets.googleapis.com/v4"
 _PEOPLE = "https://people.googleapis.com/v1"
+
+#: The bases the readback planner builds authoritative reads from.
+_ENDPOINTS: Mapping[str, str] = {
+    "gmail": _GMAIL,
+    "calendar": _CALENDAR,
+    "drive": _DRIVE,
+    "docs": _DOCS,
+    "sheets": _SHEETS,
+    "people": _PEOPLE,
+}
 
 
 def _id(value: object, field: str) -> str:
@@ -568,4 +585,41 @@ class GoogleWorkspaceAdapter:
                 or response.get("spreadsheetId")
                 or source
             )
+        # The mutation response is the provider's claim; the readback is proof.
+        self._verify(operation, resource_id, payload, response)
         return self._record("google_workspace", source, response)
+
+    def _verify(
+        self,
+        operation: str,
+        resource_id: str,
+        payload: Mapping[str, object],
+        response: object,
+    ) -> None:
+        """Read the resource back and require it to show the intended state."""
+
+        readback = plan(operation, resource_id, payload, response, _ENDPOINTS)
+        status, observed = 0, None
+        if readback is not None:
+            try:
+                result = self.transport.request(
+                    "GET",
+                    readback.request.url,
+                    headers=self.headers,
+                    query=readback.request.query,
+                )
+                status, observed = result.status, result.body
+            except ProviderError:
+                status, observed = 0, None
+        verdict = verify(
+            readback,
+            status,
+            observed,
+            fully_applied=applied_fully(operation, payload, response),
+        )
+        if verdict is not ReadbackStatus.VERIFIED:
+            # The effect may or may not have landed. It is reconciled, never
+            # retried, and never reported as a completed write.
+            raise AmbiguousEffectError(
+                f"Google Workspace write is unverified: {verdict.value}; reconcile before retry"
+            )

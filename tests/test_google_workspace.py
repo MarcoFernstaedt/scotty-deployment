@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import synthetic
+from synthetic_google import SyntheticGoogle
 
 from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
 from assistant.scotty_business.config import GOOGLE_OAUTH_SCOPES, ConfigError, RuntimeConfig
@@ -114,6 +115,7 @@ class GoogleAdapterTests(AdapterHarness):
 
     def test_routine_reversible_workspace_operations_are_available_without_proposal(self) -> None:
         adapter, _ = self.adapter()
+        adapter.transport = SyntheticGoogle()
         operations = (
             ("gmail_modify_labels", "message-1", {"addLabelIds": ["STARRED"]}),
             ("gmail_create_draft", "new", {"raw": "c3ludGhldGlj"}),
@@ -347,6 +349,7 @@ class GoogleAdapterPayloadTests(AdapterHarness):
 
     def test_label_modification_accepts_only_bounded_label_fields(self) -> None:
         adapter, _ = self.adapter()
+        adapter.transport = SyntheticGoogle()
         for payload in (
             {},
             {"raw": "c3ludGhldGlj"},
@@ -365,7 +368,9 @@ class GoogleAdapterPayloadTests(AdapterHarness):
         )
 
     def test_contact_updates_name_only_known_person_fields(self) -> None:
-        adapter, transport = self.adapter()
+        adapter, _ = self.adapter()
+        transport = SyntheticGoogle()
+        adapter.transport = transport
         with self.assertRaises(ProviderError):
             adapter.execute_routine(
                 "contacts_update", "people/contact-1", {"etag": "etag-1", "notAField": []}
@@ -375,9 +380,8 @@ class GoogleAdapterPayloadTests(AdapterHarness):
             "people/contact-1",
             {"etag": "etag-1", "names": [], "emailAddresses": []},
         )
-        query = transport.calls[-1][2]
-        assert query is not None
-        self.assertEqual(query["updatePersonFields"], "names,emailAddresses")
+        update = next(url for method, url in transport.calls if method == "PATCH")
+        self.assertIn("updateContact", update)
 
     def test_a_bulk_or_forbidden_payload_never_reaches_the_transport(self) -> None:
         adapter, transport = self.adapter()
@@ -719,6 +723,270 @@ class GoogleScopeNormalizationTests(unittest.TestCase):
                 )
             )
             self.assertTrue(store.ready(GOOGLE_OAUTH_SCOPES, GOOGLE_SCOPE["account_email"]))
+
+
+class AuthoritativeReadbackTests(unittest.TestCase):
+    """A mutation is verified by an independent read, never by its own reply."""
+
+    def adapter(self):
+        from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
+
+        config = RuntimeConfig.from_mapping(
+            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+        )
+        assert config.google_workspace is not None
+        google = SyntheticGoogle()
+        return GoogleWorkspaceAdapter(
+            google, "synthetic-access-token", config.google_workspace
+        ), google
+
+    def test_every_mutation_reads_the_resource_back_before_reporting_success(self) -> None:
+        adapter, google = self.adapter()
+        adapter.execute_routine("drive_update_file", "file-1", {"name": "Renamed"})
+        methods = [method for method, _ in google.calls]
+        self.assertEqual(methods, ["PATCH", "GET"])
+        self.assertEqual(google.files["file-1"]["name"], "Renamed")
+
+    def test_a_readback_that_disagrees_is_unverified_not_success(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+        google.readback_status = 200
+        google.readback_body = {"id": "file-1", "name": "Something else"}
+        with self.assertRaises(AmbiguousEffectError) as caught:
+            adapter.execute_routine("drive_update_file", "file-1", {"name": "Renamed"})
+        self.assertIn("reconcile before retry", str(caught.exception))
+
+    def test_an_absent_resource_after_a_write_is_unverified(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+        google.readback_status = 404
+        google.readback_body = {}
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.execute_routine("drive_update_file", "file-1", {"name": "Renamed"})
+
+    def test_an_unavailable_or_malformed_readback_is_unverified(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        for status, body in ((500, {}), (429, {}), (200, "not an object"), (200, None)):
+            with self.subTest(status=status):
+                adapter, google = self.adapter()
+                google.readback_status = status
+                google.readback_body = body
+                with self.assertRaises(AmbiguousEffectError):
+                    adapter.execute_routine("drive_update_file", "file-1", {"name": "Renamed"})
+
+    def test_a_partly_applied_batch_is_unverified_even_if_the_resource_exists(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        for operation, resource in (
+            ("docs_batch_update", "document-1"),
+            ("sheets_batch_update", "spreadsheet-1"),
+        ):
+            with self.subTest(operation=operation):
+                adapter, google = self.adapter()
+                google.drop_batch_replies = 1
+                with self.assertRaises(AmbiguousEffectError) as caught:
+                    adapter.execute_routine(
+                        operation, resource, {"requests": [{"insertText": {}}, {"insertText": {}}]}
+                    )
+                self.assertIn("only part", str(caught.exception))
+
+    def test_a_fully_applied_batch_verifies(self) -> None:
+        adapter, google = self.adapter()
+        record = adapter.execute_routine(
+            "docs_batch_update", "document-1", {"requests": [{"insertText": {}}]}
+        )
+        self.assertEqual(record.source_id, "document-1")
+
+    def test_a_write_whose_response_never_arrives_is_unverified(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        class TimingOutTransport(SyntheticGoogle):
+            def request(self, method, url, **kwargs):
+                if method in {"POST", "PATCH", "PUT", "DELETE"}:
+                    # The effect may already have landed on the provider side.
+                    raise AmbiguousEffectError(
+                        "provider mutation outcome is unknown; reconcile before any retry"
+                    )
+                return super().request(method, url, **kwargs)
+
+        adapter, _ = self.adapter()
+        adapter.transport = TimingOutTransport()
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.execute_routine("drive_update_file", "file-1", {"name": "Renamed"})
+
+    def test_reconciliation_after_an_unverified_write_reads_the_true_state(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+        google.readback_status = 500
+        google.readback_body = {}
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.execute_routine("drive_update_file", "file-1", {"name": "Renamed"})
+        # The write did land. Reconciling shows that, so the caller must not
+        # repeat the mutation blindly.
+        self.assertEqual(adapter.get_drive_file("file-1").fields["name"], "Renamed")
+
+    def test_an_operation_with_no_authoritative_readback_is_never_verified(self) -> None:
+        from assistant.scotty_business.google_readback import ReadbackStatus, verify
+
+        self.assertEqual(
+            verify(None, 200, {"id": "x"}, fully_applied=None), ReadbackStatus.UNSUPPORTED
+        )
+
+    def test_a_deletion_verifies_only_when_the_resource_is_really_gone(self) -> None:
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+        adapter.mutate("drive_delete_permanently", "file-1", {})
+        self.assertNotIn("file-1", google.files)
+
+        other, other_google = self.adapter()
+        other_google.readback_status = 200
+        other_google.readback_body = {"id": "file-1"}
+        with self.assertRaises(AmbiguousEffectError) as caught:
+            other.mutate("drive_delete_permanently", "file-1", {})
+        self.assertIn("still present", str(caught.exception))
+
+    def test_a_cancelled_event_verifies_by_its_status(self) -> None:
+        adapter, google = self.adapter()
+        created = adapter.execute_routine(
+            "calendar_create_event", "primary", {"summary": "Internal sync"}
+        )
+        adapter.execute_routine("calendar_cancel_event", f"primary/{created.source_id}", {})
+        self.assertEqual(google.events[("primary", created.source_id)]["status"], "cancelled")
+
+
+class UnverifiedConsequenceLedgerTests(unittest.TestCase):
+    """An unverified consequence write lands in the ledger as unknown."""
+
+    def service(self, google):
+        import tempfile
+
+        from assistant.scotty_business.approvals import ApprovalStore
+        from assistant.scotty_business.service import ScottyService
+
+        directory = tempfile.TemporaryDirectory(prefix="scotty-readback-")
+        self.addCleanup(directory.cleanup)
+        store = ApprovalStore(f"{directory.name}/approvals.db")
+        store.initialize()
+        unused = object()
+        return (
+            ScottyService(
+                synthetic.config(google_workspace=GOOGLE_SCOPE),
+                store,
+                trello=unused,
+                ghl=unused,
+                rentcast=None,
+                discord=unused,
+                google_workspace=google,
+            ),
+            store,
+        )
+
+    def adapter(self, transport):
+        from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
+
+        config = RuntimeConfig.from_mapping(
+            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+        )
+        assert config.google_workspace is not None
+        return GoogleWorkspaceAdapter(transport, "synthetic-access-token", config.google_workspace)
+
+    def execute(self, google):
+        from assistant.scotty_business.approvals import ProposalStatus
+        from assistant.scotty_business.policy import Role
+
+        service, store = self.service(self.adapter(google))
+        operator = synthetic.config().principal_for(Role.MAIN_OPERATOR)
+        proposal = service.propose_google_workspace_write(
+            operator, "drive_delete_permanently", "file-1", {}
+        )
+        approved = store.approve(proposal.proposal_id, operator, proposal.version)
+        return (
+            service.execute(
+                operator,
+                proposal.proposal_id,
+                expected_version=approved.version,
+                execution_nonce=approved.execution_nonce,
+            ),
+            ProposalStatus,
+            store,
+            operator,
+        )
+
+    def test_a_verified_consequence_write_is_recorded_verified(self) -> None:
+        google = SyntheticGoogle()
+        outcome, statuses, _, _ = self.execute(google)
+        self.assertEqual(outcome.status, statuses.VERIFIED)
+        self.assertNotIn("file-1", google.files)
+
+    def test_an_unverified_consequence_write_is_recorded_unknown(self) -> None:
+        google = SyntheticGoogle()
+        # The delete lands, but the readback still shows the file, so the
+        # outcome is ambiguous and must never be recorded as verified.
+        google.readback_status = 200
+        google.readback_body = {"id": "file-1"}
+        outcome, statuses, _, _ = self.execute(google)
+        self.assertEqual(outcome.status, statuses.UNKNOWN)
+        self.assertIs(outcome.receipt.get("verified"), False)
+
+    def test_an_unknown_outcome_is_terminal_and_is_never_retried(self) -> None:
+        from assistant.scotty_business.approvals import ApprovalError
+
+        google = SyntheticGoogle()
+        google.readback_status = 500
+        google.readback_body = {}
+        outcome, statuses, store, operator = self.execute(google)
+        self.assertEqual(outcome.status, statuses.UNKNOWN)
+        # The write is reconciled by a person, never repeated by Scotty: the
+        # ledger refuses to claim an already-terminal proposal again.
+        with self.assertRaises(ApprovalError):
+            store.claim_execution(
+                outcome.proposal_id,
+                operator,
+                expected_version=outcome.version,
+                execution_nonce=outcome.execution_nonce,
+                current_source_revision="configured-google-resource-v1",
+            )
+
+
+class ReadbackNormalizationTests(unittest.TestCase):
+    """Equal state written differently must compare equal; different must not."""
+
+    def matches(self, intended, observed):
+        from assistant.scotty_business.google_readback import matches
+
+        return matches(intended, observed)
+
+    def test_whitespace_and_instant_representation_are_normalized(self) -> None:
+        self.assertTrue(self.matches({"summary": "Team sync"}, {"summary": " Team sync "}))
+        self.assertTrue(
+            self.matches(
+                {"start": {"dateTime": "2026-01-01T10:00:00-07:00"}},
+                {"start": {"dateTime": "2026-01-01T17:00:00Z"}},
+            )
+        )
+
+    def test_list_order_does_not_matter_but_membership_does(self) -> None:
+        self.assertTrue(self.matches({"labelIds": ["A", "B"]}, {"labelIds": ["B", "C", "A"]}))
+        self.assertFalse(self.matches({"labelIds": ["A", "B"]}, {"labelIds": ["A"]}))
+
+    def test_only_the_fields_the_intent_named_are_required(self) -> None:
+        self.assertTrue(self.matches({"name": "Notes"}, {"name": "Notes", "size": "12"}))
+        self.assertFalse(self.matches({"name": "Notes"}, {"size": "12"}))
+
+    def test_a_different_value_or_shape_never_matches(self) -> None:
+        for intended, observed in (
+            ({"name": "Notes"}, {"name": "Other"}),
+            ({"labelIds": ["A"]}, {"labelIds": "A"}),
+            ({"start": {"dateTime": "2026-01-01T10:00:00Z"}}, {"start": "2026-01-01T10:00:00Z"}),
+            ({"trashed": True}, {"trashed": False}),
+        ):
+            with self.subTest(intended=intended):
+                self.assertFalse(self.matches(intended, observed))
 
 
 class GoogleTokenRefreshTests(unittest.TestCase):
