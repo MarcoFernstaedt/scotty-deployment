@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
 import synthetic
@@ -482,12 +483,16 @@ class RuntimeRunTests(RuntimeWorkflowTests):
                     }
                 ],
             )
-            first = runtime.advance_workflow_runs()
+            # Midday, explicitly: this workflow declares quiet hours, and a
+            # pass that did not say when it was running would fire or not
+            # depending on the time of day the suite happened to run.
+            noon = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+            first = runtime.advance_workflow_runs(at=noon)
             self.assertEqual(first["started"], 1)
             # The loop runs every second. A schedule that fired every pass
             # would be one reminder a second, which is the bug the window
             # exists to prevent.
-            again = runtime.advance_workflow_runs()
+            again = runtime.advance_workflow_runs(at=noon)
             self.assertEqual(again["started"], 0)
             self.assertEqual(len(runtime.handle_reminder(operator, {"action": "list"})), 1)
 
@@ -505,7 +510,12 @@ class RuntimeRunTests(RuntimeWorkflowTests):
                     ),
                 },
             )
-            self.assertEqual(runtime.advance_workflow_runs()["started"], 0)
+            self.assertEqual(
+                runtime.advance_workflow_runs(at=datetime(2026, 9, 1, 12, 0, tzinfo=UTC))[
+                    "started"
+                ],
+                0,
+            )
 
     def test_a_step_the_owner_may_not_do_fails_the_run_rather_than_widening_it(self) -> None:
         with self.runtime() as runtime:

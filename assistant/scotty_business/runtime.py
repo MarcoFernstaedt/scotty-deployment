@@ -28,10 +28,11 @@ from .adapters import (
     TrelloAdapter,
 )
 from .adapters.discord_admin import DiscordAdminAdapter
+from .adapters.http import HttpResponse, Transport
 from .approvals import ApprovalError, ApprovalStore, Proposal, ProposalStatus
 from .backup import backup_state, restorable, rollback_guidance, verify_backup
 from .brokered_transport import BrokeredTransport
-from .budgets import BudgetLedger, BudgetPolicy
+from .budgets import DEFAULT_BUDGETS, BudgetLedger, BudgetPolicy
 from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
 from .discord_policy import (
@@ -106,6 +107,86 @@ from .workflows import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GuardedTransport:
+    """One transport, counted. Everything through it spends and reports.
+
+    The Google adapter does not go through the broker, so it needs the same
+    chokepoint somewhere of its own. Wrapping the transport rather than the
+    adapter keeps both the routine path and the approval executor counted,
+    because both of them ultimately make a request through this.
+    """
+
+    def __init__(
+        self,
+        transport: Transport,
+        *,
+        permit: Callable[[str], None],
+        record: Callable[[bool], None],
+    ) -> None:
+        self.transport = transport
+        self.permit = permit
+        self.record = record
+
+    def __repr__(self) -> str:
+        return f"GuardedTransport({self.transport!r})"
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        query: Mapping[str, object] | None = None,
+        json_body: Mapping[str, object] | None = None,
+        attachment: Attachment | None = None,
+        text: bool = False,
+    ) -> HttpResponse:
+        # A write is anything that is not a read, decided from the method
+        # rather than from a name a caller chose.
+        self.permit("provider_read" if method == "GET" else "workspace_write")
+        try:
+            response = self.transport.request(
+                method,
+                url,
+                headers=headers,
+                query=query,
+                json_body=json_body,
+                attachment=attachment,
+                text=text,
+            )
+        except Exception:
+            self.record(False)
+            raise
+        self.record(200 <= response.status < 300)
+        return response
+
+
+#: Which budget one provider operation spends from. Reads are one pool, writes
+#: another, and anything that reaches a person outside the deployment its own.
+_BUDGET_ACTIONS: Mapping[str, str] = {
+    "ghl.send_sms": "external_send",
+    "trello.create_card": "card_write",
+    "trello.update_card": "card_write",
+    "trello.move_card": "card_write",
+    "trello.archive_card": "card_write",
+    "trello.set_custom_field": "card_write",
+}
+
+
+def _budget_action(operation: str) -> str:
+    """The budget an operation spends from, defaulting to a read.
+
+    A caller that already knows which budget it means -- the Workspace wrapper,
+    which has no broker operation id to map -- passes that name straight
+    through rather than having it silently turned back into a read.
+    """
+
+    if operation in DEFAULT_BUDGETS:
+        return operation
+    return _BUDGET_ACTIONS.get(operation, "provider_read")
+
 
 #: How much of the run ledger one supervision pass walks, and in what pages.
 #: Bounded so a very large ledger cannot make one pass take forever, and paged
@@ -552,8 +633,13 @@ class Runtime:
             )
             self.google_connected[role] = linked
             if linked and scope is not None:
+                # Counted on the way out, like every other provider. The
+                # guard is on the transport rather than the adapter so that
+                # the approval executor is counted too, not just routine work.
                 self.google_adapters[role] = GoogleWorkspaceAdapter(
-                    transport, self._google_token_provider(role), scope
+                    self._guarded(transport, self.config.principal_for(role)),
+                    self._google_token_provider(role),
+                    scope,
                 )
         self.connected["google_workspace"] = any(self.google_connected.values())
         self.state_dir = state_dir
@@ -572,7 +658,13 @@ class Runtime:
         # being repeated into a second card or a second message.
         self.workflow_runs.recover_interrupted()
         self.workflow_runner = Runner(self.workflow_runs, self._run_workflow_step)
-        self.budgets = BudgetLedger(state_dir / "budgets.db", BudgetPolicy.from_mapping({}))
+        # Read from the deployment's own configuration rather than built from
+        # nothing. A file the runtime account could write would not be a limit,
+        # so one is refused; an absent file means the declared defaults.
+        self.budgets = BudgetLedger(
+            state_dir / "budgets.db",
+            BudgetPolicy.load(state_dir / "budgets.json", owner_uid=os.getuid()),
+        )
         self.budgets.initialize()
         self.supervisor = Supervisor(state_dir)
         self.incidents = IncidentLog(state_dir / "incidents.json")
@@ -1029,11 +1121,16 @@ class Runtime:
             }
         raise ValueError("maintenance action is not permitted")
 
-    def advance_workflow_runs(self) -> dict[str, int]:
+    def advance_workflow_runs(self, *, at: datetime | None = None) -> dict[str, int]:
         """One supervision pass over every client user's workflows.
 
         Two things happen here and nothing else: a scheduled workflow whose
         window has come is started, and a run that is open is carried forward.
+
+        `at` exists so a test can name the moment. The pass is otherwise
+        wall-clock driven, and a schedule with quiet hours behaves differently
+        depending on the time of day -- which is correct in production and
+        makes a test that does not say when it is running fail at night.
         Both are safe to repeat, because the window is the run's identity and a
         finished step is never claimed twice — so a pass that ran a second time,
         or a restart in the middle of one, does no work over again.
@@ -1051,7 +1148,7 @@ class Runtime:
             for workflow in self.workflows.list(role):
                 if workflow.state is not WorkflowState.ACTIVE:
                     continue
-                trigger = due_trigger(workflow, datetime.now(UTC))
+                trigger = due_trigger(workflow, at or datetime.now(UTC))
                 if trigger is None or self.workflow_runs.find(workflow, trigger) is not None:
                     # Not due, or this window's run already exists. The loop
                     # comes round every second; a window is what stops that
@@ -1177,7 +1274,56 @@ class Runtime:
         operator's connector before.
         """
 
-        return BrokeredTransport(self.provider_broker, provenance=principal.citation())
+        return BrokeredTransport(
+            self.provider_broker,
+            provenance=principal.citation(),
+            guard=lambda provider, operation: self._permit(principal, provider, operation),
+            record=self._record_provider,
+        )
+
+    def _guarded(self, transport: Transport, actor: Principal) -> GuardedTransport:
+        """That transport, counted against that person's own budget."""
+
+        def permit(action: str) -> None:
+            self._permit(actor, "google_workspace", action)
+
+        def record(ok: bool) -> None:
+            self._record_provider("google_workspace", ok)
+
+        return GuardedTransport(transport, permit=permit, record=record)
+
+    def permit(self, principal: Principal, provider: str, operation: str) -> None:
+        """Public for the wrappers that guard adapters this runtime builds."""
+
+        self._permit(principal, provider, operation)
+
+    def record_provider(self, provider: str, ok: bool) -> None:
+        self._record_provider(provider, ok)
+
+    def _permit(self, principal: Principal, provider: str, operation: str) -> None:
+        """May this exact person make this exact call, right now?
+
+        One place, asked by the transport itself, so a call site that forgets
+        cannot exist. The breaker is checked first: a provider that has been
+        failing is not somewhere to spend a budget.
+        """
+
+        breaker = self.budgets.breaker(provider)
+        if breaker.open:
+            raise PermissionError(
+                f"{provider} has been failing, so calls to it are paused: {breaker.reason}"
+            )
+        decision = self.budgets.spend(principal, _budget_action(operation))
+        if not decision.allowed:
+            raise PermissionError(decision.reason)
+
+    def _record_provider(self, provider: str, ok: bool) -> None:
+        """What became of one call, recorded where the breakers can see it."""
+
+        if ok:
+            self.budgets.record_success(provider)
+        else:
+            self.budgets.record_failure(provider)
 
     def _reaches(self, principal: Principal, provider: str) -> bool:
         """Whether this exact person has a usable route to that provider.

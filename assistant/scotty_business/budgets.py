@@ -16,6 +16,7 @@ configuration that would remove a limit is refused.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -98,6 +99,35 @@ class BudgetPolicy:
     breaker_threshold: int
     breaker_cooldown: timedelta
     retention_days: int
+
+    @classmethod
+    def load(cls, path: Path | str, *, owner_uid: int | None = None) -> BudgetPolicy:
+        """Read the configured budgets, or use the declared defaults.
+
+        The runtime built its policy from an empty mapping, so this file was
+        never read at all and the defaults were the only limits that existed --
+        which was invisible, because the defaults are reasonable.
+
+        A file the model-facing account could write is not a limit, so when the
+        deployment says which account that is, a writable file is refused
+        rather than trusted.
+        """
+
+        target = Path(path)
+        if target.is_symlink():
+            raise BudgetError("the budget configuration path is unsafe")
+        if not target.is_file():
+            return cls.from_mapping({})
+        metadata = target.stat()
+        if owner_uid is not None and (metadata.st_uid == owner_uid or metadata.st_mode & 0o022):
+            raise BudgetError(
+                "the budget configuration is writable by the runtime, so it is not a limit"
+            )
+        try:
+            raw = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BudgetError("the budget configuration could not be read") from exc
+        return cls.from_mapping(raw)
 
     @classmethod
     def from_mapping(cls, raw: object) -> BudgetPolicy:

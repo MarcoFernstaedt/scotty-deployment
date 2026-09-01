@@ -16,10 +16,18 @@ nothing, because nothing here is trusted over there.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from .adapters.http import AmbiguousEffectError, HttpResponse, ProviderError
+
+#: Asked before every request: may this happen at all? It raises when not, so a
+#: caller cannot proceed by ignoring a return value.
+Guard = Callable[[str, str], None]
+
+#: Told after every request: did it work? Drives the provider breakers without
+#: anybody at a call site having to remember.
+Record = Callable[[str, bool], None]
 
 #: The provider hosts the adapters may name at all.
 _HOSTS: Mapping[str, str] = {
@@ -96,9 +104,21 @@ class BrokeredTransport:
     answer for work nobody asked for.
     """
 
-    def __init__(self, broker: object, *, provenance: Mapping[str, object] | None = None):
+    def __init__(
+        self,
+        broker: object,
+        *,
+        provenance: Mapping[str, object] | None = None,
+        guard: Guard | None = None,
+        record: Record | None = None,
+    ):
         self.broker = broker
         self.provenance = dict(provenance) if provenance else None
+        # Every request this transport makes passes the guard first and reports
+        # its outcome after. Putting both here rather than at each call site is
+        # the point: a call site that forgets is a limit that does not exist.
+        self.guard = guard
+        self.record = record
 
     def _route(self, method: str, path: str) -> _Route | None:
         for route in _ROUTES:
@@ -142,16 +162,32 @@ class BrokeredTransport:
         for name, value in (json_body or {}).items():
             arguments[name] = value
 
-        reply = self.broker.execute(  # type: ignore[attr-defined]
-            route.operation, arguments, provenance=self.provenance
-        )
+        provider = route.operation.split(".", 1)[0]
+        if self.guard is not None:
+            # Refused before anything leaves. A budget checked after the call
+            # is a count of what already happened.
+            self.guard(provider, route.operation)
+        try:
+            reply = self.broker.execute(  # type: ignore[attr-defined]
+                route.operation, arguments, provenance=self.provenance
+            )
+        except Exception:
+            self._record(provider, ok=False)
+            raise
         if reply is None:
             # The broker did not answer, so what the provider did is unknown.
+            self._record(provider, ok=False)
             raise AmbiguousEffectError("provider outcome is unknown; reconcile before any retry")
         status = reply.get("status")
         if not isinstance(status, int):
+            self._record(provider, ok=False)
             raise ProviderError(str(reply.get("state") or "provider request was refused"))
+        self._record(provider, ok=200 <= status < 300)
         return HttpResponse(status=status, headers={}, body=reply.get("body"))
+
+    def _record(self, provider: str, *, ok: bool) -> None:
+        if self.record is not None:
+            self.record(provider, ok)
 
 
 __all__ = ["BrokeredTransport"]
