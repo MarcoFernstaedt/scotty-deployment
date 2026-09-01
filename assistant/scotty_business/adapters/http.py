@@ -50,6 +50,7 @@ class Transport(Protocol):
         query: Mapping[str, object] | None = None,
         json_body: Mapping[str, object] | None = None,
         attachment: Attachment | None = None,
+        text: bool = False,
     ) -> HttpResponse: ...
 
 
@@ -77,6 +78,7 @@ class HttpTransport:
         query: Mapping[str, object] | None = None,
         json_body: Mapping[str, object] | None = None,
         attachment: Attachment | None = None,
+        text: bool = False,
     ) -> HttpResponse:
         upper = method.upper()
         if upper not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
@@ -101,7 +103,9 @@ class HttpTransport:
             if len(body_bytes) > 65_536:
                 raise ProviderError("provider request body exceeds the limit")
             request_headers["Content-Type"] = "application/json"
-        request_headers.setdefault("Accept", "application/json")
+        # A file export or download is text, not JSON, so it is decoded rather
+        # than parsed. Everything else still requires well-formed JSON.
+        request_headers.setdefault("Accept", "*/*" if text else "application/json")
         # The scheme and authority were parsed and restricted to HTTPS above.
         request = urllib.request.Request(  # noqa: S310
             url, data=body_bytes, headers=request_headers, method=upper
@@ -114,7 +118,7 @@ class HttpTransport:
                 return HttpResponse(
                     status=int(response.status),
                     headers={key.lower(): value for key, value in response.headers.items()},
-                    body=_parse_json(raw),
+                    body=_decode_text(raw) if text else _parse_json(raw),
                 )
         except urllib.error.HTTPError as exc:
             raw = exc.read(self.max_response_bytes + 1)
@@ -129,6 +133,13 @@ class HttpTransport:
                     "provider mutation outcome is unknown; reconcile before any retry"
                 ) from None
             raise ProviderError("provider read failed") from None
+
+
+def _decode_text(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProviderError("provider returned content that is not text") from exc
 
 
 def _parse_json(raw: bytes) -> object:

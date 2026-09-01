@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -490,6 +490,112 @@ def check_provider_guidance() -> None:
     )
 
 
+def check_google_action_bounds() -> None:
+    """Bulk, destructive and sharing writes reach the approval ledger."""
+
+    from assistant.scotty_business.google_policy import (
+        MAX_DOCS_REQUESTS,
+        MAX_SHEETS_RANGES,
+        GoogleActionClass,
+        classify_google_action,
+    )
+
+    bounded: dict[str, object] = {
+        "requests": [{"insertText": {}} for _ in range(MAX_DOCS_REQUESTS)]
+    }
+    check(
+        "a small bounded document edit stays routine",
+        classify_google_action("docs_batch_update", bounded) is GoogleActionClass.ROUTINE,
+    )
+    for label, operation, payload in (
+        (
+            "an oversized document batch",
+            "docs_batch_update",
+            {"requests": [{"insertText": {}} for _ in range(MAX_DOCS_REQUESTS + 1)]},
+        ),
+        (
+            "an oversized values update",
+            "sheets_update_values",
+            {"data": [{"range": f"A{n}"} for n in range(MAX_SHEETS_RANGES + 1)]},
+        ),
+        ("a destructive batch request", "sheets_batch_update", {"requests": [{"deleteSheet": {}}]}),
+        ("a sharing change", "drive_update_file", {"permissions": [{"type": "anyone"}]}),
+    ):
+        check(
+            f"{label} requires approval",
+            classify_google_action(operation, payload) is GoogleActionClass.CONSEQUENCE,
+        )
+    for label, operation in (
+        ("an admin action", "admin_change_user"),
+        ("a credential action", "credential_rotate"),
+        ("an unknown action", "drive_delete"),
+    ):
+        check(
+            f"{label} fails closed",
+            classify_google_action(operation, {}) is GoogleActionClass.FORBIDDEN,
+        )
+
+
+def check_google_read_bounds() -> None:
+    """Bounded reads validate their arguments before any provider call."""
+
+    from assistant.scotty_business.adapters.google_workspace import (
+        MAX_SHEETS_READ_RANGES,
+        GoogleWorkspaceAdapter,
+    )
+    from assistant.scotty_business.adapters.http import (
+        Attachment,
+        HttpResponse,
+        ProviderError,
+    )
+    from assistant.scotty_business.config import RuntimeConfig
+
+    class RefusingTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: Mapping[str, str] | None = None,
+            query: Mapping[str, object] | None = None,
+            json_body: Mapping[str, object] | None = None,
+            attachment: Attachment | None = None,
+            text: bool = False,
+        ) -> HttpResponse:
+            self.calls += 1
+            raise AssertionError("a bounded read must validate before calling out")
+
+    fixture = json.loads(
+        (ROOT / "fixtures" / "scotty.private.example.json").read_text(encoding="utf-8")
+    )
+    scope = RuntimeConfig.from_mapping(fixture).google_workspace
+    assert scope is not None
+    transport = RefusingTransport()
+    adapter = GoogleWorkspaceAdapter(transport, "synthetic-access-token", scope)
+
+    calls: tuple[tuple[str, Callable[[], object]], ...] = (
+        ("a malformed spreadsheet range", lambda: adapter.get_sheet_values("sheet-1", "A1; DROP")),
+        ("an empty range batch", lambda: adapter.batch_get_sheet_values("sheet-1", [])),
+        (
+            "an oversized range batch",
+            lambda: adapter.batch_get_sheet_values(
+                "sheet-1", [f"A{n}" for n in range(MAX_SHEETS_READ_RANGES + 1)]
+            ),
+        ),
+    )
+    for label, call in calls:
+        refused = False
+        try:
+            call()
+        except ProviderError:
+            refused = True
+        check(f"{label} is refused", refused)
+    check("no bounded read reached the transport", transport.calls == 0)
+
+
 class SyntheticDiscord:
     """Synthetic Discord REST double. No socket is ever opened."""
 
@@ -636,6 +742,8 @@ def main() -> int:
     check_fixed_paths(runtime_config)
     check_employee_denial(runtime_config)
     check_provider_guidance()
+    check_google_action_bounds()
+    check_google_read_bounds()
     check_codex_and_optional_providers(runtime_config)
     check_provisioning(runtime_config)
     check_secrecy(runtime_config)

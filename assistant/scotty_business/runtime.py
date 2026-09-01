@@ -216,6 +216,15 @@ class UnconnectedProvider:
     def get_spreadsheet(self, spreadsheet_id: str) -> ProviderRecord:
         raise self._deny()
 
+    def read_drive_file(self, file_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def get_sheet_values(self, spreadsheet_id: str, range_: str) -> ProviderRecord:
+        raise self._deny()
+
+    def batch_get_sheet_values(self, spreadsheet_id: str, ranges: Sequence[str]) -> ProviderRecord:
+        raise self._deny()
+
     def get_google_contact(self, resource_name: str) -> ProviderRecord:
         raise self._deny()
 
@@ -554,6 +563,20 @@ class Runtime:
                     raise ValueError("calendar event resource must be calendar/event")
                 calendar_id, event_id = resource_id.split("/", 1)
                 return _record_json(self.google_workspace.get_calendar_event(calendar_id, event_id))
+            if google_operation == "read_drive_file":
+                return _record_json(self.google_workspace.read_drive_file(resource_id))
+            if google_operation == "get_sheet_values":
+                target = payload.get("range")
+                if type(target) is not str:
+                    raise ValueError("spreadsheet range is malformed")
+                return _record_json(self.google_workspace.get_sheet_values(resource_id, target))
+            if google_operation == "batch_get_sheet_values":
+                ranges = payload.get("ranges")
+                if not isinstance(ranges, list):
+                    raise ValueError("spreadsheet ranges are malformed")
+                return _record_json(
+                    self.google_workspace.batch_get_sheet_values(resource_id, ranges)
+                )
             if google_operation == "list_contacts":
                 maximum = payload.get("max_results", 100)
                 if type(maximum) is not int:

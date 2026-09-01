@@ -66,6 +66,58 @@ _TARGET_LIST_FIELDS = frozenset(
 #: More than this many named targets in one action is bulk mutation.
 BULK_TARGET_THRESHOLD = 25
 
+#: Operation-aware ceilings on the units each operation actually affects. A
+#: small bounded edit stays routine; past the ceiling the edit is bulk and goes
+#: to the approval ledger like any other high-impact mutation.
+MAX_DOCS_REQUESTS = 25
+MAX_SHEETS_REQUESTS = 25
+MAX_SHEETS_RANGES = 10
+MAX_SHEETS_CELLS = 5_000
+MAX_DRIVE_PARENTS = 5
+MAX_CONTACT_ENTRIES = 25
+
+#: Batch request kinds that remove content or structure rather than add it.
+_DESTRUCTIVE_REQUESTS = frozenset(
+    {
+        "deleteContentRange",
+        "deleteFooter",
+        "deleteHeader",
+        "deleteNamedRange",
+        "deletePositionedObject",
+        "deleteTableColumn",
+        "deleteTableRow",
+        "deleteBanding",
+        "deleteConditionalFormatRule",
+        "deleteDeveloperMetadata",
+        "deleteDimension",
+        "deleteDimensionGroup",
+        "deleteDuplicates",
+        "deleteEmbeddedObject",
+        "deleteFilterView",
+        "deleteProtectedRange",
+        "deleteRange",
+        "deleteSheet",
+        "cutPaste",
+        "randomizeRange",
+    }
+)
+
+#: Anything naming sharing or access, wherever it appears in a payload.
+_PERMISSION_FIELDS = frozenset(
+    {
+        "permissions",
+        "permissionIds",
+        "permissionId",
+        "role",
+        "sharingUser",
+        "writersCanShare",
+        "copyRequiresWriterPermission",
+        "viewersCanCopyContent",
+        "addProtectedRange",
+        "updateProtectedRange",
+    }
+)
+
 #: A payload larger or deeper than this is not a bounded Scotty action.
 MAX_PAYLOAD_BYTES = 262_144
 MAX_PAYLOAD_DEPTH = 12
@@ -111,6 +163,68 @@ def _contains_field(value: object, fields: frozenset[str], depth: int = 0) -> bo
     return False
 
 
+def _sequence(value: object) -> Sequence[object]:
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return value
+    return ()
+
+
+def _sheets_cells(payload: Mapping[str, object]) -> int:
+    """Total cells a values update would write across every named range."""
+
+    total = 0
+    for entry in _sequence(payload.get("data")):
+        if not isinstance(entry, Mapping):
+            continue
+        for row in _sequence(entry.get("values")):
+            total += max(len(_sequence(row)), 1)
+    for row in _sequence(payload.get("values")):
+        total += max(len(_sequence(row)), 1)
+    return total
+
+
+def affected_units(
+    operation: str, payload: Mapping[str, object]
+) -> tuple[tuple[str, int, int], ...]:
+    """Report (unit, count, limit) for every unit this operation affects."""
+
+    counts: list[tuple[str, int, int]] = []
+    if operation == "docs_batch_update":
+        counts.append(("requests", len(_sequence(payload.get("requests"))), MAX_DOCS_REQUESTS))
+    elif operation == "sheets_batch_update":
+        counts.append(("requests", len(_sequence(payload.get("requests"))), MAX_SHEETS_REQUESTS))
+    elif operation == "sheets_update_values":
+        counts.append(("ranges", len(_sequence(payload.get("data"))), MAX_SHEETS_RANGES))
+        counts.append(("cells", _sheets_cells(payload), MAX_SHEETS_CELLS))
+    elif operation in {"drive_move_file", "drive_update_file", "drive_create_file"}:
+        parents = 0
+        for field in ("addParents", "removeParents", "parents"):
+            value = payload.get(field)
+            if type(value) is str:
+                parents = max(parents, len([item for item in value.split(",") if item]))
+            else:
+                parents = max(parents, len(_sequence(value)))
+        counts.append(("parents", parents, MAX_DRIVE_PARENTS))
+    elif operation in {"contacts_create", "contacts_update"}:
+        entries = max(
+            (len(_sequence(value)) for value in payload.values() if not isinstance(value, str)),
+            default=0,
+        )
+        counts.append(("entries", entries, MAX_CONTACT_ENTRIES))
+    return tuple(counts)
+
+
+def _has_destructive_request(payload: Mapping[str, object]) -> bool:
+    """Whether any batch request removes content or structure."""
+
+    for request in _sequence(payload.get("requests")):
+        if isinstance(request, Mapping) and _DESTRUCTIVE_REQUESTS & {
+            key for key in request if type(key) is str
+        }:
+            return True
+    return False
+
+
 def _payload_bytes(payload: Mapping[str, object]) -> int | None:
     """Serialized payload size, or None when the payload is not serializable."""
 
@@ -124,10 +238,13 @@ def classify_google_action(operation: object, payload: object) -> GoogleActionCl
     """Classify one exact Workspace action before any provider call.
 
     Broad OAuth consent is not autonomous authority. Administrative, credential,
-    billing, oversized, and unknown actions stay absent and fail closed. Bulk is
-    measured by how many targets one action names, not by how many edits it
-    makes inside a single resource, so ordinary document and spreadsheet work
-    does not repeatedly require approval.
+    billing, oversized, and unknown actions stay absent and fail closed.
+
+    Bulk is measured two ways, because both matter: how many separate targets an
+    action names, and how many units it changes inside one resource. A small
+    bounded edit to a document or sheet stays routine so ordinary work is not
+    interrupted; a large batch, a destructive batch request, or anything naming
+    sharing or access goes to the approval ledger.
     """
 
     if type(operation) is not str or not isinstance(payload, Mapping):
@@ -146,6 +263,14 @@ def classify_google_action(operation: object, payload: object) -> GoogleActionCl
     if operation in CONSEQUENCE_GOOGLE_OPERATIONS:
         return GoogleActionClass.CONSEQUENCE
     if targets > BULK_TARGET_THRESHOLD:
+        return GoogleActionClass.CONSEQUENCE
+    if _contains_field(payload, _PERMISSION_FIELDS):
+        # Sharing and access changes are gated wherever they appear, not only
+        # through the dedicated permissions operation.
+        return GoogleActionClass.CONSEQUENCE
+    if _has_destructive_request(payload):
+        return GoogleActionClass.CONSEQUENCE
+    if any(count > limit for _, count, limit in affected_units(operation, payload)):
         return GoogleActionClass.CONSEQUENCE
     if operation.startswith("calendar_") and _contains_field(payload, _NEW_AUDIENCE_FIELDS):
         return GoogleActionClass.CONSEQUENCE

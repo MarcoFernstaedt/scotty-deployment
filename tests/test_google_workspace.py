@@ -185,7 +185,7 @@ class GoogleConsequenceClassificationTests(unittest.TestCase):
 
     def test_a_bulk_target_list_is_consequence_gated_not_routine(self) -> None:
         klass = self.klass()
-        for field in ("ids", "messageIds", "fileIds", "resourceNames", "permissions"):
+        for field in ("ids", "messageIds", "fileIds", "resourceNames"):
             with self.subTest(field=field):
                 self.assertEqual(
                     self.classify("gmail_modify_labels", {field: [f"id-{n}" for n in range(200)]}),
@@ -196,21 +196,106 @@ class GoogleConsequenceClassificationTests(unittest.TestCase):
                     klass.ROUTINE,
                 )
 
-    def test_ordinary_single_resource_editing_stays_routine_at_any_edit_count(self) -> None:
+    def test_a_permissions_list_is_gated_at_any_size(self) -> None:
+        """Sharing is never a question of volume, so no small list is routine."""
+
         klass = self.klass()
-        self.assertEqual(
-            self.classify(
-                "docs_batch_update", {"requests": [{"insertText": {}} for _ in range(400)]}
-            ),
-            klass.ROUTINE,
+        for entries in (["id-1"], [f"id-{n}" for n in range(200)]):
+            with self.subTest(count=len(entries)):
+                self.assertEqual(
+                    self.classify("drive_update_file", {"permissions": entries}),
+                    klass.CONSEQUENCE,
+                )
+
+    def test_a_small_bounded_edit_stays_routine_up_to_its_limit(self) -> None:
+        from assistant.scotty_business.google_policy import (
+            MAX_DOCS_REQUESTS,
+            MAX_SHEETS_RANGES,
+            MAX_SHEETS_REQUESTS,
         )
-        self.assertEqual(
-            self.classify(
+
+        klass = self.klass()
+        for operation, payload in (
+            (
+                "docs_batch_update",
+                {"requests": [{"insertText": {}} for _ in range(MAX_DOCS_REQUESTS)]},
+            ),
+            (
+                "sheets_batch_update",
+                {"requests": [{"updateCells": {}} for _ in range(MAX_SHEETS_REQUESTS)]},
+            ),
+            (
                 "sheets_update_values",
-                {"valueInputOption": "RAW", "data": [{"range": f"A{n}"} for n in range(80)]},
+                {
+                    "valueInputOption": "RAW",
+                    "data": [{"range": f"A{n}"} for n in range(MAX_SHEETS_RANGES)],
+                },
             ),
-            klass.ROUTINE,
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(self.classify(operation, payload), klass.ROUTINE)
+
+    def test_one_unit_past_the_limit_becomes_consequence_gated(self) -> None:
+        from assistant.scotty_business.google_policy import (
+            MAX_DOCS_REQUESTS,
+            MAX_SHEETS_CELLS,
+            MAX_SHEETS_RANGES,
+            MAX_SHEETS_REQUESTS,
         )
+
+        klass = self.klass()
+        oversized_rows = [["x"] for _ in range(MAX_SHEETS_CELLS + 1)]
+        for operation, payload in (
+            (
+                "docs_batch_update",
+                {"requests": [{"insertText": {}} for _ in range(MAX_DOCS_REQUESTS + 1)]},
+            ),
+            (
+                "sheets_batch_update",
+                {"requests": [{"updateCells": {}} for _ in range(MAX_SHEETS_REQUESTS + 1)]},
+            ),
+            (
+                "sheets_update_values",
+                {
+                    "valueInputOption": "RAW",
+                    "data": [{"range": f"A{n}"} for n in range(MAX_SHEETS_RANGES + 1)],
+                },
+            ),
+            (
+                "sheets_update_values",
+                {
+                    "valueInputOption": "RAW",
+                    "data": [{"range": "A1:A", "values": oversized_rows}],
+                },
+            ),
+        ):
+            with self.subTest(operation=operation, units=len(str(payload))):
+                self.assertEqual(self.classify(operation, payload), klass.CONSEQUENCE)
+
+    def test_a_destructive_request_inside_a_batch_is_consequence_gated(self) -> None:
+        klass = self.klass()
+        for operation, request in (
+            ("docs_batch_update", {"deleteContentRange": {"range": {}}}),
+            ("docs_batch_update", {"deleteTableRow": {}}),
+            ("sheets_batch_update", {"deleteSheet": {"sheetId": 0}}),
+            ("sheets_batch_update", {"deleteDimension": {}}),
+            ("sheets_batch_update", {"deleteRange": {}}),
+        ):
+            with self.subTest(request=next(iter(request))):
+                self.assertEqual(
+                    self.classify(operation, {"requests": [request]}), klass.CONSEQUENCE
+                )
+
+    def test_a_routine_write_that_touches_permissions_is_consequence_gated(self) -> None:
+        klass = self.klass()
+        for operation, payload in (
+            ("drive_update_file", {"permissions": [{"role": "reader", "type": "anyone"}]}),
+            ("drive_create_file", {"name": "notes", "permissionIds": ["anyone"]}),
+            ("drive_update_file", {"metadata": {"permissions": [{"type": "anyone"}]}}),
+            ("drive_update_file", {"writersCanShare": True}),
+        ):
+            with self.subTest(operation=operation):
+                self.assertEqual(self.classify(operation, payload), klass.CONSEQUENCE)
 
     def test_a_nested_new_audience_is_still_consequence_gated(self) -> None:
         klass = self.klass()
@@ -394,6 +479,195 @@ class GoogleRequestShapeTests(AdapterHarness):
                     self.assertNotIsInstance(value, bool)
         self.assertEqual(transport.calls[0][2]["singleEvents"], "true")
         self.assertEqual(transport.calls[-1][2]["includeGridData"], "false")
+
+
+class BoundedGoogleReadTests(unittest.TestCase):
+    """Drive content and Sheets values must be typed, validated, and bounded."""
+
+    def adapter(self, routes):
+        from assistant.scotty_business.adapters.google_workspace import GoogleWorkspaceAdapter
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        calls: list[tuple[str, object, bool]] = []
+
+        class Transport:
+            def request(self, method, url, *, headers=None, query=None, json_body=None, text=False):
+                calls.append((url, query, text))
+                for suffix, response in routes.items():
+                    if suffix in url:
+                        return response
+                return HttpResponse(200, {}, {})
+
+        config = RuntimeConfig.from_mapping(
+            synthetic.private_mapping(google_workspace=GOOGLE_SCOPE)
+        )
+        assert config.google_workspace is not None
+        return (
+            GoogleWorkspaceAdapter(Transport(), "synthetic-access-token", config.google_workspace),
+            calls,
+        )
+
+    def metadata(self, mime, size=None):
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        body = {"id": "file-1", "name": "Notes", "mimeType": mime, "etag": "etag-1"}
+        if size is not None:
+            body["size"] = size
+        return HttpResponse(200, {}, body)
+
+    def test_a_google_native_document_is_exported_to_bounded_text(self) -> None:
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        adapter, calls = self.adapter(
+            {
+                "/files/file-1/export": HttpResponse(200, {}, "synthetic body"),
+                "/files/file-1": self.metadata("application/vnd.google-apps.document"),
+            }
+        )
+        record = adapter.read_drive_file("file-1")
+        self.assertEqual(record.fields["text"], "synthetic body")
+        self.assertEqual(record.fields["readAs"], "text/plain")
+        export = next(call for call in calls if "export" in call[0])
+        self.assertEqual(export[1]["mimeType"], "text/plain")
+        self.assertTrue(export[2], "an export must be read as text, not parsed as JSON")
+
+    def test_a_stored_text_file_is_downloaded_with_alt_media(self) -> None:
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        adapter, calls = self.adapter({"/files/file-1": self.metadata("text/csv", size="12")})
+        # The metadata read and the content read share a URL prefix, so the
+        # content route is resolved by the alt=media query rather than the path.
+        adapter.transport = _SequencedTransport(
+            [self.metadata("text/csv", size="12"), HttpResponse(200, {}, "a,b\n1,2")]
+        )
+        record = adapter.read_drive_file("file-1")
+        self.assertEqual(record.fields["text"], "a,b\n1,2")
+        self.assertEqual(adapter.transport.calls[-1][1]["alt"], "media")
+
+    def test_an_unsupported_file_type_is_refused_explicitly(self) -> None:
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        for mime in ("image/png", "application/pdf", "application/octet-stream", ""):
+            with self.subTest(mime=mime):
+                adapter, _ = self.adapter({"/files/file-1": self.metadata(mime)})
+                with self.assertRaises(ProviderError):
+                    adapter.read_drive_file("file-1")
+
+    def test_an_oversize_file_is_refused_before_it_is_downloaded(self) -> None:
+        from assistant.scotty_business.adapters.google_workspace import MAX_DRIVE_TEXT_BYTES
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        adapter, calls = self.adapter(
+            {"/files/file-1": self.metadata("text/plain", size=str(MAX_DRIVE_TEXT_BYTES + 1))}
+        )
+        with self.assertRaises(ProviderError):
+            adapter.read_drive_file("file-1")
+        self.assertEqual(len(calls), 1, "only the metadata read may happen")
+
+    def test_an_oversize_body_is_refused_even_when_metadata_understated_it(self) -> None:
+        from assistant.scotty_business.adapters.google_workspace import MAX_DRIVE_TEXT_BYTES
+        from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
+
+        adapter, _ = self.adapter({})
+        adapter.transport = _SequencedTransport(
+            [
+                self.metadata("text/plain", size="10"),
+                HttpResponse(200, {}, "x" * (MAX_DRIVE_TEXT_BYTES + 1)),
+            ]
+        )
+        with self.assertRaises(ProviderError):
+            adapter.read_drive_file("file-1")
+
+    def test_a_malformed_content_or_metadata_response_is_refused(self) -> None:
+        from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
+
+        adapter, _ = self.adapter({})
+        adapter.transport = _SequencedTransport(
+            [self.metadata("text/plain"), HttpResponse(200, {}, {"not": "text"})]
+        )
+        with self.assertRaises(ProviderError):
+            adapter.read_drive_file("file-1")
+
+        other, _ = self.adapter({"/files/file-1": HttpResponse(200, {}, {"id": "file-1"})})
+        with self.assertRaises(ProviderError):
+            other.read_drive_file("file-1")
+
+    def test_one_validated_range_of_values_is_read(self) -> None:
+        from assistant.scotty_business.adapters.http import HttpResponse
+
+        adapter, calls = self.adapter(
+            {
+                "/values/": HttpResponse(
+                    200, {}, {"range": "Sheet1!A1:B2", "values": [["a", "b"], ["1", "2"]]}
+                )
+            }
+        )
+        record = adapter.get_sheet_values("sheet-1", "Sheet1!A1:B2")
+        self.assertEqual(record.fields["values"], [["a", "b"], ["1", "2"]])
+        self.assertIn("Sheet1%21A1%3AB2", calls[-1][0])
+
+    def test_a_malformed_range_never_reaches_the_transport(self) -> None:
+        from assistant.scotty_business.adapters.http import ProviderError
+
+        adapter, calls = self.adapter({})
+        for bad in ("", "A1; DROP", "Sheet1!A1:B2:C3", "../secret", "A" * 300, 7, None):
+            with self.subTest(range=bad), self.assertRaises(ProviderError):
+                adapter.get_sheet_values("sheet-1", bad)
+        self.assertEqual(calls, [])
+
+    def test_a_bounded_batch_of_ranges_is_read_and_an_unbounded_one_refused(self) -> None:
+        from assistant.scotty_business.adapters.google_workspace import MAX_SHEETS_READ_RANGES
+        from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
+
+        adapter, calls = self.adapter(
+            {
+                "values:batchGet": HttpResponse(
+                    200,
+                    {},
+                    {"valueRanges": [{"range": "Sheet1!A1", "values": [["a"]]}]},
+                )
+            }
+        )
+        record = adapter.batch_get_sheet_values("sheet-1", ["Sheet1!A1", "Sheet1!B1"])
+        self.assertEqual(len(record.fields["valueRanges"]), 1)
+        self.assertEqual(calls[-1][1]["ranges"], ["Sheet1!A1", "Sheet1!B1"])
+
+        for ranges in ([], [f"A{n}" for n in range(MAX_SHEETS_READ_RANGES + 1)], "A1", None):
+            with self.subTest(ranges=ranges), self.assertRaises(ProviderError):
+                adapter.batch_get_sheet_values("sheet-1", ranges)
+
+    def test_an_oversize_or_malformed_values_response_is_refused(self) -> None:
+        from assistant.scotty_business.adapters.google_workspace import MAX_SHEETS_READ_CELLS
+        from assistant.scotty_business.adapters.http import HttpResponse, ProviderError
+
+        huge = [["x"] for _ in range(MAX_SHEETS_READ_CELLS + 1)]
+        for body in (
+            {"range": "A1", "values": huge},
+            {"range": "A1", "values": "not a list"},
+            ["not", "an", "object"],
+        ):
+            with self.subTest(body=str(body)[:30]):
+                adapter, _ = self.adapter({"/values/": HttpResponse(200, {}, body)})
+                with self.assertRaises(ProviderError):
+                    adapter.get_sheet_values("sheet-1", "A1")
+
+        adapter, _ = self.adapter(
+            {"values:batchGet": HttpResponse(200, {}, {"valueRanges": "not a list"})}
+        )
+        with self.assertRaises(ProviderError):
+            adapter.batch_get_sheet_values("sheet-1", ["A1"])
+
+
+class _SequencedTransport:
+    """Returns scripted responses in order, recording each call."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls: list[tuple[str, object]] = []
+
+    def request(self, method, url, *, headers=None, query=None, json_body=None, text=False):
+        self.calls.append((url, query or {}))
+        return self.responses.pop(0)
 
 
 class GoogleScopeNormalizationTests(unittest.TestCase):
@@ -697,7 +971,7 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                 return (self._record("message-1"),)
 
             def __getattr__(self, name):
-                def getter(resource_id):
+                def getter(resource_id, *rest):
                     self.calls.append((name, resource_id))
                     return self._record(resource_id)
 
@@ -727,6 +1001,73 @@ class EmployeeWorkspaceAuthorityTests(unittest.TestCase):
                         },
                     )
             self.assertEqual(recorder.calls, [])
+
+    def test_the_new_bounded_reads_are_available_to_both_client_roles(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as runtime:
+            recorder = self.connect(runtime)
+            for role in (Role.EMPLOYEE, Role.MAIN_OPERATOR):
+                for operation, payload in (
+                    ("read_drive_file", {}),
+                    ("get_sheet_values", {"range": "Sheet1!A1:B2"}),
+                    ("batch_get_sheet_values", {"ranges": ["Sheet1!A1"]}),
+                ):
+                    with self.subTest(role=role, operation=operation):
+                        runtime.handle_read(
+                            self.principal(role),
+                            {
+                                "operation": "google_workspace",
+                                "google_operation": operation,
+                                "resource_id": "resource-1",
+                                "payload": payload,
+                            },
+                        )
+            self.assertEqual(len(recorder.calls), 6)
+
+    def test_a_malformed_range_argument_is_refused_by_the_runtime(self) -> None:
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as runtime:
+            recorder = self.connect(runtime)
+            for operation, payload in (
+                ("get_sheet_values", {}),
+                ("get_sheet_values", {"range": 7}),
+                ("batch_get_sheet_values", {}),
+                ("batch_get_sheet_values", {"ranges": "Sheet1!A1"}),
+            ):
+                with self.subTest(operation=operation), self.assertRaises(ValueError):
+                    runtime.handle_read(
+                        self.principal(Role.MAIN_OPERATOR),
+                        {
+                            "operation": "google_workspace",
+                            "google_operation": operation,
+                            "resource_id": "resource-1",
+                            "payload": payload,
+                        },
+                    )
+            self.assertEqual(recorder.calls, [])
+
+    def test_the_new_reads_report_not_connected_rather_than_failing_oddly(self) -> None:
+        from assistant.scotty_business.policy import Role
+        from assistant.scotty_business.runtime import ProviderNotConnected
+
+        with self.runtime() as runtime:
+            for operation, payload in (
+                ("read_drive_file", {}),
+                ("get_sheet_values", {"range": "A1"}),
+                ("batch_get_sheet_values", {"ranges": ["A1"]}),
+            ):
+                with self.subTest(operation=operation), self.assertRaises(ProviderNotConnected):
+                    runtime.handle_read(
+                        self.principal(Role.MAIN_OPERATOR),
+                        {
+                            "operation": "google_workspace",
+                            "google_operation": operation,
+                            "resource_id": "resource-1",
+                            "payload": payload,
+                        },
+                    )
 
     def test_an_employee_may_still_read_the_workspace(self) -> None:
         from assistant.scotty_business.policy import Role

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 from ..config import GoogleWorkspaceScope
 from ..google_oauth import GoogleOAuthError
@@ -64,6 +65,53 @@ def _text(value: object, field: str, *, limit: int = 1_000) -> str:
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ProviderError(f"{field} contains forbidden characters")
     return value
+
+
+#: Google-native documents have no bytes to download; they are exported to a
+#: bounded text form instead. Anything not named here is refused rather than
+#: guessed at.
+EXPORTABLE_GOOGLE_TYPES: Mapping[str, str] = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+    "application/vnd.google-apps.presentation": "text/plain",
+}
+
+#: Stored file types Scotty may read directly as text.
+READABLE_TEXT_TYPES = frozenset(
+    {
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "text/tab-separated-values",
+        "text/html",
+        "text/xml",
+        "application/json",
+        "application/xml",
+    }
+)
+
+#: Hard ceilings for one bounded read.
+MAX_DRIVE_TEXT_BYTES = 1_000_000
+MAX_SHEETS_READ_RANGES = 10
+MAX_SHEETS_READ_CELLS = 20_000
+
+#: A1 notation: an optional sheet name, then a cell or a cell range.
+_A1_RANGE = re.compile(
+    r"(?:(?:'[^'\r\n]{1,100}'|[A-Za-z0-9_ .\-]{1,100})!)?"
+    r"[A-Za-z]{1,3}[0-9]{0,7}(?::[A-Za-z]{1,3}[0-9]{0,7})?"
+)
+
+
+def _a1_range(value: object, field: str) -> str:
+    if type(value) is not str or not _A1_RANGE.fullmatch(value):
+        raise ProviderError(f"{field} must be an A1 range such as Sheet1!A1:C20")
+    return value
+
+
+def _count_cells(values: object) -> int:
+    if not isinstance(values, list):
+        return 0
+    return sum(len(row) if isinstance(row, list) else 1 for row in values)
 
 
 def _bounded_count(value: int) -> int:
@@ -210,7 +258,7 @@ class GoogleWorkspaceAdapter:
                 query={
                     "q": q,
                     "pageSize": _bounded_count(max_results),
-                    "fields": "files(id,name,mimeType,parents,trashed,modifiedTime,version,etag)",
+                    "fields": "files(id,name,mimeType,size,parents,trashed,modifiedTime,version,etag)",
                 },
             )
         )
@@ -223,7 +271,7 @@ class GoogleWorkspaceAdapter:
                 "GET",
                 f"{_DRIVE}/files/{_path(source, 'Drive file id')}",
                 headers=self.headers,
-                query={"fields": "id,name,mimeType,parents,trashed,modifiedTime,version,etag"},
+                query={"fields": "id,name,mimeType,size,parents,trashed,modifiedTime,version,etag"},
             )
         )
         return self._record("google_drive", source, body)
@@ -250,6 +298,123 @@ class GoogleWorkspaceAdapter:
             )
         )
         return self._record("google_sheets", source, body)
+
+    def read_drive_file(self, file_id: str) -> ProviderRecord:
+        """Read one Drive file as bounded text, exporting Google-native types.
+
+        The file's own metadata decides the path: a Google-native document is
+        exported to a fixed text form, a stored text file is downloaded, and
+        anything else is refused rather than returned as guessed-at bytes.
+        """
+
+        source = _id(file_id, "Drive file id")
+        metadata = self.get_drive_file(source)
+        mime = metadata.fields.get("mimeType")
+        if type(mime) is not str or not mime:
+            raise ProviderError("Drive file metadata is malformed")
+
+        declared = metadata.fields.get("size")
+        if type(declared) is str and declared.isdigit() and int(declared) > MAX_DRIVE_TEXT_BYTES:
+            raise ProviderError("Drive file is larger than Scotty reads in one call")
+
+        export_as = EXPORTABLE_GOOGLE_TYPES.get(mime)
+        if export_as is not None:
+            url = f"{_DRIVE}/files/{_path(source, 'Drive file id')}/export"
+            query: Mapping[str, object] = {"mimeType": export_as}
+        elif mime in READABLE_TEXT_TYPES:
+            url = f"{_DRIVE}/files/{_path(source, 'Drive file id')}"
+            query = {"alt": "media"}
+            export_as = mime
+        else:
+            raise ProviderError("that Drive file type cannot be read as text")
+
+        body = require_success(
+            self.transport.request("GET", url, headers=self.headers, query=query, text=True)
+        )
+        if type(body) is not str:
+            raise ProviderError("Drive content response is malformed")
+        if len(body.encode("utf-8")) > MAX_DRIVE_TEXT_BYTES:
+            raise ProviderError("Drive file is larger than Scotty reads in one call")
+        return self._record(
+            "google_drive",
+            source,
+            {
+                "id": source,
+                "name": metadata.fields.get("name"),
+                "mimeType": mime,
+                "readAs": export_as,
+                "text": body,
+                "etag": metadata.fields.get("etag", "unversioned"),
+            },
+        )
+
+    def get_sheet_values(self, spreadsheet_id: str, range_: str) -> ProviderRecord:
+        """Read one validated A1 range of values."""
+
+        source = _id(spreadsheet_id, "spreadsheet id")
+        target = _a1_range(range_, "spreadsheet range")
+        body = require_success(
+            self.transport.request(
+                "GET",
+                f"{_SHEETS}/spreadsheets/{_path(source, 'spreadsheet id')}/values/"
+                f"{urllib.parse.quote(target, safe='')}",
+                headers=self.headers,
+                query={"majorDimension": "ROWS"},
+            )
+        )
+        return self._record("google_sheets", source, self._bounded_values(body))
+
+    def batch_get_sheet_values(self, spreadsheet_id: str, ranges: Sequence[str]) -> ProviderRecord:
+        """Read a bounded set of validated A1 ranges in one call."""
+
+        source = _id(spreadsheet_id, "spreadsheet id")
+        if not isinstance(ranges, Sequence) or isinstance(ranges, str | bytes):
+            raise ProviderError("spreadsheet ranges must be a list")
+        if not 1 <= len(ranges) <= MAX_SHEETS_READ_RANGES:
+            raise ProviderError(
+                f"spreadsheet ranges must number from 1 to {MAX_SHEETS_READ_RANGES}"
+            )
+        targets = [_a1_range(item, "spreadsheet range") for item in ranges]
+        body = require_success(
+            self.transport.request(
+                "GET",
+                f"{_SHEETS}/spreadsheets/{_path(source, 'spreadsheet id')}/values:batchGet",
+                headers=self.headers,
+                query={"ranges": targets, "majorDimension": "ROWS"},
+            )
+        )
+        if not isinstance(body, dict):
+            raise ProviderError("Sheets values response is malformed")
+        value_ranges = body.get("valueRanges")
+        if not isinstance(value_ranges, list):
+            raise ProviderError("Sheets values response is malformed")
+        total = 0
+        bounded: list[Mapping[str, object]] = []
+        for entry in value_ranges:
+            checked = self._bounded_values(entry)
+            total += _count_cells(checked.get("values"))
+            if total > MAX_SHEETS_READ_CELLS:
+                raise ProviderError("Sheets response is larger than Scotty reads in one call")
+            bounded.append(checked)
+        return self._record(
+            "google_sheets", source, {"spreadsheetId": source, "valueRanges": bounded}
+        )
+
+    def _bounded_values(self, body: object) -> dict[str, object]:
+        """Validate one values payload and refuse an oversize response."""
+
+        if not isinstance(body, Mapping):
+            raise ProviderError("Sheets values response is malformed")
+        values = body.get("values", [])
+        if not isinstance(values, list):
+            raise ProviderError("Sheets values response is malformed")
+        if _count_cells(values) > MAX_SHEETS_READ_CELLS:
+            raise ProviderError("Sheets response is larger than Scotty reads in one call")
+        return {
+            "range": body.get("range", ""),
+            "majorDimension": body.get("majorDimension", "ROWS"),
+            "values": values,
+        }
 
     def list_contacts(self, *, page_size: int = 100) -> tuple[ProviderRecord, ...]:
         body = require_success(
