@@ -26,6 +26,7 @@ from .adapters import (
 )
 from .adapters.discord_admin import DiscordAdminAdapter
 from .approvals import ApprovalStore, Proposal
+from .budgets import BudgetLedger, BudgetPolicy
 from .config import CLIENT_ROLES, ConfigError, RuntimeConfig
 from .credential_intake import BROKER_SOCKET, CredentialIntake, UnixSocketBroker
 from .discord_policy import (
@@ -76,6 +77,7 @@ from .setup_flow import (
     first_unfinished,
     setup_progress,
 )
+from .supervisor import ConsumerLease, IncidentLog, Supervisor
 from .workflows import WorkflowState, WorkflowStore, parse_workflow
 
 logger = logging.getLogger(__name__)
@@ -487,6 +489,11 @@ class Runtime:
         self.setup_staging = SetupStagingStore(state_dir / "setup-staging.json")
         self.personas = PersonaStore(state_dir / "personas.json")
         self.workflows = WorkflowStore(state_dir / "workflows.json")
+        self.budgets = BudgetLedger(state_dir / "budgets.db", BudgetPolicy.from_mapping({}))
+        self.budgets.initialize()
+        self.supervisor = Supervisor(state_dir)
+        self.incidents = IncidentLog(state_dir / "incidents.json")
+        self.consumer_lease = ConsumerLease(state_dir / "consumer.lease")
         self.property_effects = EffectLog(state_dir / "property-effects.db")
         self.property_effects.initialize()
         self.property_cards: PropertyCardEngine | None = (
@@ -960,6 +967,11 @@ class Runtime:
             # Consequence work goes through a proposal; everything else is absent.
             raise PermissionError(redacted_refusal(discord_operation, classified))
 
+        if sending:
+            # Volume limits are per person and explained rather than silent.
+            decision = self.budgets.spend(principal, "chat_message")
+            if not decision.allowed:
+                raise PermissionError(decision.reason)
         message_id = _text(payload, "message_id", optional=True)
         if discord_operation == "read_channel":
             limit = payload.get("limit", 20)
