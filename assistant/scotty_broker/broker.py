@@ -80,10 +80,23 @@ class Peer:
     uid: int
     gid: int
 
-    def may(self, operation: str) -> bool:
+    def may(self, operation: str, *, runtime_uid: int = RUNTIME_UID) -> bool:
+        """Whether this kernel-reported peer may run this exact operation.
+
+        Root may do everything. The one account the runtime container runs as
+        may ask for status and nothing else. Every other uid may do nothing.
+
+        `runtime_uid` is deployment configuration — which account the container
+        was installed to run as — not something a caller can assert. It arrives
+        from the root-owned service that constructed the broker, never from the
+        wire, so no client can widen its own authority by naming a uid. Root
+        operations are gated on uid 0 alone and are unreachable however it is
+        set.
+        """
+
         if self.uid == 0:
             return operation in OPERATIONS
-        if self.uid == RUNTIME_UID:
+        if self.uid == runtime_uid:
             return operation in RUNTIME_OPERATIONS
         return False
 
@@ -203,11 +216,15 @@ class Broker:
         validator: Validator = _accept_shape,
         clock: Callable[[], float] = time.monotonic,
         window_seconds: float = WINDOW_SECONDS,
+        runtime_uid: int = RUNTIME_UID,
     ) -> None:
         self.store = store
         self.validator = validator
         self.clock = clock
         self.window_seconds = window_seconds
+        # Which account the runtime container was installed to run as. Set by
+        # the root-owned service, never by a request.
+        self.runtime_uid = runtime_uid
         # In memory only: a restart must not leave a usable window behind.
         self._windows: dict[str, tuple[str, str, float]] = {}
 
@@ -219,7 +236,7 @@ class Broker:
         operation = request.get("op")
         if type(operation) is not str or operation not in OPERATIONS:
             raise BrokerError("unknown operation")
-        if not peer.may(operation):
+        if not peer.may(operation, runtime_uid=self.runtime_uid):
             raise BrokerError("unauthorized")
         handler: dict[str, Callable[[Mapping[str, Any]], dict[str, object]]] = {
             "open": self._open,

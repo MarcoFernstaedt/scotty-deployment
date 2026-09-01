@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import socket
 import stat
 import subprocess
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 
 from assistant.scotty_broker.broker import (
@@ -376,7 +378,13 @@ class InstalledSocketTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.socket_path = self.root / "credential-broker.sock"
         self.store = CredentialStore(self.root / "credentials.json")
-        self.broker = Broker(self.store)
+        # The runtime uid is deployment configuration: which account the
+        # container was installed to run as. Here that is this test process, so
+        # the peer the kernel reports is genuinely the runtime account and the
+        # runtime operation is genuinely authorized. Production policy is
+        # untouched — root operations are gated on uid 0 alone, so a non-root
+        # harness cannot reach them however this is set.
+        self.broker = Broker(self.store, runtime_uid=os.getuid())
         self.server = bind_socket(self.socket_path, group=os.getgid())
         self.addCleanup(self.server.close)
         self.stop = threading.Event()
@@ -390,6 +398,33 @@ class InstalledSocketTests(unittest.TestCase):
         self.addCleanup(self.thread.join, 3.0)
         self.addCleanup(self.stop.set)
 
+    def commit_as_root(self, provider: str, credential_class: str, material: str) -> None:
+        """Store one credential through the identity production requires.
+
+        Committing is root's alone. Where this process is not root it cannot
+        become root, and faking the peer would be testing a fiction — so the
+        commit goes through the broker's own handler with the root peer, which
+        is the same production code path minus the socket. The socket, and the
+        kernel's answer about who is calling, are proven separately by the
+        operations this peer really holds.
+        """
+
+        opened = self.broker.handle(
+            ROOT, {"op": "open", "provider": provider, "credential_class": credential_class}
+        )
+        self.assertTrue(opened["ok"])
+        committed = self.broker.handle(
+            ROOT,
+            {
+                "op": "commit",
+                "provider": provider,
+                "credential_class": credential_class,
+                "window": opened["window"],
+                "material": material,
+            },
+        )
+        self.assertEqual(committed["state"], "credential present")
+
     def call(self, request, *, raw: bytes | None = None):
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(5.0)
@@ -400,7 +435,39 @@ class InstalledSocketTests(unittest.TestCase):
             client.shutdown(socket.SHUT_WR)
             return json.loads(client.recv(4096).decode("utf-8"))
 
-    def test_the_socket_is_reachable_and_answers_the_fixed_operations(self) -> None:
+    def test_the_socket_answers_the_operation_this_peer_may_actually_run(self) -> None:
+        """Real socket, real SO_PEERCRED, and the one operation this peer has.
+
+        The credential is committed through the broker as root — the identity
+        production requires — and then read back over the wire as the runtime
+        account, which is exactly the split the deployment runs with.
+        """
+
+        self.commit_as_root("trello", "api_key", SECRET)
+        status = self.call({"op": "status", "provider": "trello", "credential_class": "api_key"})
+        self.assertEqual(status, {"ok": True, "state": "credential present"})
+
+    @unittest.skipIf(os.geteuid() == 0, "this process is root, so nothing is refused")
+    def test_a_root_only_operation_is_refused_over_the_real_socket(self) -> None:
+        """The kernel says who is calling, and a non-root caller may not open."""
+
+        for operation in ("open", "validate", "commit", "revoke"):
+            with self.subTest(operation=operation):
+                reply = self.call(
+                    {
+                        "op": operation,
+                        "provider": "trello",
+                        "credential_class": "api_key",
+                        "material": SECRET,
+                        "window": "whatever",
+                    }
+                )
+                self.assertEqual(reply, {"ok": False, "state": "unauthorized"})
+
+    @unittest.skipUnless(os.geteuid() == 0, "the full lifecycle needs a genuinely root peer")
+    def test_the_whole_lifecycle_runs_over_the_real_socket_when_root(self) -> None:
+        """When the test peer really is root, nothing is simulated at all."""
+
         opened = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
         self.assertTrue(opened["ok"])
         committed = self.call(
@@ -413,8 +480,10 @@ class InstalledSocketTests(unittest.TestCase):
             }
         )
         self.assertEqual(committed["state"], "credential present")
-        status = self.call({"op": "status", "provider": "trello", "credential_class": "api_key"})
-        self.assertEqual(status, {"ok": True, "state": "credential present"})
+        self.assertEqual(
+            self.call({"op": "status", "provider": "trello", "credential_class": "api_key"}),
+            {"ok": True, "state": "credential present"},
+        )
 
     def test_the_socket_is_owner_and_group_only(self) -> None:
         mode = self.socket_path.stat().st_mode
@@ -423,27 +492,37 @@ class InstalledSocketTests(unittest.TestCase):
         self.assertEqual(mode & stat.S_IRWXO, 0)
 
     def test_no_reply_ever_carries_credential_material(self) -> None:
-        opened = self.call({"op": "open", "provider": "ghl", "credential_class": "private_token"})
+        """Every operation, over both the root path and the real wire."""
+
+        opened = self.broker.handle(
+            ROOT, {"op": "open", "provider": "ghl", "credential_class": "private_token"}
+        )
         replies = [
             opened,
-            self.call(
+            self.broker.handle(
+                ROOT,
                 {
                     "op": "commit",
                     "provider": "ghl",
                     "credential_class": "private_token",
                     "window": opened["window"],
                     "material": SECRET,
-                }
+                },
             ),
-            self.call({"op": "status", "provider": "ghl", "credential_class": "private_token"}),
-            self.call(
+            self.broker.handle(
+                ROOT,
                 {
                     "op": "validate",
                     "provider": "ghl",
                     "credential_class": "private_token",
                     "material": SECRET,
-                }
+                },
             ),
+            self.broker.handle(
+                ROOT, {"op": "revoke", "provider": "ghl", "credential_class": "private_token"}
+            ),
+            # And the same again over the real socket, as the runtime account.
+            self.call({"op": "status", "provider": "ghl", "credential_class": "private_token"}),
         ]
         rendered = json.dumps(replies)
         self.assertNotIn(SECRET, rendered)
@@ -479,52 +558,64 @@ class InstalledSocketTests(unittest.TestCase):
         self.assertFalse(client.commit("trello", "api_key", SECRET))
 
     def test_the_client_talks_to_the_real_socket(self) -> None:
+        """The production client's own frames, over the production wire.
+
+        `status` is the one operation the runtime account holds, so it is the
+        one the container's client can prove end to end. A commit from the same
+        client is refused, which is the boundary this deployment depends on.
+        """
+
         from assistant.scotty_business.credential_intake import UnixSocketBroker
 
         client = UnixSocketBroker(self.socket_path)
-        # The runtime account may only ask status; this test process is the
-        # owner, so a validate succeeds here and proves the wire format matches.
-        self.assertTrue(client.validate("trello", "api_key", SECRET))
+        self.assertTrue(client.available())
+        self.assertFalse(client.status("trello", "api_key"))
+        self.commit_as_root("trello", "api_key", SECRET)
+        self.assertTrue(client.status("trello", "api_key"))
+        if os.geteuid() != 0:
+            self.assertFalse(client.commit("trello", "api_key", OTHER))
 
     def test_a_restarted_broker_keeps_credentials_but_drops_windows(self) -> None:
-        opened = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
-        self.call(
-            {
-                "op": "commit",
-                "provider": "trello",
-                "credential_class": "api_key",
-                "window": opened["window"],
-                "material": SECRET,
-            }
+        """A restart must not leave a usable window behind on disk."""
+
+        self.commit_as_root("trello", "api_key", SECRET)
+        stale = self.broker.handle(
+            ROOT, {"op": "open", "provider": "trello", "credential_class": "api_key"}
         )
-        stale = self.call({"op": "open", "provider": "trello", "credential_class": "api_key"})
 
         self.stop.set()
         self.thread.join(3.0)
         self.server.close()
+        restarted = Broker(self.store, runtime_uid=os.getuid())
         self.server = bind_socket(self.socket_path, group=os.getgid())
         self.stop = threading.Event()
         self.thread = threading.Thread(
             target=serve_forever,
-            args=(Broker(self.store), self.server),
+            args=(restarted, self.server),
             kwargs={"should_stop": self.stop.is_set},
             daemon=True,
         )
         self.thread.start()
 
+        # The credential survived the restart, read over the real socket.
         self.assertTrue(
             self.call({"op": "status", "provider": "trello", "credential_class": "api_key"})["ok"]
         )
-        replayed = self.call(
-            {
-                "op": "commit",
-                "provider": "trello",
-                "credential_class": "api_key",
-                "window": stale["window"],
-                "material": OTHER,
-            }
-        )
-        self.assertEqual(replayed, {"ok": False, "state": "no open window"})
+        # The window did not: windows live in memory only, so a commit against
+        # one opened before the restart has nothing to commit into. The wire
+        # turns this into {"ok": false, "state": "no open window"}.
+        with self.assertRaises(BrokerError) as refused:
+            restarted.handle(
+                ROOT,
+                {
+                    "op": "commit",
+                    "provider": "trello",
+                    "credential_class": "api_key",
+                    "window": stale["window"],
+                    "material": OTHER,
+                },
+            )
+        self.assertEqual(str(refused.exception), "no open window")
 
     def test_a_symlinked_socket_path_is_refused(self) -> None:
         target = self.root / "elsewhere.sock"
@@ -579,25 +670,67 @@ class RuntimeBrokerStatusTests(unittest.TestCase):
             self.assertNotIn(SECRET, json.dumps(reply))
 
 
+def _unprivileged_uid() -> int | None:
+    """A real non-root account this process may become, or None."""
+
+    if os.geteuid() != 0:
+        return os.geteuid()
+    for name in ("nobody", "daemon"):
+        try:
+            entry = pwd.getpwnam(name)
+        except KeyError:
+            continue
+        if entry.pw_uid != 0:
+            return entry.pw_uid
+    return None
+
+
+def _drop_to(uid: int) -> Callable[[], None]:
+    """Become that account in the child before it executes anything."""
+
+    def drop() -> None:  # pragma: no cover - runs in the forked child
+        if os.geteuid() == 0:
+            os.setgroups([])
+            os.setgid(uid)
+            os.setuid(uid)
+
+    return drop
+
+
 class PackagedArtefactTests(unittest.TestCase):
     """The installed executable, run as a real process against a real socket."""
 
     def test_the_broker_executable_refuses_to_run_unprivileged(self) -> None:
-        result = subprocess.run(
+        """A genuinely non-root process, refused for the stated reason.
+
+        There is no environment override for the effective uid, because a
+        refusal a caller can switch off is not a refusal. Where this process is
+        root it drops privileges in the child rather than skipping — running
+        the executable as root here would bind the deployment's real socket.
+
+        This runs from a source checkout, where the installed tree does not
+        exist, so it also proves the refusal comes before the import of it: an
+        executable that imported first would fail with ModuleNotFoundError and
+        never say what was actually wrong.
+        """
+
+        unprivileged = _unprivileged_uid()
+        if unprivileged is None:
+            self.skipTest("no unprivileged account is available to drop to")
+        result = subprocess.run(  # noqa: S603 - fixed interpreter and argument
             [sys.executable, "scotty-credential-broker"],
             cwd=Path.cwd(),
-            env={"PATH": "/usr/bin:/bin", "SCOTTY_TEST_EUID": "1000"},
+            env={"PATH": "/usr/bin:/bin"},
             text=True,
             capture_output=True,
             check=False,
             timeout=30,
+            preexec_fn=_drop_to(unprivileged),  # noqa: PLW1509 - that is the point
         )
-        if os.geteuid() == 0:
-            # Running as root here, so the guard cannot trigger; the import
-            # path is still exercised below.
-            self.skipTest("this process is root")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("must run as root", result.stderr)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_the_packaged_module_serves_a_real_client(self) -> None:
         with tempfile.TemporaryDirectory(prefix="scotty-broker-pkg-") as directory:
@@ -614,7 +747,11 @@ class PackagedArtefactTests(unittest.TestCase):
                 "from scotty_broker.broker import (Broker, CredentialStore,"
                 " bind_socket, serve_forever)\n"
                 f"server = bind_socket({str(socket_path)!r}, group={os.getgid()})\n"
-                f"serve_forever(Broker(CredentialStore({str(store_path)!r})), server)\n"
+                # The staged package is served with this process as the runtime
+                # account, so the client below is genuinely authorized for the
+                # runtime operation rather than pretending to be.
+                "serve_forever(Broker(CredentialStore("
+                f"{str(store_path)!r}), runtime_uid={os.getuid()}), server)\n"
             )
             process = subprocess.Popen(
                 [sys.executable, "-c", script],
