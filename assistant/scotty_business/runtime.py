@@ -694,6 +694,9 @@ class Runtime:
             discord=self.discord,
             discord_admin=self.discord_admin,
             google_workspace=self.google_workspace_for,
+            # An approved batch runs on the requester's own engine, resolved
+            # at execution time like every other provider here.
+            property_engine=self._property_engine,
         )
         self.reminder_worker = ReminderWorker(self.reminders, self.discord.send_message)
         self._reporters: dict[tuple[str, str], ProgressReporter] = {}
@@ -1899,24 +1902,28 @@ class Runtime:
     def execute_bulk(
         self, principal: Principal, proposal_id: str, args: Mapping[str, object]
     ) -> dict[str, object]:
-        """Run an approved batch, re-previewed and hash-matched first."""
+        """Run an approved batch, through the same gate as every consequence.
 
-        engine = self._property_engine(principal)
-        if engine is None:
-            raise ProviderNotConnected("Trello is not connected")
-        proposal = self.service.approvals.get(proposal_id)
-        approved_hash = str(proposal.payload.get("payload_hash", ""))
-        stored = proposal.payload.get("card_ids", [])
-        if not isinstance(stored, list):
-            raise ValueError("this proposal does not name a batch")
-        identifiers = [str(item) for item in stored]
-        target = str(proposal.payload.get("card_operation_target", ""))
-        payload = proposal.payload.get("payload")
-        plan = engine.dry_run(
-            principal, target, identifiers, payload if isinstance(payload, Mapping) else {}
+        This used to read the proposal for its plan and run it, without asking
+        whether it had been approved. It now goes through `service.execute`,
+        which claims the exact version and nonce, spends the approval once, and
+        settles the proposal on what actually happened.
+        """
+
+        settled = self.service.execute(
+            principal,
+            proposal_id,
+            expected_version=_integer(args, "expected_version"),
+            execution_nonce=_text(args, "execution_nonce"),
         )
-        del args
-        return engine.run_bulk(principal, plan, approved_hash).as_json()
+        receipt = dict(settled.receipt or {})
+        return {
+            "proposal_id": settled.proposal_id,
+            "status": settled.status.value,
+            "verified": receipt.get("verified", []),
+            "unresolved": receipt.get("unresolved", []),
+            "failed": receipt.get("failed", []),
+        }
 
     def handle_approval(self, principal: Principal, args: Mapping[str, object]) -> object:
         action = _text(args, "action")

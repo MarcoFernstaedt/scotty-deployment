@@ -5,7 +5,7 @@ import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from .adapters import AmbiguousEffectError, ProviderError, ProviderRecord
 from .adapters.discord_admin import DiscordAdminAdapter
@@ -132,6 +132,7 @@ class ScottyService:
         google_workspace: GoogleWorkspacePort
         | None
         | Callable[[Principal], GoogleWorkspacePort | None] = None,
+        property_engine: Callable[[Principal], Any | None] | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
@@ -142,6 +143,9 @@ class ScottyService:
         self.discord = discord
         self.discord_admin = discord_admin
         self.google_workspace = google_workspace
+        # Resolved per actor, so an approved batch runs on the requester's own
+        # connector rather than the approver's.
+        self.property_engine = property_engine
         self.clock = clock
 
     def _trello_for(self, actor: Principal) -> TrelloPort:
@@ -159,6 +163,11 @@ class ScottyService:
 
     def _rentcast_for(self, actor: Principal) -> RentCastPort | None:
         return self.rentcast(actor) if callable(self.rentcast) else self.rentcast
+
+    def _engine_for(self, actor: Principal) -> Any | None:
+        """That actor's own property engine, or none when Trello is absent."""
+
+        return self.property_engine(actor) if callable(self.property_engine) else None
 
     def _workspace_for(self, actor: Principal) -> GoogleWorkspacePort | None:
         """The Workspace this exact actor may act on, and no other.
@@ -848,6 +857,8 @@ class ScottyService:
         operation = proposal.payload.get("operation")
         if operation == "merge":
             return self._execute_merge(principal, proposal, expected_version, nonce)
+        if operation == "bulk":
+            return self._execute_bulk(principal, proposal, expected_version, nonce)
         if operation == "create":
             executing = self._claim(
                 principal, proposal, expected_version, nonce, proposal.source_revision
@@ -955,6 +966,60 @@ class ScottyService:
                 "resulting_revision": observed.source_revision,
                 "changed_fields": sorted(intended),
             },
+        )
+
+    def _execute_bulk(
+        self, principal: Principal, proposal: Proposal, expected_version: int, nonce: str
+    ) -> Proposal:
+        """Run one approved batch through the ordinary approval machinery.
+
+        It used to run beside it: the runtime read the proposal for its plan
+        and never asked whether anybody had approved it, never claimed it, and
+        never settled it, so a caller could propose a mass edit and perform it
+        in the next call. Bulk operations are consequence-classified precisely
+        to stop that, and the gate was not attached to the door.
+
+        Now it claims like every other consequence -- one version, one nonce,
+        spent once -- and the engine re-previews the board and refuses if the
+        plan no longer hashes to what was approved.
+        """
+
+        engine = self._engine_for(proposal.requester)
+        if engine is None:
+            raise ApprovalError("Trello is not connected")
+        payload = proposal.payload
+        stored = payload.get("card_ids")
+        arguments = payload.get("payload")
+        if not isinstance(stored, list):
+            raise ApprovalError("this proposal does not name a batch")
+        executing = self._claim(
+            principal, proposal, expected_version, nonce, proposal.source_revision
+        )
+        try:
+            plan = engine.dry_run(
+                proposal.requester,
+                str(payload.get("card_operation_target", "")),
+                [str(item) for item in stored],
+                arguments if isinstance(arguments, Mapping) else {},
+            )
+            outcome = engine.run_bulk(
+                proposal.requester, plan, str(payload.get("payload_hash", ""))
+            )
+        except PermissionError as exc:
+            # The board moved under the approval, so this is not the batch
+            # anybody agreed to. Nothing was written.
+            return self._failed(executing, str(exc))
+        except (ProviderError, ValueError) as exc:
+            return self._failed(executing, str(exc))
+        receipt = {"verified": not outcome.unresolved and not outcome.failed, **outcome.as_json()}
+        if outcome.unresolved:
+            # Some card's outcome is genuinely unknown, so the proposal is too.
+            return self._unknown(executing, receipt)
+        return self.approvals.complete_execution(
+            executing.proposal_id,
+            ProposalStatus.VERIFIED if not outcome.failed else ProposalStatus.FAILED,
+            expected_version=executing.version,
+            receipt=receipt,
         )
 
     def _execute_merge(

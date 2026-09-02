@@ -28,6 +28,7 @@ from pathlib import Path
 
 from assistant.scotty_business.adapters.http import AmbiguousEffectError, ProviderError
 from assistant.scotty_business.adapters.records import ProviderRecord
+from assistant.scotty_business.approvals import ApprovalError
 from assistant.scotty_business.policy import Principal, Role
 
 MOMENT = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
@@ -532,16 +533,7 @@ class BulkApprovalTests(unittest.TestCase):
         with self.runtime() as live:
             operator = principal_for(live, Role.MAIN_OPERATOR)
             board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
-            live._property_engine = lambda _principal: self.engine(board)  # type: ignore[method-assign]
-            proposal = live.handle_propose(
-                operator,
-                {
-                    "operation": "trello_bulk",
-                    "card_operation_target": "move",
-                    "card_ids": ["card-1", "card-2"],
-                    "payload": {"list_id": "list-2"},
-                },
-            )
+            proposal = self.propose(live, operator, board)
             # Proposed, not performed: the board has not moved.
             self.assertEqual(board.cards["card-1"]["idList"], "list-1")
             self.assertTrue(proposal["proposal_id"])
@@ -559,25 +551,95 @@ class BulkApprovalTests(unittest.TestCase):
             self._effects.initialize()
         return PropertyCardEngine(synthetic.config(), trello, self._effects)
 
-    def test_an_approved_batch_runs_and_a_board_that_moved_since_refuses(self) -> None:
+    def propose(self, live, operator, board):
+        engine = self.engine(board)
+        live._property_engine = lambda _principal: engine  # type: ignore[method-assign]
+        # The service holds its own reference, bound when the runtime was
+        # built, so replacing the runtime's method alone changes nothing.
+        live.service.property_engine = lambda _principal: engine
+        return live.handle_propose(
+            operator,
+            {
+                "operation": "trello_bulk",
+                "card_operation_target": "move",
+                "card_ids": ["card-1", "card-2"],
+                "payload": {"list_id": "list-2"},
+            },
+        )
+
+    def approve(self, live, operator, proposal):
+        return live.handle_approval(
+            operator,
+            {
+                "action": "approve",
+                "proposal_id": proposal["proposal_id"],
+                "expected_version": proposal["version"],
+            },
+        )
+
+    def spend(self, approved):
+        return {
+            "expected_version": approved["version"],
+            "execution_nonce": approved["execution_nonce"],
+        }
+
+    def test_an_unapproved_batch_does_not_run(self) -> None:
+        """Found by reading this back: the gate was not wired to the door.
+
+        `execute_bulk` read the proposal for its plan and never asked whether
+        anybody had approved it, never claimed it, and never settled it. A
+        caller could propose a mass edit and run it in the next call -- which
+        is the entire thing bulk operations are consequence-classified to
+        prevent. My own test called it "an approved batch" and approved
+        nothing, so it passed and told me the opposite.
+        """
+
         from test_provider_connection import principal_for
 
         with self.runtime() as live:
             operator = principal_for(live, Role.MAIN_OPERATOR)
             board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
-            live._property_engine = lambda _principal: self.engine(board)  # type: ignore[method-assign]
-            proposal = live.handle_propose(
-                operator,
-                {
-                    "operation": "trello_bulk",
-                    "card_operation_target": "move",
-                    "card_ids": ["card-1", "card-2"],
-                    "payload": {"list_id": "list-2"},
-                },
-            )
-            outcome = live.execute_bulk(operator, proposal["proposal_id"], {})
+            proposal = self.propose(live, operator, board)
+            # A real version and a nonce that nobody issued, so what refuses
+            # this is the approval state machine rather than argument checking.
+            with self.assertRaises((ApprovalError, PermissionError)):
+                live.execute_bulk(
+                    operator,
+                    proposal["proposal_id"],
+                    {
+                        "expected_version": proposal["version"],
+                        "execution_nonce": "not-a-nonce-anybody-issued",
+                    },
+                )
+            self.assertEqual(board.cards["card-1"]["idList"], "list-1")
+            self.assertEqual(board.cards["card-2"]["idList"], "list-1")
+
+    def test_an_approved_batch_runs_and_settles_the_proposal(self) -> None:
+        from test_provider_connection import principal_for
+
+        with self.runtime() as live:
+            operator = principal_for(live, Role.MAIN_OPERATOR)
+            board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
+            proposal = self.propose(live, operator, board)
+            approved = self.approve(live, operator, proposal)
+            outcome = live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
             self.assertEqual(outcome["verified"], ["card-1", "card-2"])
             self.assertEqual(board.cards["card-2"]["idList"], "list-2")
+            # And the proposal is finished, so the approval is spent.
+            settled = live.service.approvals.get(proposal["proposal_id"])
+            self.assertEqual(settled.status.value, "verified")
+
+    def test_an_approval_cannot_be_spent_twice(self) -> None:
+        from test_provider_connection import principal_for
+
+        with self.runtime() as live:
+            operator = principal_for(live, Role.MAIN_OPERATOR)
+            board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
+            proposal = self.propose(live, operator, board)
+            approved = self.approve(live, operator, proposal)
+            live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
+            with self.assertRaises((ApprovalError, PermissionError)):
+                live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
 
     def test_a_card_that_vanished_since_the_preview_invalidates_the_approval(self) -> None:
         """The approval is for a plan, and the plan describes a board.
@@ -593,19 +655,13 @@ class BulkApprovalTests(unittest.TestCase):
         with self.runtime() as live:
             operator = principal_for(live, Role.MAIN_OPERATOR)
             board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
-            live._property_engine = lambda _principal: self.engine(board)  # type: ignore[method-assign]
-            proposal = live.handle_propose(
-                operator,
-                {
-                    "operation": "trello_bulk",
-                    "card_operation_target": "move",
-                    "card_ids": ["card-1", "card-2"],
-                    "payload": {"list_id": "list-2"},
-                },
-            )
+            proposal = self.propose(live, operator, board)
+            approved = self.approve(live, operator, proposal)
             del board.cards["card-2"]
-            with self.assertRaises(PermissionError):
-                live.execute_bulk(operator, proposal["proposal_id"], {})
+            outcome = live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
+            # The approval is spent and recorded as failed rather than left
+            # hanging, and nothing on the board moved.
+            self.assertEqual(outcome["status"], "failed")
             self.assertEqual(board.cards["card-1"]["idList"], "list-1")
 
 
