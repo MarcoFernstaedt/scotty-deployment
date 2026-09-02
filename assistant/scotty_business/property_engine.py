@@ -378,6 +378,9 @@ def query_cards(
     in a chat message. This does it once, with the filters named rather than
     guessed at.
 
+    A board that could not be read to the end is refused rather than filtered,
+    because a partial answer here is indistinguishable from a complete one.
+
     Archived cards are excluded unless asked for. A closed card is not gone --
     it is deliberately out of the way -- so including it silently in a routine
     listing is how a duplicate gets created next to one somebody archived.
@@ -387,7 +390,14 @@ def query_cards(
         raise ValueError("that is not a field a card query can sort by")
     if limit < 1 or limit > MAX_QUERY_CARDS:
         raise ValueError("a card query asks for between one and two hundred cards")
-    records, _complete = trello.list_all_cards()  # type: ignore[attr-defined]
+    records, complete = trello.list_all_cards()  # type: ignore[attr-defined]
+    if not complete:
+        # Trello pages, and the reader says whether it reached the end. A
+        # filter applied to the first page of a larger board produces an answer
+        # that looks complete and is not -- "nothing in the offers list" when
+        # the offers are on page two. The duplicate check already refuses to
+        # judge a partial board; so does this.
+        raise ProviderError("the whole board could not be read; narrow the query and retry")
     found = []
     wanted = text.casefold()
     for record in records:
@@ -600,7 +610,11 @@ class PropertyCardEngine:
             payload_hash=card.payload_hash(),
             source_revision=self.source_revision,
         )
-        if not claimed and record.status is EffectStatus.UNKNOWN:
+        if not claimed and record.status is EffectStatus.FAILED:
+            # Definitely did not happen, so there is nothing to reconcile and
+            # nothing to double. Start this attempt over on the same row.
+            self.effects.settle(record.effect_id, EffectStatus.UNKNOWN, card_id=card_id)
+        elif not claimed and record.status is EffectStatus.UNKNOWN:
             # This exact change was attempted and its outcome was never
             # established. Repeating it is how an ambiguous effect becomes a
             # doubled one, so it is reconciled against the card instead.
@@ -787,6 +801,14 @@ class PropertyCardEngine:
                 card_id=card_id,
                 reason=f"the {operation} may or may not have applied; reconcile before retry",
             )
+        except ProviderError as exc:
+            # A definite answer. The claim was written before the call, so
+            # leaving it here would strand the card: the next attempt would see
+            # an unresolved claim, refuse to repeat it, and nothing would ever
+            # settle it. Settling `failed` is what makes an ordinary refusal or
+            # a bad gateway something somebody can try again.
+            self.effects.settle(record.effect_id, EffectStatus.FAILED, receipt={"note": str(exc)})
+            raise
         landed = self._matches(card_id, intended)
         status = EffectStatus.VERIFIED if landed else EffectStatus.UNKNOWN
         self.effects.settle(

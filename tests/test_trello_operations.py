@@ -53,6 +53,9 @@ class FakeTrello:
         self.calls: list[tuple[str, str]] = []
         self.acknowledge_only = False
         self.ambiguous_on: set[str] = set()
+        #: Whether list_all_cards really saw the whole board. Trello pages, so
+        #: a large board comes back truncated and says so.
+        self.board_complete = True
 
     def _record(self, card_id: str) -> ProviderRecord:
         fields = dict(self.cards.get(card_id, {}))
@@ -108,7 +111,10 @@ class FakeTrello:
         )
 
     def list_all_cards(self):
-        return tuple(self._record(card_id) for card_id in sorted(self.cards)), True
+        return (
+            tuple(self._record(card_id) for card_id in sorted(self.cards)),
+            self.board_complete,
+        )
 
 
 class VerificationTests(unittest.TestCase):
@@ -274,6 +280,90 @@ class ReachableOperationTests(unittest.TestCase):
         self.assertEqual(outcome.status.value, "unknown")
 
 
+class RetryAfterFailureTests(unittest.TestCase):
+    """A definite failure has to be retryable; only doubt blocks a retry."""
+
+    def engine(self, trello):
+        import synthetic
+
+        from assistant.scotty_business.property_engine import EffectLog, PropertyCardEngine
+
+        directory = tempfile.TemporaryDirectory(prefix="scotty-trello-retry-")
+        self.addCleanup(directory.cleanup)
+        effects = EffectLog(Path(directory.name) / "effects.db")
+        effects.initialize()
+        return PropertyCardEngine(synthetic.config(), trello, effects)
+
+    def test_a_move_that_definitely_failed_can_be_tried_again(self) -> None:
+        """Found by reading this back: a 500 stranded the card forever.
+
+        The claim is written before the call, and only AmbiguousEffectError
+        settled it. A plain ProviderError -- a refusal, a bad gateway, anything
+        the provider answered definitely -- propagated with the row still
+        UNKNOWN. The next attempt then saw an unresolved claim, refused to
+        repeat it, and there was no path that ever settled it: the card could
+        not be moved again by anybody.
+        """
+
+        trello = FakeTrello({"card-1": {"idList": "list-1"}})
+        engine = self.engine(trello)
+
+        def refusing(card_id, list_id):
+            raise ProviderError("Trello said no")
+
+        trello.move_card = refusing  # type: ignore[method-assign]
+        with self.assertRaises(ProviderError):
+            engine.routine(actor(), "move", "card-1", {"list_id": "list-2"})
+
+        # The provider answered definitely, so nothing is in doubt and the same
+        # move is allowed to run again.
+        trello.move_card = FakeTrello.move_card.__get__(trello)  # type: ignore[method-assign]
+        outcome = engine.routine(actor(), "move", "card-1", {"list_id": "list-2"})
+        self.assertEqual(outcome.status.value, "verified")
+        self.assertEqual(trello.cards["card-1"]["idList"], "list-2")
+
+    def test_a_move_whose_outcome_is_unknown_still_blocks_a_blind_retry(self) -> None:
+        """The case that must keep refusing: nobody knows what happened."""
+
+        trello = FakeTrello({"card-1": {"idList": "list-1"}})
+        trello.ambiguous_on = {"move_card"}
+        engine = self.engine(trello)
+        first = engine.routine(actor(), "move", "card-1", {"list_id": "list-2"})
+        self.assertEqual(first.status.value, "unknown")
+
+        trello.ambiguous_on = set()
+        again = engine.routine(actor(), "move", "card-1", {"list_id": "list-2"})
+        self.assertEqual(again.status.value, "unknown")
+        self.assertIn("reconcile", again.reason)
+        # And it really did not write a second time.
+        self.assertEqual(trello.cards["card-1"]["idList"], "list-1")
+
+    def test_a_bulk_card_that_definitely_failed_is_not_stranded(self) -> None:
+        trello = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
+        engine = self.engine(trello)
+        plan = engine.dry_run(actor(), "move", ["card-1", "card-2"], {"list_id": "list-2"})
+
+        real = trello.move_card
+        refused: list[str] = []
+
+        def selective(card_id, list_id):
+            if card_id == "card-2" and not refused:
+                refused.append(card_id)
+                raise ProviderError("Trello said no")
+            return real(card_id, list_id)
+
+        trello.move_card = selective  # type: ignore[method-assign]
+        first = engine.run_bulk(actor(), plan, plan.payload_hash())
+        self.assertEqual(first.verified, ("card-1",))
+        self.assertEqual(first.failed, ("card-2",))
+
+        # Re-running the approved batch finishes the card that failed, and
+        # leaves the one that already landed alone.
+        again = engine.run_bulk(actor(), plan, plan.payload_hash())
+        self.assertEqual(sorted(again.verified), ["card-1", "card-2"])
+        self.assertEqual(trello.cards["card-2"]["idList"], "list-2")
+
+
 class QueryTests(unittest.TestCase):
     """Filtering, sorting and querying a board, as a typed read."""
 
@@ -313,6 +403,22 @@ class QueryTests(unittest.TestCase):
     def test_a_query_can_ask_for_the_archived_ones_on_purpose(self) -> None:
         found = self.query(self.board(), archived=True)
         self.assertEqual([card.source_id for card in found], ["card-4"])
+
+    def test_a_query_over_a_board_it_could_not_fully_read_is_refused(self) -> None:
+        """Found by reading this back: a partial board answered as if whole.
+
+        Trello pages, and `list_all_cards` says whether it reached the end.
+        The duplicate check already respects that -- answering "no match" from
+        the first page of a larger board is how one property gets two cards --
+        and this query ignored it. "No cards in the offers list" from a board
+        that was never fully read is a wrong answer that looks like a right
+        one, so it is refused instead.
+        """
+
+        board = self.board()
+        board.board_complete = False
+        with self.assertRaises(ProviderError):
+            self.query(board)
 
     def test_an_unknown_sort_field_is_refused_rather_than_ignored(self) -> None:
         with self.assertRaises(ValueError):

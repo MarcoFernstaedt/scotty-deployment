@@ -530,6 +530,12 @@ class Broker:
         )
         actor = _actor(request.get("actor", "shared"))
         removed = self.store.drop(provider, credential_class, actor)
+        if provider == "google" and self.google is not None:
+            # Dropping the refresh token stops new exchanges and says nothing
+            # about the token already minted. Without this, revoking somebody's
+            # Google access left the broker serving their cached token from
+            # memory for up to an hour, with nothing on disk to explain it.
+            self.google.forget(actor)
         return {"ok": removed, "state": "credential removed" if removed else "no credential"}
 
     def _grant(self, request: Mapping[str, Any]) -> dict[str, object]:

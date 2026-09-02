@@ -225,6 +225,69 @@ class WireTests(MinterFixture):
         )
 
 
+class RevocationTests(MinterFixture):
+    """Revoking consent has to stop the tokens, not just the minting."""
+
+    def test_a_revoked_user_stops_getting_tokens_immediately(self) -> None:
+        """Found by reading this back: the cache outlived the credential.
+
+        `access_token` returns a cached token without re-reading the store, so
+        dropping the refresh token stopped new exchanges and did nothing about
+        the token already minted. For up to an hour after somebody revoked a
+        user's Google access, the broker would keep handing that user's token
+        to the runtime -- from memory, with nothing left on disk to explain it.
+        """
+
+        first = self.minter.access_token("main_operator", self.scopes())
+        self.assertEqual(first.access_token, "synthetic-access-1")
+
+        self.store.drop("google", "refresh_token", "main_operator")
+        self.minter.forget("main_operator")
+        with self.assertRaises(GoogleTokenError):
+            self.minter.access_token("main_operator", self.scopes())
+
+    def test_the_broker_forgets_when_the_credential_is_revoked(self) -> None:
+        """The wiring, not just the method: revoke has to call it."""
+
+        from assistant.scotty_broker.broker import Broker, Peer
+
+        broker = Broker(self.store, google=self.minter)
+        self.minter.access_token("main_operator", self.scopes())
+        reply = broker.handle(
+            Peer(pid=1, uid=0, gid=0),
+            {
+                "op": "revoke",
+                "provider": "google",
+                "credential_class": "refresh_token",
+                "actor": "main_operator",
+            },
+        )
+        self.assertTrue(reply["ok"])
+        # Nothing cached survives the revoke.
+        with self.assertRaises(GoogleTokenError):
+            self.minter.access_token("main_operator", self.scopes())
+
+    def test_revoking_one_user_leaves_the_other_connected(self) -> None:
+        from assistant.scotty_broker.broker import Broker, Peer
+
+        self.store.put("google", "refresh_token", "synthetic-refresh-employee", "employee")
+        broker = Broker(self.store, google=self.minter)
+        self.minter.access_token("main_operator", self.scopes())
+        self.minter.access_token("employee", self.scopes())
+        broker.handle(
+            Peer(pid=1, uid=0, gid=0),
+            {
+                "op": "revoke",
+                "provider": "google",
+                "credential_class": "refresh_token",
+                "actor": "main_operator",
+            },
+        )
+        with self.assertRaises(GoogleTokenError):
+            self.minter.access_token("main_operator", self.scopes())
+        self.assertTrue(self.minter.access_token("employee", self.scopes()).access_token)
+
+
 class ContainerStateTests(unittest.TestCase):
     """What is left in the container's own tree, and what is not.
 
