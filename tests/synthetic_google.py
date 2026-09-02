@@ -237,12 +237,65 @@ class SyntheticGoogle:
             document_id = path.split("/")[2].removesuffix(":batchUpdate")
             requests = body.get("requests", [])
             applied = max(len(requests) - self.drop_batch_replies, 0)
-            self.documents.setdefault(document_id, {"documentId": document_id})
+            record = self.documents.setdefault(document_id, {"documentId": document_id})
+            # The requests are applied to the document's own text, because the
+            # readback now reads the text. A fake that answered with replies
+            # and never changed anything would let a test prove a verification
+            # that verifies nothing.
+            self._apply_document_requests(record, requests[:applied])
             return self._ok({"documentId": document_id, "replies": [{} for _ in range(applied)]})
         if path.startswith("/documents/") and method == "GET":
             record = self.documents.get(path.split("/")[2])
             return self._ok(dict(record)) if record else self._missing()
         return None
+
+    @staticmethod
+    def _document_text(record):
+        content = record.setdefault("body", {}).setdefault("content", [])
+        return content
+
+    def _apply_document_requests(self, record, requests) -> None:
+        """Apply the request kinds the readback knows how to look for."""
+
+        content = self._document_text(record)
+        for request in requests:
+            if not isinstance(request, dict) or len(request) != 1:
+                continue
+            ((kind, argument),) = request.items()
+            if kind == "insertText" and isinstance(argument, dict):
+                text = str(argument.get("text", ""))
+                if text:
+                    content.append({"paragraph": {"elements": [{"textRun": {"content": text}}]}})
+            elif kind == "replaceAllText" and isinstance(argument, dict):
+                contains = argument.get("containsText") or {}
+                original = str(contains.get("text", "")) if isinstance(contains, dict) else ""
+                replacement = str(argument.get("replaceText", ""))
+                if not original:
+                    continue
+                for element in content:
+                    runs = element.get("paragraph", {}).get("elements", [])
+                    for run in runs:
+                        run_text = run.get("textRun", {}).get("content", "")
+                        if original in run_text:
+                            run["textRun"]["content"] = run_text.replace(original, replacement)
+
+    @staticmethod
+    def _apply_spreadsheet_requests(record, requests) -> None:
+        for request in requests:
+            if not isinstance(request, dict) or len(request) != 1:
+                continue
+            ((kind, argument),) = request.items()
+            if not isinstance(argument, dict):
+                continue
+            properties = argument.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            if kind == "addSheet":
+                record.setdefault("sheets", []).append(
+                    {"properties": {"title": str(properties.get("title", ""))}}
+                )
+            elif kind == "updateSpreadsheetProperties":
+                record["properties"] = {"title": str(properties.get("title", ""))}
 
     # -- Sheets ----------------------------------------------------------
 
@@ -291,7 +344,8 @@ class SyntheticGoogle:
             spreadsheet_id = path.split("/")[2].removesuffix(":batchUpdate")
             requests = body.get("requests", [])
             applied = max(len(requests) - self.drop_batch_replies, 0)
-            self.spreadsheets.setdefault(spreadsheet_id, {"spreadsheetId": spreadsheet_id})
+            record = self.spreadsheets.setdefault(spreadsheet_id, {"spreadsheetId": spreadsheet_id})
+            self._apply_spreadsheet_requests(record, requests[:applied])
             return self._ok(
                 {"spreadsheetId": spreadsheet_id, "replies": [{} for _ in range(applied)]}
             )

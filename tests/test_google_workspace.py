@@ -140,9 +140,19 @@ class GoogleAdapterTests(AdapterHarness):
         ("drive_move_file", "file-1", {"addParents": "folder-2", "removeParents": "folder-1"}),
         ("drive_trash_file", "file-1", {}),
         ("docs_create", "new", {"title": "Notes"}),
-        ("docs_batch_update", "document-1", {"requests": [{"insertText": {}}]}),
+        (
+            "docs_batch_update",
+            "document-1",
+            # An observable request: the readback looks for this text in the
+            # document afterwards, so an empty one would be unverifiable.
+            {"requests": [{"insertText": {"location": {"index": 1}, "text": "Synthetic"}}]},
+        ),
         ("sheets_create", "new", {"properties": {"title": "Pipeline"}}),
-        ("sheets_batch_update", "spreadsheet-1", {"requests": [{"addSheet": {}}]}),
+        (
+            "sheets_batch_update",
+            "spreadsheet-1",
+            {"requests": [{"addSheet": {"properties": {"title": "Offers"}}}]},
+        ),
         ("contacts_create", "new", {"names": [{"givenName": "Synthetic"}]}),
         ("contacts_update", "people/contact-1", {"etag": "etag-1", "names": []}),
         ("gmail_update_draft", "draft-1", {"raw": "c3ludGhldGlj"}),
@@ -846,9 +856,62 @@ class AuthoritativeReadbackTests(unittest.TestCase):
     def test_a_fully_applied_batch_verifies(self) -> None:
         adapter, google = self.adapter()
         record = adapter.execute_routine(
-            "docs_batch_update", "document-1", {"requests": [{"insertText": {}}]}
+            "docs_batch_update",
+            "document-1",
+            {"requests": [{"insertText": {"location": {"index": 1}, "text": "Synthetic"}}]},
         )
         self.assertEqual(record.source_id, "document-1")
+
+    def test_a_batch_whose_text_never_arrived_is_unverified(self) -> None:
+        """The reply count agrees and the document disagrees.
+
+        This is the case the old readback could not see: it compared the
+        document's own id, which is the same whether or not the text landed.
+        """
+
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, google = self.adapter()
+
+        def acknowledge_only(record, requests):
+            del record, requests
+
+        google._apply_document_requests = acknowledge_only  # type: ignore[method-assign]
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.execute_routine(
+                "docs_batch_update",
+                "document-1",
+                {"requests": [{"insertText": {"location": {"index": 1}, "text": "Synthetic"}}]},
+            )
+
+    def test_a_batch_nobody_can_observe_is_never_reported_as_written(self) -> None:
+        """Restyling text leaves nothing to look for, so nothing is claimed.
+
+        It is reversible, so it is routine rather than consequential -- the
+        destructive kinds are refused earlier and never reach a readback. What
+        it is not is provable: a document read shows the same text either way,
+        so the honest answer is unresolved rather than written.
+        """
+
+        from assistant.scotty_business.adapters.http import AmbiguousEffectError
+
+        adapter, _ = self.adapter()
+        with self.assertRaises(AmbiguousEffectError):
+            adapter.execute_routine(
+                "docs_batch_update",
+                "document-1",
+                {
+                    "requests": [
+                        {
+                            "updateTextStyle": {
+                                "range": {"startIndex": 1, "endIndex": 4},
+                                "textStyle": {"bold": True},
+                                "fields": "bold",
+                            }
+                        }
+                    ]
+                },
+            )
 
     def test_a_write_whose_response_never_arrives_is_unverified(self) -> None:
         from assistant.scotty_business.adapters.http import AmbiguousEffectError
@@ -1093,7 +1156,7 @@ class AuthoritativeReadbackTests(unittest.TestCase):
             (
                 "docs_batch_update",
                 "document-1",
-                {"requests": [{"insertText": {}}]},
+                {"requests": [{"insertText": {"location": {"index": 1}, "text": "Synthetic"}}]},
                 {"documentId": "document-1"},
             ),
             (

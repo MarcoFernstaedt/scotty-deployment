@@ -21,6 +21,15 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TypeGuard
 
+#: Operations for which no authoritative read exists at all, whatever the
+#: payload. Empty, and kept as a named set so that adding one is a deliberate
+#: statement rather than a plan function quietly returning None forever.
+#:
+#: Note the difference from a `None` plan: that is payload-specific -- a batch
+#: whose requests cannot be observed, a values write with no range -- and is
+#: reported as `unknown` for that call rather than as a gap in the product.
+UNPROVABLE_OPERATIONS: frozenset[str] = frozenset()
+
 
 class ReadbackStatus(StrEnum):
     """Why a mutation was or was not verified. Fixed, redacted vocabulary."""
@@ -59,6 +68,11 @@ class ReadbackPlan:
     request: ReadbackRequest
     expected: Mapping[str, object]
     absent: Mapping[str, Sequence[object]] = field(default_factory=dict)
+    #: Text that must appear somewhere in the resource afterwards, and text
+    #: that must not. This is how a document batch is proved: the requests
+    #: assert something about the content, and the content is what is read.
+    contains_text: tuple[str, ...] = ()
+    excludes_text: tuple[str, ...] = ()
 
 
 def _text(value: object) -> str | None:
@@ -117,6 +131,26 @@ def matches(intended: object, observed: object) -> bool:
     return bool(intended == observed)
 
 
+def flatten_text(value: object, depth: int = 0) -> str:
+    """Every string in a response body, run together.
+
+    A Docs document is a tree of structural elements and text runs; asking
+    whether an inserted sentence is in it means walking the whole thing rather
+    than reading one field. Bounded, because a readback must not become a way
+    to spend the process on a hostile response.
+    """
+
+    if depth > 24:
+        return ""
+    if type(value) is str:
+        return value
+    if isinstance(value, Mapping):
+        return " ".join(flatten_text(item, depth + 1) for item in value.values())
+    if _is_list(value):
+        return " ".join(flatten_text(item, depth + 1) for item in value)
+    return ""
+
+
 def _absent(field: str) -> Mapping[str, object]:
     del field
     return {}
@@ -151,6 +185,86 @@ def applied_fully(operation: str, payload: Mapping[str, object], response: objec
     if replies is None:
         return False
     return replies >= len(requests)
+
+
+#: Document-batch request kinds whose effect a later read can actually find.
+#: Everything else -- deleting a range, restyling text, bulleting a paragraph --
+#: leaves nothing to look for, so a batch containing one is not verifiable.
+_OBSERVABLE_DOCS_REQUESTS = frozenset({"insertText", "replaceAllText"})
+
+#: The same for spreadsheets. A metadata read can see a sheet appear and a
+#: title change; it cannot see a cell format or a repeated range.
+_OBSERVABLE_SHEETS_REQUESTS = frozenset({"addSheet", "updateSpreadsheetProperties"})
+
+
+def _docs_observable(
+    payload: Mapping[str, object],
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """What a document must and must not contain afterwards, or None.
+
+    None means at least one request in the batch cannot be observed, which
+    makes the whole batch unverifiable: the requests are applied together and
+    there is no partial answer that would be honest.
+    """
+
+    requests = payload.get("requests")
+    if not _is_list(requests) or not requests:
+        return None
+    wanted: list[str] = []
+    gone: list[str] = []
+    for request in requests:
+        if not isinstance(request, Mapping) or len(request) != 1:
+            return None
+        ((kind, argument),) = request.items()
+        if kind not in _OBSERVABLE_DOCS_REQUESTS or not isinstance(argument, Mapping):
+            return None
+        if kind == "insertText":
+            text = _text(argument.get("text"))
+            if not text:
+                return None
+            wanted.append(text)
+        else:
+            replacement = _text(argument.get("replaceText"))
+            contains = argument.get("containsText")
+            original = _text(contains.get("text")) if isinstance(contains, Mapping) else None
+            if replacement is None or not original:
+                return None
+            if replacement:
+                wanted.append(replacement)
+            # A replacement is only proven when the old text has really gone.
+            gone.append(original)
+    if not wanted and not gone:
+        return None
+    return tuple(wanted), tuple(gone)
+
+
+def _sheets_observable(payload: Mapping[str, object], spreadsheet: str) -> dict[str, object] | None:
+    """What a spreadsheet must look like afterwards, or None if nobody can say."""
+
+    requests = payload.get("requests")
+    if not _is_list(requests) or not requests:
+        return None
+    expected: dict[str, object] = {"spreadsheetId": spreadsheet}
+    sheets_expected: list[object] = []
+    for request in requests:
+        if not isinstance(request, Mapping) or len(request) != 1:
+            return None
+        ((kind, argument),) = request.items()
+        if kind not in _OBSERVABLE_SHEETS_REQUESTS or not isinstance(argument, Mapping):
+            return None
+        properties = argument.get("properties")
+        if not isinstance(properties, Mapping):
+            return None
+        title = _text(properties.get("title"))
+        if not title:
+            return None
+        if kind == "addSheet":
+            sheets_expected.append({"properties": {"title": title}})
+        else:
+            expected["properties"] = {"title": title}
+    if sheets_expected:
+        expected["sheets"] = sheets_expected
+    return expected
 
 
 def plan(
@@ -275,15 +389,14 @@ def plan(
             {"permissions": [grant]},
         )
 
-    if operation in {"docs_create", "docs_batch_update"}:
+    if operation == "docs_create":
         document = created or _text(body.get("documentId")) or resource_id
         if not document:
             return None
         expected = {"documentId": document}
-        if operation == "docs_create":
-            title = _text(payload.get("title"))
-            if title:
-                expected["title"] = title
+        title = _text(payload.get("title"))
+        if title:
+            expected["title"] = title
         return ReadbackPlan(
             ReadbackRequest(
                 f"{docs}/documents/{document}", {"fields": "documentId,title,revisionId"}
@@ -291,13 +404,51 @@ def plan(
             expected,
         )
 
-    if operation in {"sheets_create", "sheets_batch_update"}:
+    if operation == "docs_batch_update":
+        document = created or _text(body.get("documentId")) or resource_id
+        if not document:
+            return None
+        observable = _docs_observable(payload)
+        if observable is None:
+            # At least one request in the batch changes something nothing can
+            # look for afterwards. Reading the document would prove the
+            # document exists, which is not what the batch asserted, so there
+            # is no authoritative read and the caller must report `unknown`.
+            return None
+        wanted, replaced = observable
+        return ReadbackPlan(
+            ReadbackRequest(
+                f"{docs}/documents/{document}",
+                {"fields": "documentId,title,revisionId,body"},
+            ),
+            {"documentId": document},
+            contains_text=wanted,
+            excludes_text=replaced,
+        )
+
+    if operation == "sheets_create":
         spreadsheet = created or _text(body.get("spreadsheetId")) or resource_id
         if not spreadsheet:
             return None
         return ReadbackPlan(
             ReadbackRequest(f"{sheets}/spreadsheets/{spreadsheet}", {"includeGridData": "false"}),
             {"spreadsheetId": spreadsheet},
+        )
+
+    if operation == "sheets_batch_update":
+        spreadsheet = created or _text(body.get("spreadsheetId")) or resource_id
+        if not spreadsheet:
+            return None
+        expected_sheet = _sheets_observable(payload, spreadsheet)
+        if expected_sheet is None:
+            # Same reasoning as a document batch: most spreadsheet requests
+            # change cell formatting or structure that a metadata read cannot
+            # confirm, and confirming the spreadsheet still exists is not
+            # verification of what was asked for.
+            return None
+        return ReadbackPlan(
+            ReadbackRequest(f"{sheets}/spreadsheets/{spreadsheet}", {"includeGridData": "false"}),
+            expected_sheet,
         )
 
     if operation == "sheets_update_values":
@@ -332,7 +483,10 @@ def plan(
         )
 
     if operation in {"contacts_create", "contacts_update"}:
-        person = created or resource_id
+        # A People resource is named by `resourceName`, so that is preferred
+        # over the generic `id` the other APIs use: taking `id` first turned a
+        # perfectly readable contact into an unprovable one.
+        person = _text(body.get("resourceName")) or resource_id
         if not person.startswith("people/"):
             return None
         intended = {
@@ -388,6 +542,12 @@ def verify(
         return ReadbackStatus.MALFORMED
     if not matches(plan_.expected, observed):
         return ReadbackStatus.MISMATCH
+    if plan_.contains_text or plan_.excludes_text:
+        content = flatten_text(observed)
+        if any(wanted not in content for wanted in plan_.contains_text):
+            return ReadbackStatus.MISMATCH
+        if any(gone in content for gone in plan_.excludes_text):
+            return ReadbackStatus.MISMATCH
     for name, removed in plan_.absent.items():
         present = observed.get(name)
         if not _is_list(present):
