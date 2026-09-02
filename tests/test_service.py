@@ -178,9 +178,20 @@ class ServiceTests(unittest.TestCase):
     def test_merge_preview_binds_conflicts_and_archives_only_after_readback(self) -> None:
         service = self.service()
         proposal = service.propose_trello_merge(self.operator, "source", "destination")
+        # The conflict now records where the merged value came from, and
+        # whether a person chose it or the rule did -- an approver reading
+        # "destination" over an empty destination was reading a merge that
+        # never happened.
         self.assertEqual(
-            proposal.payload["conflicts"]["desc"], {"source": "source notes", "destination": ""}
+            proposal.payload["conflicts"]["desc"],
+            {
+                "source": "source notes",
+                "destination": "",
+                "resolved_to": "source",
+                "chosen_by_reviewer": False,
+            },
         )
+        self.assertIn("desc", proposal.payload["defaulted_conflicts"])
         approved = service.approve(self.operator, proposal.proposal_id, 1)
         result = service.execute(
             self.operator,

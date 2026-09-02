@@ -70,7 +70,7 @@ from .property_cards import (
     normalize_address,
     parse_card,
 )
-from .property_engine import EffectLog, PropertyCardEngine
+from .property_engine import MAX_QUERY_CARDS, EffectLog, PropertyCardEngine, query_cards
 from .provider_identity import (
     ProviderIdentity,
     ProviderIdentityResolver,
@@ -208,6 +208,9 @@ _CARD_OPERATIONS = frozenset(
         "create",
         "update",
         "move",
+        "label",
+        "unarchive",
+        "query",
     }
 )
 
@@ -364,6 +367,12 @@ class UnconnectedProvider:
         raise self._deny()
 
     def move_card(self, card_id: str, list_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def unarchive_card(self, card_id: str) -> ProviderRecord:
+        raise self._deny()
+
+    def set_labels(self, card_id: str, label_ids: Sequence[str]) -> ProviderRecord:
         raise self._deny()
 
     def archive_card(self, card_id: str) -> ProviderRecord:
@@ -851,11 +860,42 @@ class Runtime:
         if operation == "update":
             card = parse_card(_object(args, "card"))
             return engine.update(principal, _text(args, "card_id"), card).as_json()
-        if operation == "move":
+        if operation in {"move", "label", "unarchive"}:
             return engine.routine(
-                principal, "move", _text(args, "card_id"), _object(args, "payload")
+                principal,
+                operation,
+                _text(args, "card_id"),
+                _object(args, "payload", optional=True),
             ).as_json()
+        if operation == "query":
+            return self._card_query(principal, args)
         raise ValueError("property-card operation is not permitted")
+
+    def _card_query(self, principal: Principal, args: Mapping[str, object]) -> object:
+        """Find cards on the board, filtered and ordered as asked.
+
+        A read, so it spends the read budget and needs no approval. The filters
+        are named parameters rather than a query string, so there is nothing
+        here a model can compose into a request for a board it was not given.
+        """
+
+        trello = self._trello(principal)
+        self._permit(principal, "trello", "trello.query_cards")
+        payload = _object(args, "payload", optional=True)
+        limit = payload.get("limit", MAX_QUERY_CARDS)
+        if type(limit) is not int:
+            raise ValueError("a card query's limit is a whole number")
+        found = query_cards(
+            trello,
+            list_id=str(payload.get("list_id", "")),
+            label_id=str(payload.get("label_id", "")),
+            text=str(payload.get("text", "")),
+            archived=bool(payload.get("archived", False)),
+            sort_by=str(payload.get("sort_by", "")),
+            descending=bool(payload.get("descending", False)),
+            limit=limit,
+        )
+        return [_record_json(record) for record in found]
 
     #: How a workflow step reaches the operation it names. Every one of these
     #: goes back through the handler that serves a person asking directly, so a
@@ -865,6 +905,9 @@ class Runtime:
         "property_card.create": {"operation": "property_card", "card_operation": "create"},
         "property_card.update": {"operation": "property_card", "card_operation": "update"},
         "property_card.move": {"operation": "property_card", "card_operation": "move"},
+        "property_card.label": {"operation": "property_card", "card_operation": "label"},
+        "property_card.unarchive": {"operation": "property_card", "card_operation": "unarchive"},
+        "property_card.query": {"operation": "property_card", "card_operation": "query"},
         "property_card.reformat": {"operation": "property_card", "card_operation": "reformat"},
         "property_card.apply_template": {
             "operation": "property_card",
@@ -1774,7 +1817,15 @@ class Runtime:
         operation = _text(args, "operation")
         if operation == "trello_merge":
             proposal = self.service.propose_trello_merge(
-                principal, _text(args, "source_card_id"), _text(args, "destination_card_id")
+                principal,
+                _text(args, "source_card_id"),
+                _text(args, "destination_card_id"),
+                # Which side wins where the two cards disagree. Absent, the
+                # default applies and the proposal names which fields took it.
+                resolutions={
+                    str(name): str(side)
+                    for name, side in _object(args, "resolutions", optional=True).items()
+                },
             )
         elif operation == "trello_create":
             proposal = self.service.propose_trello_create(
@@ -1788,7 +1839,14 @@ class Runtime:
                 _text(args, "discord_operation"),
                 _object(args, "payload", optional=True),
             )
-        elif operation in {"trello_update", "trello_move", "trello_archive"}:
+        elif operation == "trello_bulk":
+            proposal = self._propose_bulk(principal, args)
+        elif operation in {
+            "trello_update",
+            "trello_move",
+            "trello_archive",
+            "trello_unarchive",
+        }:
             proposal = self.service.propose_trello_action(
                 principal,
                 operation.removeprefix("trello_"),
@@ -1817,6 +1875,48 @@ class Runtime:
         else:
             raise ValueError("proposal operation is not permitted")
         return _proposal_json(proposal)
+
+    def _propose_bulk(self, principal: Principal, args: Mapping[str, object]) -> Proposal:
+        """Propose one batch, as the exact plan a dry run produced.
+
+        The plan is previewed here and its hash goes into the payload, so the
+        approval is for this batch and not for "a bulk move" in general. When
+        it executes, the engine re-previews and refuses if the board has moved
+        under it -- an approval is not a licence to run against whatever the
+        board looks like later.
+        """
+
+        engine = self._property_engine(principal)
+        if engine is None:
+            raise ProviderNotConnected("Trello is not connected")
+        identifiers = args.get("card_ids")
+        if not isinstance(identifiers, list) or not all(type(item) is str for item in identifiers):
+            raise ValueError("a bulk operation needs a list of card identifiers")
+        target = _text(args, "card_operation_target")
+        plan = engine.dry_run(principal, target, identifiers, _object(args, "payload"))
+        return self.service.propose_trello_bulk(principal, plan)
+
+    def execute_bulk(
+        self, principal: Principal, proposal_id: str, args: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Run an approved batch, re-previewed and hash-matched first."""
+
+        engine = self._property_engine(principal)
+        if engine is None:
+            raise ProviderNotConnected("Trello is not connected")
+        proposal = self.service.approvals.get(proposal_id)
+        approved_hash = str(proposal.payload.get("payload_hash", ""))
+        stored = proposal.payload.get("card_ids", [])
+        if not isinstance(stored, list):
+            raise ValueError("this proposal does not name a batch")
+        identifiers = [str(item) for item in stored]
+        target = str(proposal.payload.get("card_operation_target", ""))
+        payload = proposal.payload.get("payload")
+        plan = engine.dry_run(
+            principal, target, identifiers, payload if isinstance(payload, Mapping) else {}
+        )
+        del args
+        return engine.run_bulk(principal, plan, approved_hash).as_json()
 
     def handle_approval(self, principal: Principal, args: Mapping[str, object]) -> object:
         action = _text(args, "action")

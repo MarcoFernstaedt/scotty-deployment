@@ -15,10 +15,12 @@ itself, and a claim that already exists is reconciled rather than repeated.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -46,8 +48,12 @@ from .property_cards import (
 MAX_BULK_CARDS = 50
 
 #: Operations a client may run directly, and operations that need an approval.
-ROUTINE_OPERATIONS = frozenset({"create", "update", "move", "label", "reformat"})
+ROUTINE_OPERATIONS = frozenset({"create", "update", "move", "label", "unarchive", "reformat"})
 CONSEQUENCE_OPERATIONS = frozenset({"archive", "bulk_update", "bulk_move"})
+
+#: What a batch may do. Narrower than the routine set on purpose: a bulk
+#: archive is a mass deletion in everything but name.
+BULK_OPERATIONS = frozenset({"move", "update", "label"})
 
 
 def consequence_operations() -> frozenset[str]:
@@ -279,6 +285,10 @@ class BulkPlan:
     changes: tuple[Mapping[str, object], ...]
     unreadable: tuple[str, ...] = ()
     diffs: Mapping[str, CardDiff] = field(default_factory=dict)
+    #: What the plan was built from. Carried so that re-previewing before
+    #: execution reproduces this plan rather than an empty one, which would
+    #: hash differently and refuse an approval that was perfectly good.
+    arguments: Mapping[str, object] = field(default_factory=dict)
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -286,12 +296,118 @@ class BulkPlan:
             "affected": self.affected,
             "changes": [dict(change) for change in self.changes],
             "unreadable": list(self.unreadable),
+            "payload_hash": self.payload_hash(),
+        }
+
+    def payload_hash(self) -> str:
+        """This exact plan, so an approval cannot be spent on a different one.
+
+        A batch approved for three cards that runs on four is the reason
+        batches are gated at all. The hash covers the operation and every
+        change, so re-previewing after the board moved produces a different
+        plan and the old approval no longer fits it.
+        """
+
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "operation": self.operation,
+                    "changes": [dict(change) for change in self.changes],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BulkOutcome:
+    """What a batch actually did, card by card.
+
+    Three lists rather than one status, because a batch is not one effect. Some
+    cards land, some are left unresolved by a lost acknowledgement, and some
+    are refused; collapsing that into "failed" would hide the ones that moved.
+    """
+
+    operation: str
+    verified: tuple[str, ...]
+    unresolved: tuple[str, ...]
+    failed: tuple[str, ...]
+    effect_ids: Mapping[str, str] = field(default_factory=dict)
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "operation": self.operation,
+            "verified": list(self.verified),
+            "unresolved": list(self.unresolved),
+            "failed": list(self.failed),
+            "effect_ids": dict(self.effect_ids),
         }
 
 
 #: The Trello fields a card's canonical values are written into.
 _NAME_FIELD = "name"
 _DESC_FIELD = "desc"
+
+
+#: The card fields a query may sort or filter on. A fixed set, because a
+#: caller-chosen field name is a way to sort by something the board does not
+#: have and get an arbitrary order back without being told.
+QUERYABLE_FIELDS: tuple[str, ...] = ("name", "desc", "idList", "due", "dateLastActivity")
+
+#: The most cards one query answers with. A board can be larger than a reply.
+MAX_QUERY_CARDS = 200
+
+
+def query_cards(
+    trello: object,
+    *,
+    list_id: str = "",
+    label_id: str = "",
+    text: str = "",
+    archived: bool = False,
+    sort_by: str = "",
+    descending: bool = False,
+    limit: int = MAX_QUERY_CARDS,
+) -> tuple[ProviderRecord, ...]:
+    """Find cards on the configured board, filtered and ordered on purpose.
+
+    The board was reachable only as an unordered list of everything, so
+    "the cards in the offers list, newest first" was work somebody did by hand
+    in a chat message. This does it once, with the filters named rather than
+    guessed at.
+
+    Archived cards are excluded unless asked for. A closed card is not gone --
+    it is deliberately out of the way -- so including it silently in a routine
+    listing is how a duplicate gets created next to one somebody archived.
+    """
+
+    if sort_by and sort_by not in QUERYABLE_FIELDS:
+        raise ValueError("that is not a field a card query can sort by")
+    if limit < 1 or limit > MAX_QUERY_CARDS:
+        raise ValueError("a card query asks for between one and two hundred cards")
+    records, _complete = trello.list_all_cards()  # type: ignore[attr-defined]
+    found = []
+    wanted = text.casefold()
+    for record in records:
+        fields = record.fields
+        if bool(fields.get("closed")) is not archived:
+            continue
+        if list_id and fields.get("idList") != list_id:
+            continue
+        if label_id:
+            labels = fields.get("idLabels")
+            if not isinstance(labels, list | tuple) or label_id not in labels:
+                continue
+        if wanted:
+            haystack = " ".join(str(fields.get(name, "")) for name in ("name", "desc")).casefold()
+            if wanted not in haystack:
+                continue
+        found.append(record)
+    if sort_by:
+        found.sort(key=lambda record: str(record.fields.get(sort_by, "")), reverse=descending)
+    return tuple(found[:limit])
 
 
 class PropertyCardEngine:
@@ -545,7 +661,13 @@ class PropertyCardEngine:
     def routine(
         self, actor: Principal, operation: str, card_id: str, arguments: Mapping[str, object]
     ) -> EffectOutcome:
-        """Run one routine operation. A consequence never comes through here."""
+        """Run one routine operation. A consequence never comes through here.
+
+        Every branch has the same shape, and it is the shape the contract asks
+        for: claim an effect row first so a crash leaves `unknown` rather than
+        nothing, make the call, then settle on what an independent read says.
+        The provider's reply to its own write settles nothing.
+        """
 
         if operation in CONSEQUENCE_OPERATIONS:
             raise PermissionError(f"{operation} needs an approved proposal")
@@ -555,58 +677,143 @@ class PropertyCardEngine:
             destination = arguments.get("list_id")
             if type(destination) is not str or not destination:
                 raise ValueError("a move needs a configured destination list")
-            record, claimed = self.effects.claim(
-                operation="move",
+            return self._effect(
+                actor,
+                "move",
+                card_id,
                 key=f"{card_id}:{destination}",
-                actor=actor,
                 payload_hash=destination,
-                source_revision=self.source_revision,
+                intended={"idList": destination},
+                write=lambda: self.trello.move_card(card_id, destination),  # type: ignore[attr-defined]
             )
-            if not claimed and record.status is EffectStatus.UNKNOWN:
-                observed = self.trello.get_card(card_id)  # type: ignore[attr-defined]
-                if observed.fields.get("idList") == destination:
-                    # The earlier attempt did land; only its reply was lost.
-                    self.effects.settle(
-                        record.effect_id,
-                        EffectStatus.VERIFIED,
-                        card_id=card_id,
-                        receipt={"note": "reconciled a lost acknowledgement"},
-                    )
-                    return EffectOutcome(
-                        EffectStatus.VERIFIED,
-                        record.effect_id,
-                        card_id=card_id,
-                        reconciled=True,
-                    )
-                return EffectOutcome(
-                    EffectStatus.UNKNOWN,
-                    record.effect_id,
-                    card_id=card_id,
-                    reason="an earlier move is unresolved; reconcile before retry",
-                )
-            try:
-                self.trello.move_card(card_id, destination)  # type: ignore[attr-defined]
-            except AmbiguousEffectError as exc:
-                self.effects.settle(
-                    record.effect_id, EffectStatus.UNKNOWN, receipt={"note": str(exc)}
-                )
-                return EffectOutcome(
-                    EffectStatus.UNKNOWN,
-                    record.effect_id,
-                    card_id=card_id,
-                    reason="the move may or may not have applied; reconcile before retry",
-                )
-            moved = self.trello.get_card(card_id)  # type: ignore[attr-defined]
-            landed = moved.fields.get("idList") == destination
-            status = EffectStatus.VERIFIED if landed else EffectStatus.UNKNOWN
-            self.effects.settle(
-                record.effect_id,
-                status,
-                card_id=card_id,
-                receipt={"changed_fields": ["idList"], "to": destination},
+        if operation == "label":
+            labels = self._labels(arguments.get("label_ids"))
+            return self._effect(
+                actor,
+                "label",
+                card_id,
+                key=f"{card_id}:{','.join(labels)}",
+                payload_hash=",".join(labels),
+                intended={"idLabels": list(labels)},
+                write=lambda: self.trello.set_labels(card_id, labels),  # type: ignore[attr-defined]
             )
-            return EffectOutcome(status, record.effect_id, card_id=card_id)
+        if operation == "unarchive":
+            return self._effect(
+                actor,
+                "unarchive",
+                card_id,
+                key=f"{card_id}:unarchive",
+                payload_hash="unarchive",
+                intended={"closed": False},
+                write=lambda: self.trello.unarchive_card(card_id),  # type: ignore[attr-defined]
+            )
         raise ValueError("property-card operation is not permitted")
+
+    def _labels(self, requested: object) -> tuple[str, ...]:
+        """The labels this board actually has, in the order they were asked for.
+
+        A label id the board does not carry is refused here rather than sent:
+        Trello accepts an unknown id on some paths and silently drops it, which
+        would read back as a card that lost a label nobody removed.
+        """
+
+        if not isinstance(requested, list | tuple) or not requested:
+            raise ValueError("a label change names the labels to set")
+        configured = set(self.config.trello.label_ids) if self.config.trello else set()
+        labels: list[str] = []
+        for item in requested:
+            if type(item) is not str or not item:
+                raise ValueError("a label id is a non-empty name")
+            if item not in configured:
+                raise ValueError("that label is not on the configured board")
+            labels.append(item)
+        return tuple(labels)
+
+    def _effect(
+        self,
+        actor: Principal,
+        operation: str,
+        card_id: str,
+        *,
+        key: str,
+        payload_hash: str,
+        intended: Mapping[str, object],
+        write: Callable[[], object],
+    ) -> EffectOutcome:
+        """Claim, call, and settle one routine write on an independent read."""
+
+        record, claimed = self.effects.claim(
+            operation=operation,
+            key=key,
+            actor=actor,
+            payload_hash=payload_hash,
+            source_revision=self.source_revision,
+        )
+        if not claimed and record.status is EffectStatus.VERIFIED:
+            # This exact change already landed and was proved. Writing again
+            # would be a second effect for one intent -- which is the whole
+            # thing the claim exists to prevent -- so it is reported as the
+            # settled effect it is.
+            return EffectOutcome(
+                EffectStatus.VERIFIED, record.effect_id, card_id=card_id, reconciled=True
+            )
+        if not claimed and record.status is EffectStatus.UNKNOWN:
+            # An earlier attempt whose outcome nobody saw. Reading the card is
+            # how it is settled; repeating the write is how one change becomes
+            # two.
+            if self._matches(card_id, intended):
+                self.effects.settle(
+                    record.effect_id,
+                    EffectStatus.VERIFIED,
+                    card_id=card_id,
+                    receipt={"note": "reconciled a lost acknowledgement"},
+                )
+                return EffectOutcome(
+                    EffectStatus.VERIFIED, record.effect_id, card_id=card_id, reconciled=True
+                )
+            return EffectOutcome(
+                EffectStatus.UNKNOWN,
+                record.effect_id,
+                card_id=card_id,
+                reason=f"an earlier {operation} is unresolved; reconcile before retry",
+            )
+        try:
+            write()
+        except AmbiguousEffectError as exc:
+            self.effects.settle(record.effect_id, EffectStatus.UNKNOWN, receipt={"note": str(exc)})
+            return EffectOutcome(
+                EffectStatus.UNKNOWN,
+                record.effect_id,
+                card_id=card_id,
+                reason=f"the {operation} may or may not have applied; reconcile before retry",
+            )
+        landed = self._matches(card_id, intended)
+        status = EffectStatus.VERIFIED if landed else EffectStatus.UNKNOWN
+        self.effects.settle(
+            record.effect_id,
+            status,
+            card_id=card_id,
+            receipt={"changed_fields": sorted(intended), "intended": dict(intended)},
+        )
+        return EffectOutcome(
+            status,
+            record.effect_id,
+            card_id=card_id,
+            reason=(
+                ""
+                if landed
+                else f"the card does not read back as {operation}d; reconcile before retry"
+            ),
+        )
+
+    def _matches(self, card_id: str, intended: Mapping[str, object]) -> bool:
+        """Whether an independent read of the card carries the intended state."""
+
+        try:
+            observed = self.trello.get_card(card_id)  # type: ignore[attr-defined]
+        except (ProviderError, AmbiguousEffectError):
+            return False
+        return all(observed.fields.get(field) == value for field, value in intended.items())
 
     # ---- verification --------------------------------------------------
 
@@ -714,6 +921,93 @@ class PropertyCardEngine:
 
     # ---- bulk ----------------------------------------------------------
 
+    def run_bulk(self, actor: Principal, plan: BulkPlan, approved_hash: str) -> BulkOutcome:
+        """Run a batch that somebody previewed and approved, exactly once.
+
+        The plan was previously a preview and nothing else: `dry_run` said what
+        would happen and there was no path that made it happen, so a batch was
+        a feature in the contract and a description in the code.
+
+        Two things make it safe to run. The approval names this exact plan by
+        hash, so it cannot be spent on a batch assembled afterwards. And each
+        card is its own claimed effect with its own readback, so a batch is
+        idempotent per card: re-running it reconciles what already landed
+        instead of moving it twice, and one unresolved card does not strand the
+        rest.
+        """
+
+        if not secrets.compare_digest(plan.payload_hash(), approved_hash):
+            raise PermissionError("this approval does not name this batch")
+        if plan.operation not in BULK_OPERATIONS:
+            raise ValueError("bulk property-card operation is not permitted")
+        verified: list[str] = []
+        unresolved: list[str] = []
+        failed: list[str] = []
+        effect_ids: dict[str, str] = {}
+        for change in plan.changes:
+            card_id = str(change.get("card_id", ""))
+            if not card_id:  # pragma: no cover - dry_run never emits one
+                continue
+            try:
+                outcome = self._bulk_change(actor, plan, card_id, change)
+            except (ProviderError, ValueError):
+                failed.append(card_id)
+                continue
+            effect_ids[card_id] = outcome.effect_id
+            if outcome.status is EffectStatus.VERIFIED:
+                verified.append(card_id)
+            else:
+                unresolved.append(card_id)
+        return BulkOutcome(
+            operation=plan.operation,
+            verified=tuple(verified),
+            unresolved=tuple(unresolved),
+            failed=tuple(failed),
+            effect_ids=effect_ids,
+        )
+
+    def _bulk_change(
+        self,
+        actor: Principal,
+        plan: BulkPlan,
+        card_id: str,
+        change: Mapping[str, object],
+    ) -> EffectOutcome:
+        """One card of a batch, as an ordinary claimed and verified effect.
+
+        Keyed by the plan as well as the card, so the same card in a different
+        approved batch is a different effect while a re-run of this one is the
+        same effect reconciled.
+        """
+
+        key = f"{plan.payload_hash()}:{card_id}"
+        if plan.operation == "move":
+            destination = str(change.get("to", ""))
+            if not destination:
+                raise ValueError("a bulk move needs a destination list")
+            return self._effect(
+                actor,
+                "bulk_move",
+                card_id,
+                key=key,
+                payload_hash=destination,
+                intended={"idList": destination},
+                write=lambda: self.trello.move_card(card_id, destination),  # type: ignore[attr-defined]
+            )
+        fields = change.get("to")
+        if not isinstance(fields, Mapping) or not fields:
+            raise ValueError("a bulk update needs the fields to set")
+        intended = {str(name): value for name, value in fields.items()}
+        return self._effect(
+            actor,
+            "bulk_update",
+            card_id,
+            key=key,
+            payload_hash=json.dumps(intended, sort_keys=True, default=str),
+            intended=intended,
+            write=lambda: self.trello.update_card(card_id, intended),  # type: ignore[attr-defined]
+        )
+
     def dry_run(
         self,
         actor: Principal,
@@ -755,18 +1049,24 @@ class PropertyCardEngine:
             affected=len(changes),
             changes=tuple(changes),
             unreadable=tuple(unreadable),
+            arguments=dict(arguments),
         )
 
 
 __all__ = [
+    "BULK_OPERATIONS",
     "CONSEQUENCE_OPERATIONS",
     "MAX_BULK_CARDS",
     "ROUTINE_OPERATIONS",
+    "BulkOutcome",
     "BulkPlan",
     "EffectLog",
     "EffectOutcome",
     "EffectRecord",
     "EffectStatus",
+    "MAX_QUERY_CARDS",
+    "QUERYABLE_FIELDS",
     "PropertyCardEngine",
     "consequence_operations",
+    "query_cards",
 ]

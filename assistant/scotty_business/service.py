@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
@@ -66,6 +66,8 @@ class TrelloPort(Protocol):
     def update_card(self, card_id: str, fields: Mapping[str, object]) -> ProviderRecord: ...
     def move_card(self, card_id: str, list_id: str) -> ProviderRecord: ...
     def archive_card(self, card_id: str) -> ProviderRecord: ...
+    def unarchive_card(self, card_id: str) -> ProviderRecord: ...
+    def set_labels(self, card_id: str, label_ids: Sequence[str]) -> ProviderRecord: ...
 
 
 class GHLPort(Protocol):
@@ -205,8 +207,26 @@ class ScottyService:
         return self.approvals.deny(proposal_id, principal, expected_version)
 
     def propose_trello_merge(
-        self, requester: Principal, source_card_id: str, destination_card_id: str
+        self,
+        requester: Principal,
+        source_card_id: str,
+        destination_card_id: str,
+        *,
+        resolutions: Mapping[str, str] | None = None,
     ) -> Proposal:
+        """Propose one duplicate merge, with its conflicts already decided.
+
+        Where the two cards disagree, the destination used to win by default
+        and the choice was never anybody's. `resolutions` names the side to
+        keep per field -- "source" or "destination" -- and travels in the
+        payload, so what an approver reads and approves is the resolution
+        rather than an instruction to merge and decide afterwards.
+
+        An unresolved conflict is not fatal: the default still applies and the
+        payload says which fields took it, so a reviewer can see what they are
+        agreeing to.
+        """
+
         if source_card_id == destination_card_id:
             raise ProviderError("merge source and destination must differ")
         trello = self._trello_for(requester)
@@ -235,21 +255,46 @@ class ScottyService:
                 "duplicate merge requires an exact normalized address or provider property identifier"
             )
 
+        chosen = self._resolutions(resolutions)
         merge_keys = ("name", "desc", "due", "dueComplete", "idLabels")
         conflicts: dict[str, dict[str, object]] = {}
         merged_fields: dict[str, object] = {}
+        defaulted: list[str] = []
         for field in merge_keys:
             source_value = source.fields.get(field)
             destination_value = destination.fields.get(field)
-            if source_value != destination_value:
+            disagrees = source_value != destination_value
+            side = chosen.get(field)
+            if side is not None:
+                # Somebody chose. Their choice is what merges, including a
+                # choice of a value the default would have discarded.
+                picked = source_value if side == "source" else destination_value
+                if picked not in (None, "", []):
+                    merged_fields[field] = picked
+                kept = side
+            else:
+                if disagrees:
+                    defaulted.append(field)
+                # The default: the destination wins unless it has nothing.
+                if destination_value not in (None, "", []):
+                    merged_fields[field] = destination_value
+                    kept = "destination"
+                elif source_value not in (None, "", []):
+                    merged_fields[field] = source_value
+                    kept = "source"
+                else:
+                    kept = "neither"
+            if disagrees:
                 conflicts[field] = {
                     "source": source_value,
                     "destination": destination_value,
+                    # Which side the merged value actually came from, rather
+                    # than which side the rule nominally prefers: a default
+                    # that says "destination" over an empty destination would
+                    # describe a merge that did not happen.
+                    "resolved_to": kept,
+                    "chosen_by_reviewer": side is not None,
                 }
-            if destination_value not in (None, "", []):
-                merged_fields[field] = destination_value
-            elif source_value not in (None, "", []):
-                merged_fields[field] = source_value
         payload: dict[str, object] = {
             "operation": "merge",
             "source_card_id": source.source_id,
@@ -261,6 +306,10 @@ class ScottyService:
             "source_fields": dict(source.fields),
             "destination_fields": dict(destination.fields),
             "conflicts": conflicts,
+            "resolutions": dict(chosen),
+            # Named so an approver can see which disagreements nobody decided
+            # and the destination simply won.
+            "defaulted_conflicts": sorted(defaulted),
             "merged_fields": merged_fields,
         }
         return self.approvals.propose(
@@ -279,6 +328,17 @@ class ScottyService:
             expires_at=self._now() + timedelta(minutes=10),
         )
 
+    @staticmethod
+    def _resolutions(requested: Mapping[str, str] | None) -> dict[str, str]:
+        """The conflict choices, checked before they reach a payload."""
+
+        chosen: dict[str, str] = {}
+        for field, side in dict(requested or {}).items():
+            if side not in {"source", "destination"}:
+                raise ProviderError("a merge conflict is resolved to source or destination")
+            chosen[str(field)] = side
+        return chosen
+
     def propose_trello_action(
         self,
         requester: Principal,
@@ -287,7 +347,7 @@ class ScottyService:
         fields: Mapping[str, object] | None = None,
         destination_list_id: str | None = None,
     ) -> Proposal:
-        if operation not in {"update", "move", "archive"}:
+        if operation not in {"update", "move", "archive", "unarchive"}:
             raise ProviderError("Trello operation is not permitted")
         current = self._trello_for(requester).get_card(card_id)
         payload = {
@@ -306,6 +366,40 @@ class ScottyService:
             target_ids=tuple(targets),
             payload=payload,
             source_revision=current.source_revision,
+            expires_at=self._now() + timedelta(minutes=10),
+        )
+
+    def propose_trello_bulk(self, requester: Principal, plan: object) -> Proposal:
+        """Propose one previewed batch, bound to that exact preview.
+
+        A bulk operation was classified as a consequence and then had no
+        executable path at all: the dry run described a change nobody could
+        make. This is the missing half, and it is deliberately narrow -- what
+        is approved is this plan's hash, so an approval cannot be carried over
+        to a batch assembled afterwards or to a board that has since moved.
+        """
+
+        changes = getattr(plan, "changes", ())
+        operation = str(getattr(plan, "operation", ""))
+        payload_hash = plan.payload_hash()  # type: ignore[attr-defined]
+        card_ids = [str(change.get("card_id", "")) for change in changes]
+        if not card_ids:
+            raise ProviderError("a bulk operation covers at least one card")
+        return self.approvals.propose(
+            requester=requester,
+            approver=self._approver_for(requester),
+            action_class="trello_write",
+            target_ids=(self._trello_scope().board_id, *card_ids),
+            payload={
+                "operation": "bulk",
+                "card_operation_target": operation,
+                "card_ids": card_ids,
+                "payload": dict(getattr(plan, "arguments", {}) or {}),
+                "payload_hash": payload_hash,
+                "affected": len(card_ids),
+                "unreadable": list(getattr(plan, "unreadable", ())),
+            },
+            source_revision=f"bulk={payload_hash}",
             expires_at=self._now() + timedelta(minutes=10),
         )
 
@@ -770,11 +864,12 @@ class ScottyService:
                 )
             except ProviderError as exc:
                 return self._failed(executing, str(exc))
-            return self.approvals.complete_execution(
-                executing.proposal_id,
-                ProposalStatus.VERIFIED,
-                expected_version=executing.version,
-                receipt={"verified": True, "resulting_card_id": result.source_id},
+            return self._settle_by_readback(
+                trello,
+                executing,
+                result.source_id,
+                {**dict(fields), "idList": list_id},
+                "the created card could not be read back",
             )
         card_id = _payload_text(proposal.payload, "card_id")
         current = trello.get_card(card_id)
@@ -786,24 +881,80 @@ class ScottyService:
                 fields = proposal.payload.get("fields")
                 if not isinstance(fields, Mapping):
                     raise ProviderError("Trello update fields are malformed")
-                result = trello.update_card(card_id, fields)
+                intended: dict[str, object] = dict(fields)
+                trello.update_card(card_id, fields)
             elif operation == "move":
-                result = trello.move_card(
-                    card_id, _payload_text(proposal.payload, "destination_list_id")
-                )
+                destination = _payload_text(proposal.payload, "destination_list_id")
+                intended = {"idList": destination}
+                trello.move_card(card_id, destination)
             elif operation == "archive":
-                result = trello.archive_card(card_id)
+                intended = {"closed": True}
+                trello.archive_card(card_id)
+            elif operation == "unarchive":
+                intended = {"closed": False}
+                trello.unarchive_card(card_id)
             else:
                 raise ProviderError("Trello operation is not permitted")
         except AmbiguousEffectError:
             return self._unknown(executing, {"verified": False, "reason": "ambiguous Trello write"})
         except ProviderError as exc:
             return self._failed(executing, str(exc))
+        return self._settle_by_readback(
+            trello, executing, card_id, intended, "the card could not be read back"
+        )
+
+    def _settle_by_readback(
+        self,
+        trello: TrelloPort,
+        executing: Proposal,
+        card_id: str,
+        intended: Mapping[str, object],
+        unreadable: str,
+    ) -> Proposal:
+        """Settle one approved Trello write on what a second read says.
+
+        The write's own reply is Trello describing what it believes it did. It
+        is not evidence that it did it: a proxy, a retry, a partial apply or a
+        rule on the board can all produce a successful acknowledgement over an
+        unchanged card. The merge path already read back; these did not, and an
+        acknowledged no-op was recorded as `verified` -- the exact thing the
+        contract says never to do.
+
+        So the state is taken from an independent read afterwards. Anything the
+        read cannot settle is `unknown`, which is a state somebody reconciles,
+        rather than `failed`, which says the change is not there.
+        """
+
+        try:
+            observed = trello.get_card(card_id)
+        except (AmbiguousEffectError, ProviderError):
+            return self._unknown(
+                executing,
+                {"verified": False, "resulting_card_id": card_id, "reason": unreadable},
+            )
+        disagreed = [
+            field for field, expected in intended.items() if observed.fields.get(field) != expected
+        ]
+        if disagreed:
+            return self._unknown(
+                executing,
+                {
+                    "verified": False,
+                    "resulting_card_id": card_id,
+                    "reason": "the card does not carry the intended change",
+                    "unverified_fields": sorted(disagreed),
+                },
+            )
         return self.approvals.complete_execution(
             executing.proposal_id,
             ProposalStatus.VERIFIED,
             expected_version=executing.version,
-            receipt={"verified": True, "resulting_card_id": result.source_id},
+            receipt={
+                "verified": True,
+                "resulting_card_id": observed.source_id,
+                "resulting_revision": observed.source_revision,
+                "changed_fields": sorted(intended),
+            },
         )
 
     def _execute_merge(

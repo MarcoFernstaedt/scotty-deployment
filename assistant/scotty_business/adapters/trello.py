@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from ..config import TrelloScope
@@ -208,6 +208,47 @@ class TrelloAdapter:
                 "Trello archive acknowledgement is malformed; reconcile before retry"
             )
         return record
+
+    def unarchive_card(self, card_id: str) -> ProviderRecord:
+        """Bring an archived card back to the board.
+
+        The counterpart to `archive_card`, and the reason archiving can stay a
+        low-friction way to get a card out of the way: something reversible is
+        a tidying step rather than a decision.
+        """
+
+        response = self.transport.request(
+            "PUT",
+            f"{_BASE}/cards/{fixed_id(card_id, 'card id')}",
+            query=self._query({"closed": False}),
+        )
+        record = self._mutation_record(require_success(response))
+        if record.fields.get("closed") is not False:
+            raise AmbiguousEffectError(
+                "Trello unarchive acknowledgement is malformed; reconcile before retry"
+            )
+        return record
+
+    def set_labels(self, card_id: str, label_ids: Sequence[str]) -> ProviderRecord:
+        """Set a card's labels to exactly this set.
+
+        Set rather than add: Trello's add and remove endpoints are one label at
+        a time, so a multi-label change through them is several effects that can
+        half-apply. One write of the whole set is one effect to verify.
+
+        The ids are checked against the configured board before this is called,
+        because Trello accepts an unknown label id on this path and drops it,
+        which reads back as a card that quietly lost a label.
+        """
+
+        for label_id in label_ids:
+            fixed_id(label_id, "label id")
+        response = self.transport.request(
+            "PUT",
+            f"{_BASE}/cards/{fixed_id(card_id, 'card id')}",
+            query=self._query({"idLabels": ",".join(label_ids)}),
+        )
+        return self._mutation_record(require_success(response))
 
     def _validate_fields(
         self, fields: Mapping[str, object], allowed: set[str] | frozenset[str]
