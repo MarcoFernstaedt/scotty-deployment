@@ -215,6 +215,83 @@ class CapabilityTests(unittest.TestCase):
         self.assertNotIn("ADMINISTRATOR", PERMISSION_BITS)
 
 
+class DiscordSurfaceTests(unittest.TestCase):
+    """The Discord page names the operations the code dispatches, exactly."""
+
+    def page(self) -> str:
+        return read("docs/discord-permissions.md")
+
+    def named(self, heading: str) -> set[str]:
+        """The backticked names in the paragraph under one bold heading."""
+
+        body = self.page()
+        start = body.index(heading)
+        chunk = body[start : body.index("\n\n", start)]
+        return set(re.findall(r"`([a-z_]+)`", chunk))
+
+    def test_the_page_names_every_routine_operation_and_no_other(self) -> None:
+        from assistant.scotty_business.discord_policy import ROUTINE_DISCORD_OPERATIONS
+
+        self.assertEqual(self.named("**Routine"), set(ROUTINE_DISCORD_OPERATIONS))
+
+    def test_the_page_names_every_consequence_operation_and_no_other(self) -> None:
+        from assistant.scotty_business.discord_policy import CONSEQUENCE_DISCORD_OPERATIONS
+
+        self.assertEqual(self.named("**Consequence"), set(CONSEQUENCE_DISCORD_OPERATIONS))
+
+    def test_the_page_names_every_administration_operation_and_no_other(self) -> None:
+        from assistant.scotty_business.discord_policy import ADMINISTRATION_DISCORD_OPERATIONS
+
+        self.assertEqual(self.named("**Administration"), set(ADMINISTRATION_DISCORD_OPERATIONS))
+
+    def test_every_administration_operation_has_a_dispatch(self) -> None:
+        """Declared and unreachable is the failure this catches.
+
+        An administration name in the policy with no branch in the executor is
+        approved by somebody and then refused at execution -- the worst place
+        to discover it.
+        """
+
+        from assistant.scotty_business.discord_policy import ADMINISTRATION_DISCORD_OPERATIONS
+
+        source = read("assistant/scotty_business/service.py")
+        body = source[source.index("def _run_administration") :]
+        body = body[: body.index("\n    def ", 10)]
+        dispatched = set(re.findall(r'operation == "([a-z_]+)"', body))
+        for group in re.findall(r"operation in \{([^}]*)\}", body):
+            dispatched |= set(re.findall(r'"([a-z_]+)"', group))
+        self.assertEqual(dispatched, set(ADMINISTRATION_DISCORD_OPERATIONS))
+
+    def test_the_invite_integer_on_the_page_is_the_one_the_code_asks_for(self) -> None:
+        from assistant.scotty_business.discord_permissions import (
+            PERMISSION_BITS,
+            required_permissions,
+        )
+
+        required = required_permissions()
+        self.assertIn(str(required), self.page())
+        # And every permission named in the invite table is really in it, so a
+        # page cannot promise an ability the invite does not carry.
+        table = set(re.findall(r"^\| `([A-Z_]+)` \|$", self.page(), re.MULTILINE))
+        self.assertEqual(table, {n for n, bit in PERMISSION_BITS.items() if required & bit})
+
+    def test_no_permission_is_promised_that_the_invite_does_not_request(self) -> None:
+        from assistant.scotty_business.discord_permissions import (
+            PERMISSION_BITS,
+            required_permissions,
+        )
+
+        required = required_permissions()
+        granted = {name for name, bit in PERMISSION_BITS.items() if required & bit}
+        promised = set(re.findall(r"`([A-Z_]+)`", self.page()))
+        # ADMINISTRATOR is named to say it is never requested, which is the
+        # opposite of a promise; everything else has to be real.
+        self.assertLessEqual(
+            promised - {"ADMINISTRATOR", "MANAGE_GUILD", "MENTION_EVERYONE", "MODERATE_MEMBERS"},
+            granted,
+        )
+
+
 class GateTests(unittest.TestCase):
     """The gates, their prerequisites, and what each one is evidence of."""
 

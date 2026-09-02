@@ -54,8 +54,33 @@ this deployment can even name.
 | Assigning or removing a role | `MANAGE_ROLES` |
 | Scheduled events and livestream reminders | `MANAGE_EVENTS` |
 | Webhooks | `MANAGE_WEBHOOKS` |
-| Moderation | `KICK_MEMBERS`, `BAN_MEMBERS`, `MODERATE_MEMBERS` |
+| Moderation | `KICK_MEMBERS`, `BAN_MEMBERS` |
 | Deleting someone else's message during approved cleanup | `MANAGE_MESSAGES` |
+
+## The exact operations
+
+These are the names the code dispatches, not a description of them. Anything
+not on one of these lists is refused as unknown rather than attempted.
+
+**Routine — no approval.** `read_channel`, `read_message`, `send_message`,
+`edit_own_message`, `delete_own_message`, `reply_message`, `add_reaction`,
+`remove_own_reaction`, `attach_file`, `create_thread`, `send_thread_message`,
+`archive_own_thread`, `update_progress`.
+
+**Consequence — approved first.** `announce`, `bulk_message`.
+
+**Administration — approved first, and every one read back afterwards.**
+`create_channel`, `edit_channel`, `archive_channel`, `create_category`,
+`reorder_channels`, `set_channel_permissions`, `create_forum_post`,
+`assign_role`, `remove_role`, `create_event`, `create_webhook`, `kick_member`,
+`ban_member`, `read_member_permissions`.
+
+Timing a member out is deliberately absent: `MODERATE_MEMBERS` is not among the
+permissions this deployment requests, so there is no operation for it. Adding
+one means widening the invite, which is an operator decision.
+
+`tests/test_documented_truth.py` holds these three lists against the policy's
+own sets, so an operation added to the code and not to this page fails there.
 
 ## Role hierarchy
 
