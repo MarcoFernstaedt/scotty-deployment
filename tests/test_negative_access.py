@@ -210,3 +210,44 @@ class InstalledNamespaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeclaredExposureTests(unittest.TestCase):
+    """What the container is knowingly allowed to hold, and nothing more.
+
+    Not a root check, so it runs everywhere: the point is that the list of
+    exposures in the contract is the list the code produces, rather than prose
+    somebody updated once.
+    """
+
+    def test_the_contract_names_exactly_what_reaches_the_container(self) -> None:
+        from pathlib import Path as _Path
+
+        from assistant.scotty_business.setup import CONTAINER_ENVIRONMENT_REASONS
+
+        contract = _Path("docs/scotty-basic-release-engineering-contract.md").read_text(
+            encoding="utf-8"
+        )
+        section = contract[contract.index("## What is not isolated") :]
+        section = section[: section.index("## Live acceptance")]
+        # Every environment secret the container gets is named there...
+        self.assertIn("DISCORD_BOT_TOKEN", section)
+        for name in CONTAINER_ENVIRONMENT_REASONS:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    name in section or "model provider key" in section,
+                    f"{name} reaches the container and the contract does not say so",
+                )
+        # ...and the short-lived Google token, which is not an environment
+        # variable and so would otherwise go unlisted.
+        self.assertIn("access token", section.casefold())
+
+    def test_the_contract_does_not_claim_the_pinned_exposures_are_closed(self) -> None:
+        from pathlib import Path as _Path
+
+        contract = (
+            _Path("docs/scotty-basic-release-engineering-contract.md")
+            .read_text(encoding="utf-8")
+            .casefold()
+        )
+        self.assertIn("cannot be closed under the pinned image", contract)

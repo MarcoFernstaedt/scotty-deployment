@@ -211,6 +211,47 @@ by a green `make verify`, and no document may say otherwise.
 `tests/test_documented_truth.py` holds this table against the Makefile, so a new
 gate with no declared class fails rather than arriving uncharacterised.
 
+## What is not isolated, and why
+
+Three credentials are inside the runtime container, and the broad maintainer
+profile runs in that same container as the same account. File mode `0600`
+separates users; it does not separate a plugin, a tool call and a maintainer
+session that share an owner. So these are exposures, stated rather than
+implied:
+
+| In the container | Why it is there | What a compromise gets |
+| --- | --- | --- |
+| `DISCORD_BOT_TOKEN` | the pinned runtime opens the Discord gateway in-process | the bot's Discord access |
+| the model provider key | the pinned runtime dispatches to the model itself | model spend on that key |
+| a Google access token, per connected user | the Workspace adapter carries a bearer | about an hour of that user's Workspace |
+
+Everything else — Trello, GoHighLevel, RentCast, the Google refresh tokens and
+the OAuth client secret — is held by the root-owned broker outside every mount,
+and no broker operation returns any of it.
+`tests/test_negative_access.py` drops to each account the deployment creates
+and proves the store and the control socket are unreachable from all of them.
+
+**The Google exposure is bounded and shrinking.** An access token lasts about
+an hour and cannot mint another; the material that could is with root. Closing
+it entirely means every Google call becoming a declared broker operation, which
+is not done.
+
+**The Discord and model exposures cannot be closed under the pinned image.**
+`nousresearch/hermes-agent@sha256:d64f4e9a…` owns the gateway connection and
+the model dispatch inside the same process that serves the broad maintainer
+profile. Moving gateway ownership to a separate non-model-facing router, or
+separating the inference process from the broad maintainer sandbox, requires
+either a supported way for that image to take events from elsewhere and
+delegate a profile out of process, or a decision to stop using it. Both are
+operator decisions and neither was taken here.
+
+The narrower step available without that decision is to stop serving the broad
+maintainer profile from the credential-bearing container at all, leaving only
+the two bounded client profiles beside those credentials and moving Marco's
+broad work to the host through `scotty-supervisor`. That contradicts the
+standing requirement in `CLAUDE.md` for a full-capability maintainer profile in
+Discord, so it is offered rather than taken.
+
 ## Live acceptance
 
 Credentials and real IDs are installed locally after code review. Start with read-only provider tests. External writes require explicit approval and one harmless bounded acceptance action per write-capable provider. Verify the result from the provider. Recheck retained VPS services after activation.
