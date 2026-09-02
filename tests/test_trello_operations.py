@@ -665,6 +665,68 @@ class BulkApprovalTests(unittest.TestCase):
             self.assertEqual(board.cards["card-1"]["idList"], "list-1")
 
 
+class QueryBudgetTests(unittest.TestCase):
+    """A query is one read, counted once."""
+
+    def runtime(self):
+        from test_provider_connection import runtime
+
+        return runtime(
+            DISCORD_BOT_TOKEN="synthetic-discord",
+            SCOTTY_TRELLO_API_KEY="shared-key",
+            SCOTTY_TRELLO_TOKEN_MAIN_OPERATOR="operator-token",  # noqa: S106 - synthetic
+        )
+
+    def test_one_query_spends_one_read_per_provider_call(self) -> None:
+        """Counted where the calls really happen, not where I patched them.
+
+        The first version of this test replaced `_trello` with a fake, which
+        skipped the guarded transport entirely and so measured only the extra
+        `_permit` -- proving nothing about the double charge it was written to
+        catch. This counts every `spend` during one query against the real
+        adapter path, so the number is the number.
+        """
+
+        from test_provider_connection import principal_for
+
+        from assistant.scotty_business.policy import Role
+
+        with self.runtime() as live:
+            operator = principal_for(live, Role.MAIN_OPERATOR)
+            spends: list[str] = []
+            real_spend = live.budgets.spend
+
+            def counting(principal, action, at=None):
+                spends.append(action)
+                return real_spend(principal, action, at=at)
+
+            live.budgets.spend = counting  # type: ignore[method-assign]
+
+            # One provider call behind the query, so one read should be spent.
+            live.broker_harness._broker.executor = _CountingExecutor()
+            live.handle_read(
+                operator,
+                {"operation": "property_card", "card_operation": "query", "payload": {}},
+            )
+            self.assertEqual(
+                spends.count("provider_read"),
+                live.broker_harness._broker.executor.calls,
+                f"one query spent {spends.count('provider_read')} reads for "
+                f"{live.broker_harness._broker.executor.calls} provider calls",
+            )
+
+    def engine(self, trello):
+        import synthetic
+
+        from assistant.scotty_business.property_engine import EffectLog, PropertyCardEngine
+
+        directory = tempfile.TemporaryDirectory(prefix="scotty-query-budget-")
+        self.addCleanup(directory.cleanup)
+        effects = EffectLog(Path(directory.name) / "effects.db")
+        effects.initialize()
+        return PropertyCardEngine(synthetic.config(), trello, effects)
+
+
 class ConflictMergeTests(unittest.TestCase):
     """A merge whose conflicts somebody actually resolved."""
 
@@ -752,6 +814,28 @@ class ConflictMergeTests(unittest.TestCase):
             actor(), "card-1", "card-2", resolutions={"name": "source"}
         )
         self.assertEqual(proposal.payload.get("resolutions"), {"name": "source"})
+
+
+class _CountingExecutor:
+    """Answers a Trello read and records how many provider calls happened."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, operation_id, arguments, *, actor, timeout=10.0):
+        del operation_id, arguments, actor, timeout
+        self.calls += 1
+
+        class Outcome:
+            ok = True
+            status = 200
+            body: list[object] = []
+
+            @staticmethod
+            def as_reply():
+                return {"ok": True, "status": 200, "body": [], "state": ""}
+
+        return Outcome()
 
 
 if __name__ == "__main__":

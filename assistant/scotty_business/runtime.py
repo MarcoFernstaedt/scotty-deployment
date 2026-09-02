@@ -877,13 +877,17 @@ class Runtime:
     def _card_query(self, principal: Principal, args: Mapping[str, object]) -> object:
         """Find cards on the board, filtered and ordered as asked.
 
-        A read, so it spends the read budget and needs no approval. The filters
-        are named parameters rather than a query string, so there is nothing
-        here a model can compose into a request for a board it was not given.
+        A read, so it spends the read budget and needs no approval -- once, at
+        the transport, like every other provider call. The filters are named
+        parameters rather than a query string, so there is nothing here a model
+        can compose into a request for a board it was not given.
         """
 
+        # No guard call here: the adapter is built on this principal's own
+        # guarded transport, which counts every request it makes. Permitting
+        # again charged the caller twice for one read, so a budget of ten
+        # queries was really a budget of five.
         trello = self._trello(principal)
-        self._permit(principal, "trello", "trello.query_cards")
         payload = _object(args, "payload", optional=True)
         limit = payload.get("limit", MAX_QUERY_CARDS)
         if type(limit) is not int:
