@@ -193,14 +193,22 @@ classified here and no document may describe it as a stronger class.
 | Class | Means | Gates |
 | --- | --- | --- |
 | static | reads bytes; executes none of the product | `format-check`, `lint`, `shellcheck`, `typecheck`, `scan`, `checksums`, `package` |
-| unit | executes product code in-process against synthetic inputs | `test` |
+| unit | executes product code in-process against synthetic inputs | the Python suite, `python3 -m unittest discover -s tests` |
 | synthetic | executes product code against recorded provider response shapes | `acceptance` |
-| pinned-runtime | needs the pinned image; proves what that image does | `smoke`, `oauth-probe` |
+| pinned-runtime | needs the pinned image; proves what that image does | `test`, `smoke`, `oauth-probe` |
 | installed-host | needs a real installed host; proves what systemd and Docker did | none — see below |
 | live-provider | talks to a real provider account | none — no gate here ever does |
 
-Only `smoke` and `oauth-probe` need a Docker daemon. Every other gate runs on a
-machine without one and still means exactly what the table says.
+`make test` is the shell gate: it runs the Python suite and then asserts the
+rendered Compose file, the installer's create-not-start behaviour, and the
+pinned image's own digest and id. The first part is `unit` evidence and runs
+anywhere; the rest needs a Docker daemon and the image pulled, which is why the
+whole gate is classified `pinned-runtime`. On a machine without a daemon, run
+the Python suite directly for the `unit` half and do not report `make test` as
+having passed.
+
+So `test`, `smoke` and `oauth-probe` need a Docker daemon. Every other gate
+runs on a machine without one and still means exactly what the table says.
 
 `installed-host` and `live-provider` evidence cannot be produced by this
 repository's gates at all. Installed-host behavior is proved by running the

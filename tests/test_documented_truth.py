@@ -60,7 +60,11 @@ EVIDENCE_CLASSES: dict[str, str] = {
     "scan": "static",
     "checksums": "static",
     "package": "static",
-    "test": "unit",
+    # `make test` runs the Python suite and then asserts the rendered Compose
+    # file and the pinned image's own digest, so it needs a daemon. Classifying
+    # it "unit" was wrong, and calling a green run of it unit evidence on a
+    # machine that never reached those assertions would have been worse.
+    "test": "pinned-runtime",
     "acceptance": "synthetic",
     "smoke": "pinned-runtime",
     "oauth-probe": "pinned-runtime",
@@ -317,7 +321,7 @@ class GateTests(unittest.TestCase):
         """Which gates need a daemon, taken from what they import and run."""
 
         needs_docker = {gate for gate, kind in EVIDENCE_CLASSES.items() if kind == "pinned-runtime"}
-        self.assertEqual(needs_docker, {"smoke", "oauth-probe"})
+        self.assertEqual(needs_docker, {"test", "smoke", "oauth-probe"})
         # "Needs Docker" means it runs the daemon, not that it mentions the
         # word: `acceptance` names docker in a list of brands a client-visible
         # string may never contain, which is the opposite of a dependency.
@@ -328,6 +332,9 @@ class GateTests(unittest.TestCase):
         ):
             with self.subTest(gate=gate):
                 self.assertRegex(read(script), invokes)
+        # The shell gate calls the daemon directly rather than through Python,
+        # which is why it belongs in the set above.
+        self.assertRegex(read("tests/test.sh"), r"(?m)^docker (compose|image) ")
         # And no gate outside that set runs it, so a machine without a daemon
         # can still run everything else and know what it proved.
         for gate, script in (
