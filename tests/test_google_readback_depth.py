@@ -235,3 +235,133 @@ class NoOperationIsSilentlyUnprovableTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OperationRegistryTests(unittest.TestCase):
+    """One registry decides what is reachable, so nothing falls between two.
+
+    The proposal tool's `google_operation` enum was a hand-written list of six.
+    Classification is not: `classify_google_action` reads the payload, so a
+    nominally routine write becomes a consequence when it crosses a bulk
+    threshold, touches permissions, or adds an audience. An operation in that
+    state was refused as routine -- it needs approval -- and refused as a
+    proposal -- it is not in the enum. Unreachable, by two rules that were each
+    individually correct.
+
+    So the enums are derived from the policy's own sets, and these hold them to
+    it: a write operation added to the policy is reachable the moment it is
+    classified, and one removed disappears from both.
+    """
+
+    def schemas(self):
+        from assistant.scotty_business import client_tool_schemas
+
+        return {schema["name"]: schema for schema in client_tool_schemas()}
+
+    def enum_of(self, tool: str) -> set[str]:
+        schema = self.schemas()[tool]
+        properties = schema["parameters"]["properties"]  # type: ignore[index]
+        return set(properties["google_operation"]["enum"])
+
+    def test_every_write_the_policy_knows_can_be_proposed(self) -> None:
+        from assistant.scotty_business.google_policy import (
+            CONSEQUENCE_GOOGLE_OPERATIONS,
+            ROUTINE_GOOGLE_OPERATIONS,
+        )
+
+        writes = ROUTINE_GOOGLE_OPERATIONS | CONSEQUENCE_GOOGLE_OPERATIONS
+        self.assertEqual(self.enum_of("scotty_propose"), writes)
+
+    def test_an_operation_that_turns_consequential_by_payload_is_reachable(self) -> None:
+        """The concrete case: a batch large enough to need approval.
+
+        Under the hand-written enum this was refused as routine and rejected as
+        a proposal, so the only way to make the change was to make it smaller.
+        """
+
+        from assistant.scotty_business.google_policy import (
+            GoogleActionClass,
+            classify_google_action,
+        )
+
+        payload = {"requests": [{"insertText": {"location": {"index": 1}, "text": "x"}}] * 30}
+        self.assertIs(
+            classify_google_action("docs_batch_update", payload), GoogleActionClass.CONSEQUENCE
+        )
+        self.assertIn("docs_batch_update", self.enum_of("scotty_propose"))
+
+    def test_the_read_tool_carries_the_reads_and_the_routine_writes(self) -> None:
+        """Routine work goes through the read tool on purpose.
+
+        A reversible change needs no proposal, so it is reachable there. What
+        must never be reachable there is a consequence, and that set is the
+        one thing this enum may not contain.
+        """
+
+        from assistant.scotty_business.google_policy import (
+            CONSEQUENCE_GOOGLE_OPERATIONS,
+            GOOGLE_READ_OPERATIONS,
+            ROUTINE_GOOGLE_OPERATIONS,
+        )
+
+        reads = self.enum_of("scotty_read")
+        self.assertEqual(reads, set(GOOGLE_READ_OPERATIONS) | ROUTINE_GOOGLE_OPERATIONS)
+        # A consequence reachable without a proposal would be the gate missing.
+        self.assertFalse(reads & CONSEQUENCE_GOOGLE_OPERATIONS)
+        self.assertIn("search_gmail", reads)
+
+
+class ReachableEndToEndTests(unittest.TestCase):
+    """The enum is one gate. This drives the whole path through the runtime."""
+
+    def test_a_batch_too_large_to_run_routinely_can_actually_be_proposed(self) -> None:
+        from test_provider_connection import principal_for, runtime
+
+        from assistant.scotty_business.policy import Role
+        from assistant.scotty_business.setup import GOOGLE_OAUTH_SCOPES
+
+        # The exact scope set this deployment asks for; a narrower one is
+        # refused at load, which is the point of it being fixed.
+        accounts = {
+            "main_operator": {
+                "account_email": "operator.synthetic@example.invalid",
+                "oauth_scopes": list(GOOGLE_OAUTH_SCOPES),
+            }
+        }
+        with runtime({"google_workspace": accounts}, DISCORD_BOT_TOKEN="synthetic-discord") as live:
+            operator = principal_for(live, Role.MAIN_OPERATOR)
+            recorder = _Workspace()
+            # The service holds its own reference, bound when the runtime was
+            # built, so replacing the runtime's method alone changes nothing.
+            live.service.google_workspace = lambda _principal: recorder
+            live.google_connected[Role.MAIN_OPERATOR] = True
+            live.connected["google_workspace"] = True
+            # Configured for real by the fixture above, so a skip here would
+            # mean the fixture stopped doing its job rather than a limitation.
+            self.assertIsNotNone(live.config.google_for(Role.MAIN_OPERATOR))
+            proposal = live.handle_propose(
+                operator,
+                {
+                    "operation": "google_workspace_write",
+                    "google_operation": "docs_batch_update",
+                    "resource_id": "document-1",
+                    "payload": {
+                        "requests": [{"insertText": {"location": {"index": 1}, "text": "x"}}] * 30
+                    },
+                },
+            )
+            self.assertTrue(proposal["proposal_id"])
+            # Proposed, not performed.
+            self.assertEqual(recorder.calls, [])
+
+
+class _Workspace:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def mutate(self, operation, resource_id, payload):
+        from assistant.scotty_business.adapters.records import ProviderRecord, utc_now
+
+        del payload
+        self.calls.append((operation, resource_id))
+        return ProviderRecord("google_workspace", resource_id, utc_now(), "v1", {}, ())

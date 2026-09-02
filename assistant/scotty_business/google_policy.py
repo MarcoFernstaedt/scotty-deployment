@@ -11,6 +11,26 @@ class GoogleActionClass(StrEnum):
     FORBIDDEN = "forbidden"
 
 
+#: The bounded reads. Named here beside the writes so that one registry decides
+#: what a tool may offer: an enum written out by hand somewhere else drifts, and
+#: an operation that drifts out of it becomes unreachable without anybody
+#: noticing, because nothing fails.
+GOOGLE_READ_OPERATIONS: tuple[str, ...] = (
+    "search_gmail",
+    "get_gmail_message",
+    "search_drive",
+    "get_drive_file",
+    "get_document",
+    "get_spreadsheet",
+    "read_drive_file",
+    "get_sheet_values",
+    "batch_get_sheet_values",
+    "list_calendar_events",
+    "get_calendar_event",
+    "list_contacts",
+    "get_contact",
+)
+
 ROUTINE_GOOGLE_OPERATIONS = frozenset(
     {
         "gmail_modify_labels",
@@ -41,6 +61,30 @@ CONSEQUENCE_GOOGLE_OPERATIONS = frozenset(
         "contacts_delete",
     }
 )
+
+
+def google_read_enum() -> list[str]:
+    """What `scotty_read` may name: the reads, plus the reversible writes.
+
+    Routine work needs no proposal, so it belongs here. A consequence never
+    does, which is the one thing this list may not contain.
+    """
+
+    return sorted(set(GOOGLE_READ_OPERATIONS) | ROUTINE_GOOGLE_OPERATIONS)
+
+
+def google_propose_enum() -> list[str]:
+    """What `scotty_propose` may name: every write, without exception.
+
+    Not just the operations that are always consequential. Classification reads
+    the payload, so a routine write becomes a consequence when it crosses a
+    bulk threshold, touches permissions, or adds an audience -- and an
+    operation in that state used to be refused as routine and rejected as a
+    proposal at once. Unreachable, by two rules that were each correct.
+    """
+
+    return sorted(ROUTINE_GOOGLE_OPERATIONS | CONSEQUENCE_GOOGLE_OPERATIONS)
+
 
 #: Fields that introduce or widen an audience for a calendar action.
 _NEW_AUDIENCE_FIELDS = frozenset(

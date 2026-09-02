@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
+from .google_policy import google_propose_enum, google_read_enum
 from .runtime import Controller
 
 __all__ = ["__version__", "client_tool_schemas", "identity_prompt", "register"]
@@ -197,41 +198,15 @@ _READ_SCHEMA = _schema(
         "document_id": {"type": "string"},
         "spreadsheet_id": {"type": "string"},
         "resource_name": {"type": "string"},
-        "google_operation": {
-            "type": "string",
-            "enum": [
-                "search_gmail",
-                "get_gmail_message",
-                "search_drive",
-                "get_drive_file",
-                "get_document",
-                "get_spreadsheet",
-                "read_drive_file",
-                "get_sheet_values",
-                "batch_get_sheet_values",
-                "list_calendar_events",
-                "get_calendar_event",
-                "list_contacts",
-                "get_contact",
-                "gmail_modify_labels",
-                "gmail_create_draft",
-                "gmail_update_draft",
-                "calendar_create_event",
-                "calendar_update_event",
-                "calendar_cancel_event",
-                "drive_create_file",
-                "drive_update_file",
-                "drive_move_file",
-                "drive_trash_file",
-                "docs_create",
-                "docs_batch_update",
-                "sheets_create",
-                "sheets_batch_update",
-                "sheets_update_values",
-                "contacts_create",
-                "contacts_update",
-            ],
-        },
+        # Derived from the policy's own sets rather than written out here.
+        # A hand-kept enum drifts, and an operation that drifts out of it
+        # becomes unreachable silently, because nothing fails when a name is
+        # simply missing.
+        # Derived from the policy's own sets rather than written out here.
+        # A hand-kept enum drifts, and an operation that drifts out of it
+        # becomes unreachable silently, because nothing fails when a name is
+        # simply missing.
+        "google_operation": {"type": "string", "enum": google_read_enum()},
         "resource_id": {"type": "string"},
         "payload": {"type": "object", "additionalProperties": True},
         "repair_action": {
@@ -272,17 +247,11 @@ _PROPOSE_SCHEMA = _schema(
         "body": {"type": "string", "maxLength": 1600},
         "channel_id": {"type": "string"},
         "content": {"type": "string", "maxLength": 2000},
-        "google_operation": {
-            "type": "string",
-            "enum": [
-                "gmail_send_draft",
-                "calendar_create_event",
-                "calendar_update_event",
-                "drive_delete_permanently",
-                "drive_change_permissions",
-                "contacts_delete",
-            ],
-        },
+        # Every write, not only the always-consequential ones: a routine
+        # write becomes a consequence by payload, and one in that state was
+        # refused as routine and rejected here at the same time -- unreachable
+        # by two rules that were each individually correct.
+        "google_operation": {"type": "string", "enum": google_propose_enum()},
         "resource_id": {"type": "string"},
         "payload": {"type": "object", "additionalProperties": True},
     },
