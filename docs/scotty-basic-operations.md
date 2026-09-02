@@ -42,7 +42,8 @@ During an approved activation window:
 
 ## Stop conditions
 
-Stop immediately if any forbidden tool appears, Tool Search replaces the five Scotty tools, a tuple mismatch reaches the model, a slash command changes runtime state, a provider response crosses configured scope, an ambiguous write is retried, a credential appears in logs/chat, the image/runtime contract drifts, a public webhook/port is required, or any fifth add-on/future application feature is requested.
+Stop immediately if any forbidden tool appears, Tool Search replaces the five Scotty tools, a tuple mismatch reaches the model, a slash command changes runtime state, a provider response crosses configured scope, an ambiguous write is retried, a credential appears in logs/chat, the image/runtime contract drifts, a public webhook/port is required, or a sixth add-on or future application feature is
+requested.
 
 ## Rollback and compensation
 

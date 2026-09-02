@@ -6,14 +6,15 @@ This repository deploys the basic release of `Scotty by The Closing Room`: a bou
 
 ## Canonical release scope
 
-Initial add-ons:
+Installed add-ons:
 
 1. Discord
 2. Trello
 3. GoHighLevel
 4. RentCast
+5. Google Workspace
 
-The deployment enforces a maximum of six add-ons. Two slots remain available. Only the maintainer-controlled deployment process may change the installed set.
+The deployment enforces a maximum of six add-ons. One slot remains available. Only the maintainer-controlled deployment process may change the installed set.
 
 Exact cap response:
 
@@ -158,7 +159,7 @@ Do not publish client commercial terms, revenue projections, pricing strategy, o
 
 Canonical repository: `MarcoFernstaedt/scotty-deployment`.
 
-Implementation branch: `feature/scotty-basic-assistant`.
+Implementation branch: `feature/scotty-google-one-command`.
 
 One writer owns the branch/worktree/index. Use test-first development and focused commits. Do not rewrite history or force-push.
 
@@ -183,10 +184,37 @@ Before release:
 10. Freeze the exact candidate for independent read-only review.
 11. Merge only after PASS, then verify the remote commit and clean tracking state.
 
+## What each gate is evidence of
+
+A green gate proves one specific kind of thing. Promoting one kind into another
+is how "the tests pass" becomes "it works against Google", so every gate is
+classified here and no document may describe it as a stronger class.
+
+| Class | Means | Gates |
+| --- | --- | --- |
+| static | reads bytes; executes none of the product | `format-check`, `lint`, `shellcheck`, `typecheck`, `scan`, `checksums`, `package` |
+| unit | executes product code in-process against synthetic inputs | `test` |
+| synthetic | executes product code against recorded provider response shapes | `acceptance` |
+| pinned-runtime | needs the pinned image; proves what that image does | `smoke`, `oauth-probe` |
+| installed-host | needs a real installed host; proves what systemd and Docker did | none — see below |
+| live-provider | talks to a real provider account | none — no gate here ever does |
+
+Only `smoke` and `oauth-probe` need a Docker daemon. Every other gate runs on a
+machine without one and still means exactly what the table says.
+
+`installed-host` and `live-provider` evidence cannot be produced by this
+repository's gates at all. Installed-host behavior is proved by running the
+installer on a real host; live-provider behavior is proved during live
+acceptance below, with real credentials, after code review. Neither is implied
+by a green `make verify`, and no document may say otherwise.
+
+`tests/test_documented_truth.py` holds this table against the Makefile, so a new
+gate with no declared class fails rather than arriving uncharacterised.
+
 ## Live acceptance
 
 Credentials and real IDs are installed locally after code review. Start with read-only provider tests. External writes require explicit approval and one harmless bounded acceptance action per write-capable provider. Verify the result from the provider. Recheck retained VPS services after activation.
 
 ## Stop conditions
 
-Stop and report before expanding scope if implementation requires a public webhook or new inbound port, browser automation or scraping, a fifth add-on, student access, the future custom API/app, payment processing, unsupported provider scopes, exposure of a forbidden tool, runtime contract drift, or a capability not listed in this file.
+Stop and report before expanding scope if implementation requires a public webhook or new inbound port, browser automation or scraping, a sixth add-on, student access, the future custom API/app, payment processing, unsupported provider scopes, exposure of a forbidden tool, runtime contract drift, or a capability not listed in this file.

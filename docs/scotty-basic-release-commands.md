@@ -91,10 +91,19 @@ the supported authentication subcommands, performs no login, and stores no
 credential. Run the exact subcommand it prints, in the stopped container's own
 runtime, and complete the browser flow as the maintainer.
 
-**Open item.** The exact subcommand has not been captured in this repository,
-because the pinned image is not available in the development environment used to
-prepare this change. Run `make oauth-probe` on the deployment host and record
-the printed command in the operations log before activation.
+**Where this evidence comes from.** `oauth-probe` is `pinned-runtime` evidence:
+it needs the pinned image and proves what that image ships. It runs in CI on
+every push, in the `gates that need the pinned runtime` job, after pulling the
+image by its immutable digest — so the subcommand is read from the image on
+every run rather than remembered here.
+
+It is deliberately not transcribed into this repository. A subcommand written
+down here would be a claim about an image nobody re-checked; the probe is a
+claim about the image in front of it. Development environments without a Docker
+daemon cannot run it, and a green `make verify` on such a machine is missing
+this gate — that is a limitation of the machine, not an open item in the
+release. Run it on the deployment host before activation and record what it
+prints in the operations log.
 
 ## 4. Credential-free synthetic acceptance command
 
@@ -292,6 +301,7 @@ naming `sudo /usr/local/sbin/scotty-start`, and the employee cannot repair.
 
 ## 6. Add-on cap
 
-The deployment is capped at six add-ons, with four installed and two slots free.
+The deployment is capped at six add-ons, with five installed and one slot free:
+Discord, Trello, GoHighLevel, RentCast, and Google Workspace.
 Scotty cannot install, remove, or bypass an add-on; only a maintainer-controlled
 deployment change can.
