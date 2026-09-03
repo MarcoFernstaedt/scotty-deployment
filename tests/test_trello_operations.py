@@ -577,11 +577,25 @@ class BulkApprovalTests(unittest.TestCase):
             },
         )
 
-    def spend(self, approved):
-        return {
-            "expected_version": approved["version"],
-            "execution_nonce": approved["execution_nonce"],
-        }
+    def execute(self, live, operator, proposal, approved):
+        """Through the model-facing path, which is the only one there is.
+
+        A runtime-level `execute_bulk` existed for these tests and nothing
+        else. It skipped `_settle_waiting_step`, so a batch a workflow raised
+        would have run and left that workflow parked forever -- a second path
+        to the same effect, quietly missing a step the real one has. It is
+        gone; this drives `handle_approval` like every other consequence.
+        """
+
+        return live.handle_approval(
+            operator,
+            {
+                "action": "execute",
+                "proposal_id": proposal["proposal_id"],
+                "expected_version": approved["version"],
+                "execution_nonce": approved["execution_nonce"],
+            },
+        )
 
     def test_an_unapproved_batch_does_not_run(self) -> None:
         """Found by reading this back: the gate was not wired to the door.
@@ -603,10 +617,11 @@ class BulkApprovalTests(unittest.TestCase):
             # A real version and a nonce that nobody issued, so what refuses
             # this is the approval state machine rather than argument checking.
             with self.assertRaises((ApprovalError, PermissionError)):
-                live.execute_bulk(
+                live.handle_approval(
                     operator,
-                    proposal["proposal_id"],
                     {
+                        "action": "execute",
+                        "proposal_id": proposal["proposal_id"],
                         "expected_version": proposal["version"],
                         "execution_nonce": "not-a-nonce-anybody-issued",
                     },
@@ -622,8 +637,8 @@ class BulkApprovalTests(unittest.TestCase):
             board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
             proposal = self.propose(live, operator, board)
             approved = self.approve(live, operator, proposal)
-            outcome = live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
-            self.assertEqual(outcome["verified"], ["card-1", "card-2"])
+            outcome = self.execute(live, operator, proposal, approved)
+            self.assertEqual(outcome["status"], "verified")
             self.assertEqual(board.cards["card-2"]["idList"], "list-2")
             # And the proposal is finished, so the approval is spent.
             settled = live.service.approvals.get(proposal["proposal_id"])
@@ -637,9 +652,9 @@ class BulkApprovalTests(unittest.TestCase):
             board = FakeTrello({"card-1": {"idList": "list-1"}, "card-2": {"idList": "list-1"}})
             proposal = self.propose(live, operator, board)
             approved = self.approve(live, operator, proposal)
-            live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
+            self.execute(live, operator, proposal, approved)
             with self.assertRaises((ApprovalError, PermissionError)):
-                live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
+                self.execute(live, operator, proposal, approved)
 
     def test_a_card_that_vanished_since_the_preview_invalidates_the_approval(self) -> None:
         """The approval is for a plan, and the plan describes a board.
@@ -658,7 +673,7 @@ class BulkApprovalTests(unittest.TestCase):
             proposal = self.propose(live, operator, board)
             approved = self.approve(live, operator, proposal)
             del board.cards["card-2"]
-            outcome = live.execute_bulk(operator, proposal["proposal_id"], self.spend(approved))
+            outcome = self.execute(live, operator, proposal, approved)
             # The approval is spent and recorded as failed rather than left
             # hanging, and nothing on the board moved.
             self.assertEqual(outcome["status"], "failed")

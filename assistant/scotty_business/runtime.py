@@ -1903,32 +1903,6 @@ class Runtime:
         plan = engine.dry_run(principal, target, identifiers, _object(args, "payload"))
         return self.service.propose_trello_bulk(principal, plan)
 
-    def execute_bulk(
-        self, principal: Principal, proposal_id: str, args: Mapping[str, object]
-    ) -> dict[str, object]:
-        """Run an approved batch, through the same gate as every consequence.
-
-        This used to read the proposal for its plan and run it, without asking
-        whether it had been approved. It now goes through `service.execute`,
-        which claims the exact version and nonce, spends the approval once, and
-        settles the proposal on what actually happened.
-        """
-
-        settled = self.service.execute(
-            principal,
-            proposal_id,
-            expected_version=_integer(args, "expected_version"),
-            execution_nonce=_text(args, "execution_nonce"),
-        )
-        receipt = dict(settled.receipt or {})
-        return {
-            "proposal_id": settled.proposal_id,
-            "status": settled.status.value,
-            "verified": receipt.get("verified", []),
-            "unresolved": receipt.get("unresolved", []),
-            "failed": receipt.get("failed", []),
-        }
-
     def handle_approval(self, principal: Principal, args: Mapping[str, object]) -> object:
         action = _text(args, "action")
         proposal_id = _text(args, "proposal_id")
