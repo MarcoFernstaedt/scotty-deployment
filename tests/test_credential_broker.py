@@ -855,6 +855,98 @@ class PackagedArtefactTests(unittest.TestCase):
                 reply = json.loads(client.recv(4096).decode("utf-8"))
             self.assertEqual(reply, {"ok": False, "state": "credential absent"})
 
+    def test_the_staged_broker_mints_a_google_token_over_a_real_socket(self) -> None:
+        """Client and server, on the wire, in the code the installer stages.
+
+        Both halves of `google_token` were tested and never together: the
+        broker's handler by calling it in-process, and the runtime's client by
+        reading its reply shape. A frame that one side writes and the other
+        cannot read would have passed both.
+
+        This runs the staged package as a separate process, connects with the
+        runtime's own client, and checks a token comes back and the material
+        that minted it does not.
+        """
+
+        from assistant.scotty_business.credential_intake import UnixSocketBroker
+
+        with tempfile.TemporaryDirectory(prefix="scotty-broker-google-") as directory:
+            root = Path(directory)
+            staged = root / "plugins" / "scotty_broker"
+            staged.mkdir(parents=True)
+            for name in _installed_broker_files():
+                (staged / name).write_bytes(Path("assistant/scotty_broker", name).read_bytes())
+            socket_path = root / "broker.sock"
+            store_path = root / "credentials.json"
+
+            # Root's own store, written the way setup writes it.
+            sys.path.insert(0, str(root / "plugins"))
+            self.addCleanup(lambda: sys.path.remove(str(root / "plugins")))
+            from scotty_broker.broker import CredentialStore  # type: ignore[import-not-found]
+
+            store = CredentialStore(store_path)
+            store.put("google", "client_id", "synthetic-client-id", "shared")
+            store.put("google", "client_secret", "synthetic-client-secret", "shared")
+            store.put("google", "refresh_token", "synthetic-refresh-operator", "main_operator")
+
+            script = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(root / 'plugins')!r})\n"
+                "from scotty_broker.broker import (Broker, CredentialStore,"
+                " bind_socket, serve_forever)\n"
+                "from scotty_broker.google import GoogleTokenMinter\n"
+                "def exchange(url, fields):\n"
+                "    return {'access_token': 'synthetic-access-1', 'expires_in': 3600,\n"
+                "            'scope': 'https://www.googleapis.com/auth/drive'}\n"
+                f"store = CredentialStore({str(store_path)!r})\n"
+                f"server = bind_socket({str(socket_path)!r}, group={os.getgid()})\n"
+                "serve_forever(Broker(store, google=GoogleTokenMinter(store, exchange=exchange),"
+                f" actor_uids={{'main_operator': {os.getuid()}}}), server, actor='main_operator')\n"
+            )
+            process = subprocess.Popen(  # noqa: S603 - fixed interpreter and script
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.addCleanup(_terminate, process)
+            deadline = time.monotonic() + 10
+            while not socket_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(socket_path.exists(), "the staged broker never bound its socket")
+
+            broker = UnixSocketBroker(socket_path)
+            minted = broker.google_token(("https://www.googleapis.com/auth/drive",))
+            self.assertIsNotNone(minted, "the staged broker returned no token")
+            assert minted is not None
+            access, expires_at = minted
+            self.assertEqual(access, "synthetic-access-1")
+            self.assertGreater(expires_at, 0)
+
+            # Nothing that could mint another crossed the socket. Read the raw
+            # frame too, so this does not rest on the client's own parsing.
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            client.connect(str(socket_path))
+            with client:
+                client.sendall(
+                    json.dumps(
+                        {
+                            "op": "google_token",
+                            "scopes": ["https://www.googleapis.com/auth/drive"],
+                        }
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+                client.shutdown(socket.SHUT_WR)
+                raw = client.recv(4096).decode("utf-8")
+            for secret in (
+                "synthetic-refresh-operator",
+                "synthetic-client-secret",
+                "synthetic-client-id",
+            ):
+                self.assertNotIn(secret, raw)
+
     def test_the_broker_lives_outside_every_container_writable_path(self) -> None:
         """The container owns /srv/Scotty/data, so root must not import from it."""
 
